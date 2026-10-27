@@ -239,6 +239,17 @@
   border-radius: var(--radius-control);
   background: transparent;
   pointer-events: none;
+  /* The band is a positioned pseudo-element, so it normally paints above the
+     row's in-flow text. When the window loses focus the band becomes opaque,
+     and an opaque band over the text hides the file name completely. Keeping
+     it at the bottom of the row's stacking order means the fill can be any
+     colour, opaque or not, without ever covering the content. */
+  z-index: 0;
+}
+
+.row > .cell {
+  position: relative;
+  z-index: 1;
 }
 
 .row:hover::before {

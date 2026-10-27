@@ -20,6 +20,8 @@ Working now:
 - Rubber-band selection: drag from empty space to select everything the
   rectangle touches, with Shift or Ctrl to add
 - An offer, once at startup, to become the desktop's folder handler
+- This PC lists volumes, not mounts: one card per device, labelled by its
+  volume label with the device shown underneath
 - Right-click menus: Open, Open with, Cut, Copy, Copy path, Rename, Delete and
   Properties on an item; New folder, Paste, Sort by, View, Refresh and Select
   all on the background

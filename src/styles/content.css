@@ -574,7 +574,20 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  align-self: center;
+  align-self: end;
+}
+
+/* The device behind the volume, quieter and smaller: a label alone does not
+   tell two similar drives apart, and a Windows user expects the letter. */
+.drive-device {
+  grid-column: 2;
+  margin-top: -2px;
+  font-size: 11px;
+  line-height: 12px;
+  color: var(--text-tertiary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 .drive-bar {

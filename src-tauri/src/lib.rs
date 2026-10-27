@@ -295,11 +295,15 @@ fn path_info(path: String) -> places::PathInfo {
 fn places() -> Vec<places::Place> {
     let list = places::places();
     if std::env::var_os("LYRE_TRACE").is_some() {
-        let volumes = list.iter().filter(|place| place.kind != "folder").count();
-        eprintln!(
-            "[lyre] places {} entries, {volumes} volumes",
-            list.len()
-        );
+        let volumes: Vec<&places::Place> =
+            list.iter().filter(|place| place.kind != "folder").collect();
+        eprintln!("[lyre] places {} entries, {} volumes", list.len(), volumes.len());
+        for volume in volumes {
+            eprintln!(
+                "[lyre]   {:?} at {:?} detail={:?} {}/{} bytes",
+                volume.name, volume.path, volume.detail, volume.free, volume.total
+            );
+        }
     }
     list
 }

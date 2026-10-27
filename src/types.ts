@@ -44,7 +44,8 @@ export interface Place {
   path: string;
   kind: PlaceKind;
   icon: string;
-  /** Free space summary for volumes. */
+  /** The device behind the volume: `/dev/sda1`, or `C:` on Windows. */
+  detail: string | null;
   /** Volume size in bytes; 0 for folders. */
   total: number;
   /** Free space in bytes; 0 for folders. */

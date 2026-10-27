@@ -21,6 +21,10 @@ pub struct Place {
     /// numbers, not just the formatted summary, to draw a capacity bar.
     pub total: u64,
     pub free: u64,
+    /// The thing this volume actually is: `/dev/sda1` on Linux, `C:` on
+    /// Windows. Shown small under the name, because a volume label alone does
+    /// not tell two similar drives apart.
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -71,6 +75,7 @@ pub fn places() -> Vec<Place> {
         icon: "home",
         total: 0,
         free: 0,
+        detail: None,
     });
 
     // The XDG user directories are declared in a config file on Linux, and the
@@ -98,6 +103,7 @@ pub fn places() -> Vec<Place> {
                 icon,
                 total: 0,
                 free: 0,
+                detail: None,
             });
         }
     }
@@ -111,38 +117,196 @@ pub fn places() -> Vec<Place> {
 
 fn drives() -> Vec<Place> {
     use sysinfo::Disks;
+    use std::collections::HashMap;
 
     let disks = Disks::new_with_refreshed_list();
-    let mut out = Vec::with_capacity(disks.len());
+    let labels = volume_labels();
+
+    // One row per volume, not per mount. On a btrfs system the same device is
+    // mounted at /, /home, /root, /srv and more, and listing each of those as a
+    // separate drive is simply wrong. The shortest mount path wins, which is
+    // the one a person means when they say "the disk".
+    let mut best: HashMap<String, Place> = HashMap::new();
     for disk in &disks {
         let mount = disk.mount_point();
         if mount.as_os_str().is_empty() {
             continue;
         }
-        let total = disk.total_space();
-        if total == 0 {
+        // Pseudo and image filesystems report no usable space and are not
+        // storage: overlays, AppImage squashfs mounts, fuse and friends.
+        if disk.total_space() == 0 || is_pseudo_filesystem(&disk.file_system().to_string_lossy()) {
             continue;
         }
+
+        let mount_path = mount.to_string_lossy().into_owned();
+        let key = volume_key(disk, &mount_path);
+        let total = disk.total_space();
         let free = disk.available_space();
-        let label = disk.name().to_string_lossy().trim().to_string();
-        let name = if label.is_empty() {
-            display_name(mount)
-        } else {
-            label
-        };
-        out.push(Place {
-            name,
-            path: mount.to_string_lossy().into_owned(),
+
+        let candidate = Place {
+            name: volume_name(
+                &key,
+                &mount_path,
+                total,
+                &labels,
+                &disk.name().to_string_lossy(),
+            ),
+            path: mount_path.clone(),
             kind: if disk.is_removable() { "removable" } else { "drive" },
             icon: "drive",
             total,
             free,
-        });
+            detail: Some(volume_detail(&key, &mount_path)),
+        };
+
+        match best.get(&key) {
+            Some(existing) if existing.path.len() <= mount_path.len() => {}
+            _ => {
+                best.insert(key, candidate);
+            }
+        }
     }
-    // Stable order: fixed drives by path, so the rail does not reshuffle
-    // between the first and second enumeration.
-    out.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let mut out: Vec<Place> = best.into_values().collect();
+    // Fixed drives first, then by name, so the order does not shuffle between
+    // the first and second enumeration.
+    out.sort_by(|a, b| {
+        (a.kind == "removable")
+            .cmp(&(b.kind == "removable"))
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
     out
+}
+
+/// What makes two mounts the same volume.
+#[cfg(target_os = "linux")]
+fn volume_key(disk: &sysinfo::Disk, _mount: &str) -> String {
+    disk.name().to_string_lossy().into_owned()
+}
+
+/// On Windows the name is a volume label, which repeats; the drive letter is
+/// the identity.
+#[cfg(not(target_os = "linux"))]
+fn volume_key(_disk: &sysinfo::Disk, mount: &str) -> String {
+    mount.to_string()
+}
+
+#[cfg(target_os = "linux")]
+fn volume_detail(key: &str, _mount: &str) -> String {
+    key.to_string()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn volume_detail(_key: &str, mount: &str) -> String {
+    // "C:\" reads as "C:" everywhere else in the interface.
+    mount.trim_end_matches(['\\', '/']).to_string()
+}
+
+#[cfg(target_os = "linux")]
+fn volume_name(
+    key: &str,
+    mount: &str,
+    total: u64,
+    labels: &std::collections::HashMap<String, String>,
+    _disk_label: &str,
+) -> String {
+    // The label is what a person calls the stick; the device path goes on the
+    // smaller line underneath.
+    if let Some(label) = labels.get(key) {
+        return label.clone();
+    }
+    if mount == "/" {
+        return "Filesystem".into();
+    }
+    format!("{} Volume", gib(total))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn volume_name(
+    _key: &str,
+    _mount: &str,
+    _total: u64,
+    _labels: &std::collections::HashMap<String, String>,
+    disk_label: &str,
+) -> String {
+    // On Windows sysinfo's name is the volume label, which is what Explorer
+    // shows above the drive letter.
+    let label = disk_label.trim();
+    if label.is_empty() {
+        "Local Disk".into()
+    } else {
+        label.to_string()
+    }
+}
+
+fn gib(bytes: u64) -> String {
+    let value = bytes as f64 / 1_073_741_824.0;
+    if value >= 100.0 {
+        format!("{value:.0} GB")
+    } else {
+        format!("{value:.1} GB")
+    }
+}
+
+/// Filesystems that are not storage.
+fn is_pseudo_filesystem(name: &str) -> bool {
+    matches!(
+        name,
+        "overlay"
+            | "tmpfs"
+            | "devtmpfs"
+            | "devpts"
+            | "proc"
+            | "sysfs"
+            | "cgroup"
+            | "cgroup2"
+            | "autofs"
+            | "mqueue"
+            | "hugetlbfs"
+            | "debugfs"
+            | "tracefs"
+            | "securityfs"
+            | "pstore"
+            | "bpf"
+            | "configfs"
+            | "fusectl"
+            | "binfmt_misc"
+            | "nsfs"
+            | "ramfs"
+            | "efivarfs"
+            | "squashfs"
+    ) || name.starts_with("fuse")
+}
+
+/// Volume labels for each block device, read from the udev links rather than
+/// shelling out to `blkid`.
+///
+/// `/dev/disk/by-label/SANDISK` is a symlink to `/dev/sda1`, so the label can be
+/// recovered without a subprocess. Udev escapes a space as `\\x20`.
+#[cfg(target_os = "linux")]
+fn volume_labels() -> std::collections::HashMap<String, String> {
+    let mut labels = std::collections::HashMap::new();
+    let Ok(entries) = std::fs::read_dir("/dev/disk/by-label") else {
+        return labels;
+    };
+    for entry in entries.flatten() {
+        let Ok(resolved) = std::fs::canonicalize(entry.path()) else {
+            continue;
+        };
+        let label = entry
+            .file_name()
+            .to_string_lossy()
+            .replace("\\x20", " ")
+            .replace("\\x27", "'")
+            .replace("\\x5c", "\\");
+        labels.insert(resolved.to_string_lossy().into_owned(), label);
+    }
+    labels
+}
+
+#[cfg(not(target_os = "linux"))]
+fn volume_labels() -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::new()
 }
 
 pub fn path_info(raw: &str) -> PathInfo {
@@ -212,3 +376,58 @@ fn display_name(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
+
+
+#[cfg(test)]
+mod volume_tests {
+    use super::*;
+
+    /// The volume list must describe *volumes*, not mounts.
+    ///
+    /// A btrfs system mounts one device at /, /home, /root, /srv and more; the
+    /// page used to list each of those as its own drive. Image and overlay
+    /// filesystems used to appear as well, with no space at all.
+    #[test]
+    fn each_volume_appears_once_and_has_space() {
+        let volumes: Vec<Place> = places()
+            .into_iter()
+            .filter(|place| place.kind != "folder")
+            .collect();
+
+        let mut seen = std::collections::HashSet::new();
+        for volume in &volumes {
+            assert!(
+                seen.insert(volume.path.clone()),
+                "{} is listed twice",
+                volume.path
+            );
+            assert!(
+                volume.total > 0,
+                "{} has no size, so it is not storage",
+                volume.path
+            );
+            assert!(
+                volume.detail.is_some(),
+                "{} has no device to show under its name",
+                volume.path
+            );
+        }
+    }
+
+    /// Unlabelled volumes still need a name a person can read.
+    #[test]
+    fn an_unlabelled_volume_is_named_by_its_size() {
+        let labels = std::collections::HashMap::new();
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                volume_name("/dev/sdz9", "/run/media/you/0A1B", 64_000_000_000, &labels, ""),
+                "59.6 GB Volume"
+            );
+            assert_eq!(
+                volume_name("/dev/sdz9", "/", 64_000_000_000, &labels, ""),
+                "Filesystem"
+            );
+        }
+    }
+}

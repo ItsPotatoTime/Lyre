@@ -5,6 +5,11 @@ import { PlaceGlyph } from "./FileGlyph";
 
 function gigabytes(bytes: number): string {
   const value = bytes / 1_073_741_824;
+  // A 32 MB EFI partition must not read as "0.0 GB free of 0.0 GB".
+  if (value < 1) {
+    const megabytes = Math.max(1, Math.round(bytes / 1_048_576));
+    return `${megabytes} MB`;
+  }
   if (value >= 100) return `${Math.round(value)} GB`;
   return `${value.toFixed(1)} GB`;
 }
@@ -65,7 +70,14 @@ export function ThisPcView({
                 <span className="drive-glyph">
                   <PlaceGlyph icon="drive" size={32} />
                 </span>
-                <span className="drive-name">{volume.name}</span>
+                <span className="drive-name" title={volume.path}>
+                  {volume.name}
+                </span>
+                {volume.detail ? (
+                  <span className="drive-device" title={volume.path}>
+                    {volume.detail}
+                  </span>
+                ) : null}
                 <span className="drive-bar">
                   <span
                     className="drive-bar-fill"

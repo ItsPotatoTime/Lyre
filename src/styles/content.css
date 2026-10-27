@@ -1212,7 +1212,9 @@ body[data-dragging] * {
 .drive-eject {
   position: absolute;
   right: 8px;
-  bottom: 8px;
+  /* Aligned with the volume's name rather than the capacity bar: sitting on
+     the bar made it look like part of the gauge and crowded the bottom edge. */
+  top: 9px;
   display: grid;
   place-items: center;
   width: 22px;
@@ -1223,6 +1225,12 @@ body[data-dragging] * {
   border: none;
 }
 
+/* Keep the name and the device clear of the button. */
+.drive-name,
+.drive-device {
+  padding-right: 26px;
+}
+
 .drive-eject:hover:not(:disabled) {
   background: var(--hover);
   color: var(--text-primary);
@@ -1231,4 +1239,3 @@ body[data-dragging] * {
 .drive-eject:disabled {
   opacity: 0.45;
 }
-

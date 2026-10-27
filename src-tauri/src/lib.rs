@@ -239,6 +239,13 @@ fn apps_for_file(path: String) -> openwith::OpenWith {
     openwith::open_with(&path)
 }
 
+/// Show the platform's own application picker, for platforms that protect the
+/// list and the default.
+#[tauri::command]
+fn choose_app_with_system(path: String) -> Result<(), String> {
+    openwith::choose_with_system(&path)
+}
+
 /// Open this file with a specific application.
 #[tauri::command]
 fn open_with_app(path: String, app_id: String) -> Result<(), String> {
@@ -354,6 +361,7 @@ pub fn run() {
             paste_into,
             delete_to_trash,
             apps_for_file,
+            choose_app_with_system,
             open_with_app,
             set_default_app
         ])

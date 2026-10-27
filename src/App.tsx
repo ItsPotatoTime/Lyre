@@ -26,6 +26,7 @@ import {
   appsForFile,
   openWithApp,
   setDefaultApp,
+  chooseAppWithSystem,
   type OpenWith,
   type PathProperties,
 } from "@/lib/ipc";
@@ -1279,6 +1280,24 @@ function Browser({
           busy={openWith.busy}
           error={openWith.error}
           onOpen={launchWith}
+          onUseSystem={() => {
+            if (!openWith) return;
+            void chooseAppWithSystem(openWith.path)
+              .then(() => setOpenWith(null))
+              .catch((error: unknown) =>
+                setOpenWith((prev) =>
+                  prev
+                    ? {
+                        ...prev,
+                        error:
+                          error instanceof Error
+                            ? error.message
+                            : "Could not open the picker.",
+                      }
+                    : prev,
+                ),
+              );
+          }}
           onCancel={() => setOpenWith(null)}
         />
       ) : null}

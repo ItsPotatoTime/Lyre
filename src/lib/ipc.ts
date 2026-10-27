@@ -322,6 +322,20 @@ export interface OpenWith {
   apps: { id: string; name: string }[];
   /** Set when this platform cannot answer, with the reason. */
   unsupported: string | null;
+  /**
+   * True where the platform protects its application list and defaults, so the
+   * system's own picker has to be used. Windows is this case.
+   */
+  systemPicker: boolean;
+}
+
+/** Ask the operating system to choose an application and set the default. */
+export async function chooseAppWithSystem(path: string): Promise<void> {
+  if (!isTauri) {
+    throw new Error("Choosing an application needs the desktop app.");
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("choose_app_with_system", { path });
 }
 
 export async function appsForFile(path: string): Promise<OpenWith> {

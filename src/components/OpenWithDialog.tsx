@@ -18,6 +18,7 @@ export function OpenWithDialog({
   busy,
   error,
   onOpen,
+  onUseSystem,
   onCancel,
 }: {
   fileName: string;
@@ -26,6 +27,7 @@ export function OpenWithDialog({
   busy: boolean;
   error: string | null;
   onOpen: (appId: string, remember: boolean) => void;
+  onUseSystem: () => void;
   onCancel: () => void;
 }) {
   const [selected, setSelected] = useState<string | null>(null);
@@ -53,6 +55,9 @@ export function OpenWithDialog({
 
   const unavailable = data?.unsupported ?? null;
   const apps = data?.apps ?? [];
+  // Windows keeps its application list in package manifests and hash-protects
+  // the default, so its own picker is the only correct answer there.
+  const systemPicker = data?.systemPicker === true;
 
   return (
     <div
@@ -89,6 +94,21 @@ export function OpenWithDialog({
 
         {error || unavailable ? (
           <p className="dialog-note">{error ?? unavailable}</p>
+        ) : systemPicker ? (
+          <>
+            <p className="dialog-note">
+              Windows keeps the list of applications and protects the default,
+              so it chooses here. Pick an application and tick{" "}
+              <strong>Always use this app</strong> to make it the default
+              {data?.defaultApp ? (
+                <>
+                  {" "}
+                  (currently <strong>{data.defaultApp}</strong>)
+                </>
+              ) : null}
+              .
+            </p>
+          </>
         ) : data === null ? (
           <p className="dialog-note">Looking for applications that can open this…</p>
         ) : apps.length === 0 ? (
@@ -120,15 +140,17 @@ export function OpenWithDialog({
           </div>
         )}
 
-        <label className="dialog-check">
-          <input
-            type="checkbox"
-            checked={remember}
-            disabled={apps.length === 0 || busy}
-            onChange={(event) => setRemember(event.target.checked)}
-          />
-          Always use this application to open {data?.mime ?? "these"} files
-        </label>
+        {systemPicker ? null : (
+          <label className="dialog-check">
+            <input
+              type="checkbox"
+              checked={remember}
+              disabled={apps.length === 0 || busy}
+              onChange={(event) => setRemember(event.target.checked)}
+            />
+            Always use this application to open {data?.mime ?? "these"} files
+          </label>
+        )}
 
         <footer className="dialog-foot">
           <button
@@ -139,14 +161,25 @@ export function OpenWithDialog({
           >
             Cancel
           </button>
-          <button
-            type="button"
-            className="dialog-action dialog-action-primary"
-            disabled={!selected || busy || apps.length === 0}
-            onClick={() => selected && onOpen(selected, remember)}
-          >
-            {busy ? "Opening…" : "Open"}
-          </button>
+          {systemPicker ? (
+            <button
+              type="button"
+              className="dialog-action dialog-action-primary"
+              disabled={busy}
+              onClick={onUseSystem}
+            >
+              Choose an app…
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="dialog-action dialog-action-primary"
+              disabled={!selected || busy || apps.length === 0}
+              onClick={() => selected && onOpen(selected, remember)}
+            >
+              {busy ? "Opening…" : "Open"}
+            </button>
+          )}
         </footer>
       </div>
     </div>

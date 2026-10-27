@@ -41,8 +41,15 @@ file contents search, thumbnails and the preview pane.
 
 Copy, move and delete never overwrite. A paste onto an existing name becomes
 "name (2)", and delete moves to the freedesktop trash, which the desktop can put
-back. Choosing an application is implemented on Linux, through the desktop's own
-MIME database; elsewhere the dialog says so rather than guessing.
+back.
+
+"Open with" is implemented differently per platform, because the platforms are
+different. On Linux the list is read from the desktop's own `.desktop` entries
+and the default is changed with `xdg-mime`. On Windows the list lives partly in
+package manifests and is activated through COM, and the default is a
+`UserChoice` key that Windows hash-validates, so the dialog hands off to
+`SHOpenWithDialog`: the same picker Explorer uses for "Choose another app", which
+knows every registered app and sets the default properly.
 
 ## Running it
 

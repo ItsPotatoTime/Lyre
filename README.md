@@ -164,6 +164,13 @@ shown are described and sent. Measured on this machine:
 The cost is now the directory walk itself, whatever the number of matches, so a
 query that matches everything costs the same as one that matches nothing.
 
+A walk has exactly one ceiling: five million entries examined. It used to stop
+after three seconds as well, which meant the same query returned different
+answers on different machines, because a slow disk examines fewer entries in a
+fixed time. A count is a property of the tree rather than of the hardware, so
+what one person finds is what another finds. The cap is high enough that only a
+genuinely enormous tree meets it, and the status bar says so when it does.
+
 `cargo test --lib bench -- --ignored --nocapture` reruns the measurements.
 
 ## Memory

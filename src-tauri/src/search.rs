@@ -38,14 +38,18 @@ use std::time::{Duration, Instant};
 /// Results handed to the interface. Past this the list is noise, and every
 /// extra row is bytes across the IPC boundary on every keystroke.
 const LIMIT: usize = 1000;
-/// Ceiling on entries examined by a recursive walk. The walker reads a few
-/// million names a second, so this is a guard against a pathological tree
-/// rather than a normal stopping point; the time budget below usually binds
-/// first on slow disks, and this one on fast ones.
+/// The only ceiling on a recursive walk: entries examined.
+///
+/// It used to be paired with a three second wall clock, which made the same
+/// query return different answers on different machines, because a slow disk
+/// examines fewer entries in a fixed time. A count is a property of the tree
+/// rather than of the hardware, so two people searching the same thing get the
+/// same answer. The walk ends early only for a genuinely enormous tree, and
+/// says so.
+///
+/// The walk itself is stopped by a newer keystroke; the interface cancels the
+/// previous search, so this is not what keeps it bounded.
 const MAX_SCANNED: usize = 5_000_000;
-/// Wall-clock budget for the walk. Results have already been streaming for
-/// this long by the time it applies, so the interface is never waiting.
-const TIME_BUDGET_MS: u128 = 3000;
 const MAX_DEPTH: usize = 32;
 /// How long the walker may accumulate before flushing a batch.
 const BATCH_MS: u64 = 40;
@@ -557,7 +561,6 @@ where
         .min(12);
 
     let mut accepted = 0usize;
-    let walk_started = Instant::now();
     // Matches are counted by every worker, but only the first `LIMIT` are
     // turned into rows. Describing a file costs a `stat` and two allocations;
     // doing that for a query like "libc" across a home folder meant 43,000 of
@@ -717,11 +720,6 @@ where
                 break;
             }
 
-            if walk_started.elapsed().as_millis() >= TIME_BUDGET_MS {
-                cut = true;
-                cancel.store(true, Ordering::Relaxed);
-                break;
-            }
         }
 
         if !batch.is_empty() {

@@ -64,6 +64,21 @@ pub fn home() -> PathBuf {
     }
 }
 
+/// A cheap description of which volumes exist, for change detection.
+///
+/// Deliberately excludes free space: that changes on every write, and an event
+/// per write would refresh the rail constantly for no reason. Identity is the
+/// path, kind and total size, which change when a device is plugged in or
+/// removed and almost never otherwise.
+pub fn fingerprint() -> Vec<(String, String, u64)> {
+    let mut out: Vec<(String, String, u64)> = places()
+        .into_iter()
+        .map(|place| (place.path, place.kind.to_string(), place.total))
+        .collect();
+    out.sort();
+    out
+}
+
 pub fn places() -> Vec<Place> {
     let mut out = Vec::with_capacity(12);
     let home = home();
@@ -412,6 +427,24 @@ mod volume_tests {
                 volume.path
             );
         }
+    }
+
+    /// The change detector must not fire while nothing changes, or the rail
+    /// would re-render every couple of seconds for no reason.
+    #[test]
+    fn the_fingerprint_is_stable_between_reads() {
+        assert_eq!(fingerprint(), fingerprint());
+        assert!(!fingerprint().is_empty(), "the home folder is always present");
+    }
+
+    /// A fingerprint that ignored identity would never report a change.
+    #[test]
+    fn a_different_volume_list_produces_a_different_fingerprint() {
+        let before = fingerprint();
+        let mut after = before.clone();
+        after.push(("/run/media/you/stick".into(), "removable".into(), 16_000_000_000));
+        after.sort();
+        assert_ne!(before, after);
     }
 
     /// Unlabelled volumes still need a name a person can read.

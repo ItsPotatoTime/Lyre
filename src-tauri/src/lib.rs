@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::ipc::Channel;
-use tauri::State;
+use tauri::{Emitter, State};
 
 #[derive(Default)]
 struct AppState {
@@ -241,6 +241,34 @@ fn apps_for_file(path: String) -> openwith::OpenWith {
     openwith::open_with(&path)
 }
 
+/// Watch for volumes appearing and disappearing while the window is open.
+///
+/// A stick plugged in after startup was invisible until the next manual
+/// refresh. This polls the volume list, compares a fingerprint that ignores
+/// free space, and tells the window when it actually changed. Two seconds is
+/// the compromise: fast enough that plugging something in feels noticed, slow
+/// enough that the enumeration is invisible.
+fn watch_places(app: tauri::AppHandle) {
+    std::thread::Builder::new()
+        .name("lyre-places".into())
+        .spawn(move || {
+            let mut last = places::fingerprint();
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(2));
+                let current = places::fingerprint();
+                if current == last {
+                    continue;
+                }
+                last = current;
+                if std::env::var_os("LYRE_TRACE").is_some() {
+                    eprintln!("[lyre] volumes changed, {} entries", last.len());
+                }
+                let _ = app.emit("places-changed", places::places());
+            }
+        })
+        .ok();
+}
+
 /// Unmount a removable volume and power the device down.
 #[tauri::command]
 fn eject_volume(path: String) -> eject::EjectOutcome {
@@ -375,6 +403,10 @@ fn dir_stamp(path: String) -> Option<i64> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .setup(|app| {
+            watch_places(app.handle().clone());
+            Ok(())
+        })
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             scan_dir,

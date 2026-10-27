@@ -136,6 +136,31 @@ export default function App() {
     };
   }, []);
 
+  // Volumes can appear and disappear while the window is open. The main process
+  // watches for that and sends the new list, so a stick plugged in after
+  // startup shows up without a manual refresh.
+  useEffect(() => {
+    let stop: (() => void) | null = null;
+    let cancelled = false;
+
+    void import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen<Place[]>("places-changed", (event) => setPlaces(event.payload)),
+      )
+      .then((unlisten) => {
+        if (cancelled) unlisten();
+        else stop = unlisten;
+      })
+      .catch(() => {
+        // No event bridge (browser preview); the list simply does not update.
+      });
+
+    return () => {
+      cancelled = true;
+      stop?.();
+    };
+  }, []);
+
   if (home === null) {
     return (
       <div className="app">

@@ -24,6 +24,8 @@ Working now:
   means the home directory
 - Safe eject for removable volumes, and favorites and sidebar pins that can be
   added and removed from the context menus
+- Volumes appearing or disappearing are noticed while the window is open, so a
+  stick plugged in after startup shows up on its own
 - This PC lists volumes, not mounts: one card per device, labelled by its
   volume label with the device shown underneath
 - Right-click menus: Open, Open with, Cut, Copy, Copy path, Rename, Delete and

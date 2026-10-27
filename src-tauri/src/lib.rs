@@ -249,6 +249,21 @@ fn apps_for_file(path: String) -> openwith::OpenWith {
     openwith::open_with(&path)
 }
 
+/// A file path to the icon the platform shows while dragging out of the window.
+///
+/// The plugin wants a path, not bytes, so the icon is written once into the
+/// temporary directory. `include_bytes!` means this works the same in a
+/// development run and in a bundled application, where resource paths differ.
+#[tauri::command]
+fn drag_icon() -> Result<String, String> {
+    let path = std::env::temp_dir().join("lyre-drag-icon.png");
+    if !path.exists() {
+        std::fs::write(&path, include_bytes!("../icons/32x32.png"))
+            .map_err(|err| format!("Could not prepare the drag preview: {err}"))?;
+    }
+    Ok(path.to_string_lossy().into_owned())
+}
+
 /// Watch for volumes appearing and disappearing while the window is open.
 ///
 /// A stick plugged in after startup was invisible until the next manual
@@ -438,6 +453,7 @@ pub fn run() {
             become_file_manager,
             startup_folder,
             eject_volume,
+            drag_icon,
             open_with_app,
             set_default_app
         ])

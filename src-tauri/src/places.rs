@@ -254,6 +254,9 @@ fn volume_name(
     }
 }
 
+/// Only the Linux naming path falls back to a size, so the helper does not
+/// exist on Windows and would otherwise be dead code there.
+#[cfg(target_os = "linux")]
 fn gib(bytes: u64) -> String {
     let value = bytes as f64 / 1_073_741_824.0;
     if value >= 100.0 {

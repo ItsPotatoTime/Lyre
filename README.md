@@ -168,10 +168,16 @@ filesystem paths for a drop arriving from the operating system, and it replaces
 WebView2's HTML5 handler on Windows, which would leave internal dragging working
 everywhere except Windows.
 
-**Not supported: dragging out of Lyre.** Into Explorer, the desktop, or a second
-Lyre window. That needs an operating-system drag source, which Tauri does not
-provide without a plugin. Drops *from* the OS work and are always copies, since
-the source may be on another volume or another machine.
+**Dragging out of Lyre works.** Keep dragging past the window edge and the drag
+becomes a real operating-system drag, so it can be dropped into Discord, a mail
+client, LocalSend or another file manager. The copy-or-move mode goes with it, so
+the platform shows the same cursor the badge was showing. This uses
+`tauri-plugin-drag`, whose Linux implementation is GTK-based and therefore
+backend-agnostic; it has been type-checked for Windows but the cross-application
+drag itself still wants a real try on each platform.
+
+Drops *from* the OS work and are always copies, since the source may be on
+another volume or another machine.
 
 ## Keyboard
 

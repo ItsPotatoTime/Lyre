@@ -51,6 +51,7 @@ import {
 } from "@/lib/library";
 import { targetAt, useDrag, type DragTarget, type DropMode } from "@/lib/dragAndDrop";
 import { sameVolume } from "@/lib/volumes";
+import { startNativeDrag } from "@/lib/nativeDrag";
 import { measureFrameRate } from "@/lib/frameRate";
 import {
   clearDropHighlight,
@@ -690,7 +691,14 @@ function Browser({
     [volumes],
   );
 
-  const drag = useDrag(handleDrop, modeFor);
+  const drag = useDrag(handleDrop, modeFor, (paths, mode) => {
+    // The pointer left the window, so the drag is meant for another
+    // application. Handing it to the platform from here means the same gesture
+    // can finish in Discord or LocalSend.
+    void startNativeDrag(paths, mode).then((error) => {
+      if (error) flash(error);
+    });
+  });
 
   /**
    * Drops from outside the window arrive through Tauri with real paths. They

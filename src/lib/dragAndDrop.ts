@@ -44,6 +44,8 @@ interface DragSession {
   target: DragTarget | null;
   hovered: Element | null;
   mode: DropMode;
+  /** The element holding pointer capture, so moves outside the window arrive. */
+  captured: { element: Element; pointerId: number } | null;
 }
 
 const EMPTY: DragTarget | null = null;
@@ -80,6 +82,11 @@ export function useDrag(
     _target,
     shift,
   ) => (shift ? "copy" : "move"),
+  /**
+   * Called once when a drag leaves the window, so the caller can hand it to the
+   * operating system and let it finish in another application.
+   */
+  onLeaveWindow?: (paths: string[], mode: DropMode) => void,
 ) {
   const session = useRef<DragSession | null>(null);
   const badge = useRef<HTMLDivElement>(null);
@@ -87,6 +94,8 @@ export function useDrag(
   callback.current = onDrop;
   const decide = useRef(modeFor);
   decide.current = modeFor;
+  const leaveWindow = useRef(onLeaveWindow);
+  leaveWindow.current = onLeaveWindow;
 
   const paintBadge = useCallback((x: number, y: number, mode: DropMode, count: number) => {
     const element = badge.current;
@@ -125,12 +134,37 @@ export function useDrag(
         target: EMPTY,
         hovered: null,
         mode: decide.current(paths, null, event.shiftKey),
+        captured: null,
       };
+
+      // Without capture the window stops receiving pointer moves the moment
+      // the pointer leaves it, which is precisely the gesture that should hand
+      // the drag to another application.
+      const element = event.currentTarget as Element | null;
+      if (element && "setPointerCapture" in element) {
+        try {
+          (element as HTMLElement).setPointerCapture(event.pointerId);
+          session.current.captured = { element, pointerId: event.pointerId };
+        } catch {
+          // Capture is a convenience here, not a requirement.
+        }
+      }
     },
     [],
   );
 
+  const release = useCallback(() => {
+    const captured = session.current?.captured;
+    if (!captured) return;
+    try {
+      (captured.element as HTMLElement).releasePointerCapture(captured.pointerId);
+    } catch {
+      // Already released, or the element went away with the row.
+    }
+  }, []);
+
   const cancel = useCallback(() => {
+    release();
     clearHighlight();
     hideBadge();
     // The body flag drives the cursor for the whole window; leaving it set
@@ -156,6 +190,25 @@ export function useDrag(
           Math.abs(event.clientX - current.startX) + Math.abs(event.clientY - current.startY);
         if (moved < THRESHOLD) return;
         current.active = true;
+      }
+
+      // Off the window entirely: this drag is meant for another application.
+      const outside =
+        event.clientX <= 0 ||
+        event.clientY <= 0 ||
+        event.clientX >= window.innerWidth - 1 ||
+        event.clientY >= window.innerHeight - 1;
+      if (current.active && outside) {
+        const paths = current.paths;
+        const mode = current.mode;
+        // The native drag takes the pointer; this one is over.
+        release();
+        clearHighlight();
+        hideBadge();
+        delete document.body.dataset.dragging;
+        session.current = null;
+        leaveWindow.current?.(paths, mode);
+        return;
       }
 
       const target = targetAt(event.clientX, event.clientY);
@@ -187,6 +240,7 @@ export function useDrag(
       if (!current) return;
       // Clear the highlight while the session still knows which element it
       // marked; clearing after the reset would leave a ring on screen.
+      release();
       clearHighlight();
       session.current = null;
       delete document.body.dataset.dragging;
@@ -195,6 +249,25 @@ export function useDrag(
 
       // Re-run the hit test at the release point: the last pointermove may have
       // been a few pixels away from where the button actually came up.
+      // Off the window entirely: this drag is meant for another application.
+      const outside =
+        event.clientX <= 0 ||
+        event.clientY <= 0 ||
+        event.clientX >= window.innerWidth - 1 ||
+        event.clientY >= window.innerHeight - 1;
+      if (current.active && outside) {
+        const paths = current.paths;
+        const mode = current.mode;
+        // The native drag takes the pointer; this one is over.
+        release();
+        clearHighlight();
+        hideBadge();
+        delete document.body.dataset.dragging;
+        session.current = null;
+        leaveWindow.current?.(paths, mode);
+        return;
+      }
+
       const target = targetAt(event.clientX, event.clientY);
       if (!target) return;
       if (current.paths.some((path) => target.path.startsWith(path))) return;
@@ -252,7 +325,7 @@ export function useDrag(
       window.removeEventListener("keyup", onKey, true);
       window.removeEventListener("blur", onBlur);
     };
-  }, [cancel, clearHighlight, hideBadge, paintBadge]);
+  }, [cancel, clearHighlight, hideBadge, paintBadge, release]);
 
   return { begin, cancel, badge };
 }

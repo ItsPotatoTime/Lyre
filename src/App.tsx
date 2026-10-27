@@ -20,7 +20,6 @@ import {
   getHomeDir,
   getPathInfo,
   getPlaces,
-  getPlatform,
   openPath,
   pathProperties,
   renamePath,
@@ -40,7 +39,7 @@ import { matchIndex, useSearch } from "@/lib/useSearch";
 import { useReveal } from "@/lib/hooks";
 import { useTheme } from "@/lib/theme";
 import { loadPrefs, savePrefs, type Prefs } from "@/lib/prefs";
-import { setHomePath, setPlatform } from "@/lib/platform";
+import { setHomePath } from "@/lib/platform";
 import { targetAt, useDrag, type DragTarget, type DropMode } from "@/lib/dragAndDrop";
 import { measureFrameRate } from "@/lib/frameRate";
 import {
@@ -117,17 +116,14 @@ export default function App() {
 
   useEffect(() => {
     let cancelled = false;
-    void Promise.all([getHomeDir(), getPlaces(), getPlatform()]).then(
-      ([start, list, os]) => {
+    void Promise.all([getHomeDir(), getPlaces()]).then(([start, list]) => {
         if (cancelled) return;
-        // Known before the first paint of the chrome, so "Home" never flashes
-        // in a window that should call the landing page something else.
-        setPlatform(os);
+        // Known before the chrome paints, so the home directory is named
+        // rather than spelled from the first frame.
         setHomePath(start);
         setHome(start);
         setPlaces(list);
-      },
-    );
+    });
     return () => {
       cancelled = true;
     };

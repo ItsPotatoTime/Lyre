@@ -290,12 +290,6 @@ fn path_info(path: String) -> places::PathInfo {
     places::path_info(&path)
 }
 
-/// Which desktop this is, so the interface can use the name each one expects.
-#[tauri::command]
-fn host_platform() -> String {
-    std::env::consts::OS.to_string()
-}
-
 /// The navigation rail's contents: home, known folders, and mounted volumes.
 #[tauri::command]
 fn places() -> Vec<places::Place> {
@@ -382,7 +376,6 @@ pub fn run() {
             release_job,
             path_info,
             places,
-            host_platform,
             home_dir,
             dir_stamp,
             open_path,

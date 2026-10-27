@@ -1,5 +1,5 @@
 import type { Location, LocationKind, PathInfo } from "@/types";
-import { folderLabel, landingLabel } from "./platform";
+import { folderLabel, LANDING_LABEL } from "./platform";
 
 /** Explorer's Home page is a place, not a directory, so it gets its own kind. */
 export const home = (path: string): Location => ({ kind: "home", path });
@@ -15,7 +15,7 @@ export function isVirtual(location: Location): boolean {
 export function locationLabel(location: Location): string {
   switch (location.kind) {
     case "home":
-      return landingLabel();
+      return LANDING_LABEL;
     case "thisPc":
       return "This PC";
     case "gallery":
@@ -64,7 +64,7 @@ export function parentOf(
 export function kindLabel(kind: LocationKind): string {
   switch (kind) {
     case "home":
-      return landingLabel();
+      return LANDING_LABEL;
     case "thisPc":
       return "This PC";
     case "gallery":

@@ -316,13 +316,6 @@ export async function deleteToTrash(paths: string[]): Promise<number> {
   return invoke<number>("delete_to_trash", { paths });
 }
 
-/** "linux", "windows" or "macos". */
-export async function getPlatform(): Promise<string> {
-  if (!isTauri) return "linux";
-  const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<string>("host_platform");
-}
-
 export interface ManagerState {
   current: string | null;
   isDefault: boolean;

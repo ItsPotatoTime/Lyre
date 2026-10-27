@@ -14,8 +14,8 @@ through the Rust core and paints whatever it finds.
 Working now:
 
 - Drag and drop: onto a folder, a breadcrumb, a tab, the navigation rail, or
-  the folder itself; move by default, copy while Shift is held, with the
-  pending action shown at the pointer
+  the folder itself. Within one volume it moves, across volumes it copies,
+  Shift inverts whichever applies, and the pointer shows which will happen
 - Drops from the operating system, copied into wherever they land
 - Rubber-band selection: drag from empty space to select everything the
   rectangle touches, with Shift or Ctrl to add
@@ -150,8 +150,14 @@ compositor is allowed to exceed the monitor rate.
 
 Dragging works onto a folder row, the empty space in a folder, any breadcrumb,
 any tab, and the navigation rail. The pointer carries a badge saying **Move** or
-**Copy**, and holding Shift switches from one to the other; the zone under the
-pointer is outlined in the accent colour.
+**Copy**, and the zone under the pointer is outlined in the accent colour.
+
+What it does depends on where it would land, before any key is pressed. Within
+one volume a drag moves, because that is the point of dragging something to a
+folder beside it. Across volumes it copies, because moving to a USB stick should
+not take the file off the disk by accident and would mean a full rewrite anyway.
+Shift inverts whichever is the default, and the badge follows as the pointer
+crosses between volumes.
 
 Moving an item into the folder it already lives in, or a folder into itself, is
 refused rather than quietly turning into a rename.

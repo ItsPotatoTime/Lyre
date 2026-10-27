@@ -70,11 +70,23 @@ export function targetAt(x: number, y: number): DragTarget | null {
 
 export function useDrag(
   onDrop: (target: DragTarget, mode: DropMode, paths: string[]) => void,
+  /**
+   * Decides move or copy for a drag. The caller owns this because it depends on
+   * which volumes the paths are on, and holding Shift inverts whatever the
+   * default is rather than always meaning one thing.
+   */
+  modeFor: (paths: string[], target: DragTarget | null, shift: boolean) => DropMode = (
+    _paths,
+    _target,
+    shift,
+  ) => (shift ? "copy" : "move"),
 ) {
   const session = useRef<DragSession | null>(null);
   const badge = useRef<HTMLDivElement>(null);
   const callback = useRef(onDrop);
   callback.current = onDrop;
+  const decide = useRef(modeFor);
+  decide.current = modeFor;
 
   const paintBadge = useCallback((x: number, y: number, mode: DropMode, count: number) => {
     const element = badge.current;
@@ -112,7 +124,7 @@ export function useDrag(
         active: false,
         target: EMPTY,
         hovered: null,
-        mode: event.shiftKey ? "copy" : "move",
+        mode: decide.current(paths, null, event.shiftKey),
       };
     },
     [],
@@ -136,7 +148,6 @@ export function useDrag(
       // says which one will happen before the button is released. Pointer
       // events do report modifiers correctly, so they are the reliable source.
       current.shiftHeld = event.shiftKey;
-      current.mode = current.shiftHeld ? "copy" : "move";
       current.x = event.clientX;
       current.y = event.clientY;
 
@@ -155,6 +166,9 @@ export function useDrag(
           : target;
 
       current.target = usable;
+      // What this drag does depends on where it would land, so the mode is
+      // worked out against the zone under the pointer rather than up front.
+      current.mode = decide.current(current.paths, usable, current.shiftHeld);
 
       const zone = usable ? document.elementFromPoint(event.clientX, event.clientY) : null;
       const zoneElement = (zone?.closest("[data-drop]") as Element | null) ?? null;
@@ -205,7 +219,7 @@ export function useDrag(
         // The event's own type decides which way the key went. Its `shiftKey`
         // field cannot be trusted for the Shift keyup on WebKit.
         current.shiftHeld = event.type === "keydown";
-        current.mode = current.shiftHeld ? "copy" : "move";
+        current.mode = decide.current(current.paths, current.target, current.shiftHeld);
         if (current.active) {
           paintBadge(current.x, current.y, current.mode, current.paths.length);
           document.body.dataset.dragging = current.mode;
@@ -220,9 +234,9 @@ export function useDrag(
       const current = session.current;
       if (!current || !current.active) return;
       current.shiftHeld = false;
-      current.mode = "move";
-      paintBadge(current.x, current.y, "move", current.paths.length);
-      document.body.dataset.dragging = "move";
+      current.mode = decide.current(current.paths, current.target, false);
+      paintBadge(current.x, current.y, current.mode, current.paths.length);
+      document.body.dataset.dragging = current.mode;
     };
 
     window.addEventListener("keydown", onKey, true);

@@ -50,6 +50,7 @@ import {
   type Library,
 } from "@/lib/library";
 import { targetAt, useDrag, type DragTarget, type DropMode } from "@/lib/dragAndDrop";
+import { sameVolume } from "@/lib/volumes";
 import { measureFrameRate } from "@/lib/frameRate";
 import {
   clearDropHighlight,
@@ -674,7 +675,22 @@ function Browser({
     [flash, requestPaste],
   );
 
-  const drag = useDrag(handleDrop);
+  /**
+   * Between volumes, copying is the default and Shift moves; within one volume
+   * it is the other way round. Dragging to a USB stick should not move a file
+   * off the disk by accident.
+   */
+  const modeFor = useCallback(
+    (paths: string[], target: DragTarget | null, shift: boolean): DropMode => {
+      const local = target ? sameVolume(paths, target.path, volumes) : true;
+      const base: DropMode = local ? "move" : "copy";
+      if (!shift) return base;
+      return base === "move" ? "copy" : "move";
+    },
+    [volumes],
+  );
+
+  const drag = useDrag(handleDrop, modeFor);
 
   /**
    * Drops from outside the window arrive through Tauri with real paths. They

@@ -71,7 +71,7 @@ function EntryIcon({
   size: number;
 }) {
   const wanted = previewable(entry.name);
-  const thumbnail = useThumbnail(entry.path, wanted);
+  const thumbnail = useThumbnail(entry.path, wanted, entry.size);
   if (thumbnail) {
     return (
       <img

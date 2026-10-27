@@ -827,36 +827,39 @@ mod memory_tests {
         }
     }
 
-    /// What the cache costs per row, in both representations, measured rather
-    /// than estimated. The compact form exists because the full one carries an
-    /// absolute path and an extension per row that are both derivable.
+    /// What the cache costs per row, in both representations.
+    ///
+    /// Counted rather than estimated: the struct plus the bytes its strings
+    /// own. A global allocator counter was the first attempt, but tests run in
+    /// parallel and it measured the whole process, so its deltas were noise.
     #[test]
     fn the_compact_form_costs_far_less_per_row() {
         const ROWS: usize = 20_000;
         let folder = "/home/someone/Downloads";
 
-        let before = crate::counting_alloc::live_bytes();
         let full: Vec<Entry> = (0..ROWS).map(|i| entry(i, folder)).collect();
-        let full_bytes = crate::counting_alloc::live_bytes() - before;
         let compact: Vec<CompactEntry> = full.iter().map(CompactEntry::from).collect();
-        let both_bytes = crate::counting_alloc::live_bytes() - before;
-        let compact_bytes = both_bytes - full_bytes;
-        drop(full);
+
+        let full_row = std::mem::size_of::<Entry>()
+            + full
+                .iter()
+                .map(|e| e.name.len() + e.path.len() + e.ext.len())
+                .sum::<usize>()
+                / ROWS;
+        let compact_row = std::mem::size_of::<CompactEntry>()
+            + compact.iter().map(|e| e.name.len()).sum::<usize>() / ROWS;
 
         println!(
-            "20k rows: full {:.1} MB, compact {:.1} MB ({:.0}% smaller), {:.0} B/row vs {:.0} B/row",
-            full_bytes as f64 / 1e6,
-            compact_bytes as f64 / 1e6,
-            100.0 * (1.0 - compact_bytes as f64 / full_bytes as f64),
-            full_bytes as f64 / ROWS as f64,
-            compact_bytes as f64 / ROWS as f64,
+            "20k rows: full {full_row} B/row ({:.1} MB), compact {compact_row} B/row ({:.1} MB), {:.0}% smaller",
+            (full_row * ROWS) as f64 / 1e6,
+            (compact_row * ROWS) as f64 / 1e6,
+            100.0 * (1.0 - compact_row as f64 / full_row as f64),
         );
 
         assert!(
-            compact_bytes * 2 < full_bytes,
-            "compaction should at least halve the cost: {compact_bytes} vs {full_bytes}"
+            compact_row * 2 < full_row,
+            "compaction should at least halve the cost: {compact_row} vs {full_row}"
         );
-        drop(compact);
     }
 
     /// The rebuilt row must equal the one the scan produced, or the saving is

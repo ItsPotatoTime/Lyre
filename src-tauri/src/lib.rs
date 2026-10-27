@@ -16,42 +16,7 @@ mod places;
 mod scan;
 mod search;
 
-/// Counts live heap bytes in tests, so a memory claim can be measured instead
-/// of estimated. Compiled only for the test harness.
-#[cfg(test)]
-mod counting_alloc {
-    use std::alloc::{GlobalAlloc, Layout, System};
-    use std::sync::atomic::{AtomicIsize, Ordering};
 
-    static LIVE: AtomicIsize = AtomicIsize::new(0);
-
-    pub struct Counting;
-
-    unsafe impl GlobalAlloc for Counting {
-        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-            LIVE.fetch_add(layout.size() as isize, Ordering::Relaxed);
-            unsafe { System.alloc(layout) }
-        }
-
-        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-            LIVE.fetch_sub(layout.size() as isize, Ordering::Relaxed);
-            unsafe { System.dealloc(ptr, layout) }
-        }
-
-        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-            LIVE.fetch_add(new_size as isize - layout.size() as isize, Ordering::Relaxed);
-            unsafe { System.realloc(ptr, layout, new_size) }
-        }
-    }
-
-    pub fn live_bytes() -> isize {
-        LIVE.load(Ordering::Relaxed)
-    }
-}
-
-#[cfg(test)]
-#[global_allocator]
-static TEST_ALLOCATOR: counting_alloc::Counting = counting_alloc::Counting;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -289,8 +254,16 @@ fn delete_to_trash(state: State<'_, AppState>, paths: Vec<String>) -> Result<usi
 
 /// Which applications can open this file, and which one currently does.
 #[tauri::command]
-fn apps_for_file(path: String) -> openwith::OpenWith {
-    openwith::open_with(&path)
+async fn apps_for_file(path: String) -> openwith::OpenWith {
+    tauri::async_runtime::spawn_blocking(move || openwith::open_with(&path))
+        .await
+        .unwrap_or_else(|_| openwith::OpenWith {
+            mime: String::new(),
+            default_app: None,
+            apps: Vec::new(),
+            unsupported: Some("Could not read the application list.".into()),
+            system_picker: false,
+        })
 }
 
 /// A file path to the icon the platform shows while dragging out of the window.
@@ -310,15 +283,25 @@ fn drag_icon() -> Result<String, String> {
 
 /// What the preview pane should show for a file.
 #[tauri::command]
-fn preview_info(path: String) -> preview::PreviewInfo {
-    preview::info(&path)
+async fn preview_info(path: String) -> preview::PreviewInfo {
+    // Synchronous commands run on the webview's own thread, and this one reads
+    // a file. Off the main loop it goes.
+    tauri::async_runtime::spawn_blocking(move || preview::info(&path))
+        .await
+        .unwrap_or_else(|_| preview::unavailable())
 }
 
 /// The thumbnail for a file, as PNG bytes rather than a path, so the webview
 /// never gets permission to read the file itself.
 #[tauri::command]
-fn preview_thumbnail(path: String) -> Result<tauri::ipc::Response, String> {
-    preview::thumbnail(&path).map(tauri::ipc::Response::new)
+async fn preview_thumbnail(path: String) -> Result<tauri::ipc::Response, String> {
+    // This spawns ffmpeg or pdftoppm and waits for it. Run synchronously it
+    // blocked the main thread for the length of every thumbnail, which froze
+    // the window on any folder with pictures in it.
+    let bytes = tauri::async_runtime::spawn_blocking(move || preview::thumbnail(&path))
+        .await
+        .map_err(|err| err.to_string())??;
+    Ok(tauri::ipc::Response::new(bytes))
 }
 
 /// Whether the reduced-memory graphics path is set, and whether it is active.
@@ -373,27 +356,40 @@ fn watch_places(app: tauri::AppHandle) {
 
 /// Unmount a removable volume and power the device down.
 #[tauri::command]
-fn eject_volume(path: String) -> eject::EjectOutcome {
-    eject::eject(&path)
+async fn eject_volume(path: String) -> eject::EjectOutcome {
+    // Unmounting can take seconds, and the window must stay alive while it does.
+    tauri::async_runtime::spawn_blocking(move || eject::eject(&path))
+        .await
+        .unwrap_or_else(|_| eject::EjectOutcome {
+            ejected: false,
+            steps: Vec::new(),
+            error: Some("The eject task stopped unexpectedly.".into()),
+        })
 }
 
 /// Whether this application is the desktop's folder handler, and if not, what
 /// is. Called when the window opens to decide whether to offer the switch.
 #[tauri::command]
-fn file_manager_state() -> defaultmanager::ManagerState {
-    defaultmanager::state()
+async fn file_manager_state() -> defaultmanager::ManagerState {
+    tauri::async_runtime::spawn_blocking(defaultmanager::state)
+        .await
+        .unwrap_or_else(|_| defaultmanager::unavailable())
 }
 
 /// Register as the handler for folders.
 #[tauri::command]
-fn become_file_manager() -> Result<defaultmanager::ManagerState, String> {
-    defaultmanager::make_default()
+async fn become_file_manager() -> Result<defaultmanager::ManagerState, String> {
+    tauri::async_runtime::spawn_blocking(defaultmanager::make_default)
+        .await
+        .map_err(|err| err.to_string())?
 }
 
 /// Undo the folder handler change, putting the platform's own back.
 #[tauri::command]
-fn restore_file_manager() -> Result<defaultmanager::ManagerState, String> {
-    defaultmanager::restore()
+async fn restore_file_manager() -> Result<defaultmanager::ManagerState, String> {
+    tauri::async_runtime::spawn_blocking(defaultmanager::restore)
+        .await
+        .map_err(|err| err.to_string())?
 }
 
 /// The folder this process was launched with, if it was launched with one.
@@ -435,8 +431,12 @@ fn path_info(path: String) -> places::PathInfo {
 
 /// The navigation rail's contents: home, known folders, and mounted volumes.
 #[tauri::command]
-fn places() -> Vec<places::Place> {
-    let list = places::places();
+async fn places() -> Vec<places::Place> {
+    // Enumerating volumes touches every mount and reads the udev links, so it
+    // belongs off the thread that draws the window.
+    let list = tauri::async_runtime::spawn_blocking(places::places)
+        .await
+        .unwrap_or_default();
     if std::env::var_os("LYRE_TRACE").is_some() {
         let volumes: Vec<&places::Place> =
             list.iter().filter(|place| place.kind != "folder").collect();

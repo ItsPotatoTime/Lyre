@@ -308,6 +308,17 @@ pub fn startup_path() -> Option<String> {
     None
 }
 
+/// The shape the interface expects when the platform cannot answer at all.
+pub fn unavailable() -> ManagerState {
+    ManagerState {
+        current: None,
+        is_default: false,
+        unsupported: Some("The folder handler could not be read.".into()),
+        desktop_file: None,
+        restore_supported: false,
+    }
+}
+
 #[cfg(target_os = "linux")]
 pub use linux::{make_default, restore, state};
 

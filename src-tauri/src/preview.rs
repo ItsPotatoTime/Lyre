@@ -21,6 +21,9 @@ const THUMB_EDGE: u32 = 480;
 /// How much of a text file is worth reading for a preview.
 const TEXT_BYTES: usize = 4096;
 const TEXT_LINES: usize = 24;
+/// Beyond this, decoding costs more than a preview is worth: a 300 MB image or
+/// a film would hold the decoder for a long time and produce a 480 pixel square.
+const MAX_PREVIEW_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -86,6 +89,9 @@ fn run(program: &str, args: &[&str]) -> bool {
 /// Make the thumbnail if it is not already cached, and return where it is.
 fn thumbnail_path(path: &Path) -> Result<PathBuf, String> {
     let meta = std::fs::metadata(path).map_err(|err| format!("{err}"))?;
+    if meta.len() > MAX_PREVIEW_BYTES {
+        return Err("File is too large to preview.".into());
+    }
     let modified = meta
         .modified()
         .ok()
@@ -151,6 +157,36 @@ fn thumbnail_path(path: &Path) -> Result<PathBuf, String> {
     }
 }
 
+/// Read only as much as the preview can show.
+///
+/// This used to read the entire file and then take the first few kilobytes,
+/// which meant selecting a large log read the whole thing into memory to
+/// display two dozen lines of it.
+fn excerpt_of(path: &Path) -> Option<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path).ok()?;
+    let mut buffer = Vec::with_capacity(TEXT_BYTES);
+    file.take(TEXT_BYTES as u64).read_to_end(&mut buffer).ok()?;
+    Some(
+        String::from_utf8_lossy(&buffer)
+            .lines()
+            .take(TEXT_LINES)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+}
+
+/// The shape the interface expects when a preview cannot be produced at all.
+pub fn unavailable() -> PreviewInfo {
+    PreviewInfo {
+        kind: "other".into(),
+        size: 0,
+        modified_ms: None,
+        excerpt: None,
+        has_thumbnail: false,
+    }
+}
+
 fn modified_ms(path: &Path) -> Option<i64> {
     std::fs::metadata(path)
         .ok()?
@@ -168,14 +204,7 @@ pub fn info(path: &str) -> PreviewInfo {
     let kind = kind_of(path, is_dir);
 
     let excerpt = if kind == "text" {
-        std::fs::read(path).ok().map(|bytes| {
-            let slice = &bytes[..bytes.len().min(TEXT_BYTES)];
-            String::from_utf8_lossy(slice)
-                .lines()
-                .take(TEXT_LINES)
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
+        excerpt_of(path)
     } else {
         None
     };
@@ -287,6 +316,40 @@ mod thumbnail_tests {
         // Second call is served from the cache, byte for byte.
         let again = thumbnail(&image.to_string_lossy()).expect("cached thumbnail");
         assert_eq!(bytes, again);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod read_tests {
+    use super::*;
+
+    /// A preview of a large file must not read the large file.
+    #[test]
+    fn a_huge_text_file_is_read_only_at_the_head() {
+        let dir = std::env::temp_dir().join(format!("lyre-huge-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("server.log");
+        // 8 MB of one long line, then a marker far past the preview window.
+        let mut body = vec![b'x'; 8 * 1024 * 1024];
+        body.extend_from_slice(b"\nMARKER-BEYOND-THE-HEAD\n");
+        std::fs::write(&file, &body).unwrap();
+
+        let started = std::time::Instant::now();
+        let info = info(&file.to_string_lossy());
+        let elapsed = started.elapsed();
+
+        let excerpt = info.excerpt.expect("an excerpt");
+        assert!(excerpt.len() <= TEXT_BYTES, "excerpt is bounded");
+        assert!(
+            !excerpt.contains("MARKER-BEYOND-THE-HEAD"),
+            "nothing past the head should be read"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "reading 8 MB took {elapsed:?}, so the whole file is still being slurped"
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

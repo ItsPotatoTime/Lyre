@@ -2,6 +2,7 @@ import { useEffect, useRef, useState, type RefObject } from "react";
 import type { Entry, Location, PathInfo } from "@/types";
 import { locationLabel } from "@/lib/location";
 import { Icon } from "./Icons";
+import { folderLabel } from "@/lib/platform";
 import { Menu } from "./Menu";
 import { PlaceGlyph } from "./FileGlyph";
 
@@ -192,7 +193,9 @@ export function AddressBar({
                         onNavigate({ kind: "folder", path: segment.path })
                       }
                     >
-                      <span className="crumb-label">{segment.name}</span>
+                      <span className="crumb-label">
+                        {folderLabel(segment.path, segment.name)}
+                      </span>
                     </button>
                     {index < folded.length - 1 ? (
                       <Icon

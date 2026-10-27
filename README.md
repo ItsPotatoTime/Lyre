@@ -20,6 +20,8 @@ Working now:
 - Rubber-band selection: drag from empty space to select everything the
   rectangle touches, with Shift or Ctrl to add
 - An offer, once at startup, to become the desktop's folder handler
+- On Linux the landing page is "Quick access" and "Home" is the real home
+  directory; on Windows the landing page keeps Explorer's "Home"
 - This PC lists volumes, not mounts: one card per device, labelled by its
   volume label with the device shown underneath
 - Right-click menus: Open, Open with, Cut, Copy, Copy path, Rename, Delete and

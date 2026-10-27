@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { Location, Place } from "@/types";
 import { folder, gallery as galleryLocation, home, thisPc } from "@/lib/location";
+import { HOME_FOLDER_LABEL, landingLabel } from "@/lib/platform";
 import { Icon } from "./Icons";
 import { PlaceGlyph } from "./FileGlyph";
 
@@ -61,10 +62,25 @@ export function NavRail({
         <div className="nav-section">
           <NavRow
             glyph={<PlaceGlyph icon="home" size={16} />}
-            label="Home"
+            label={landingLabel()}
             active={location.kind === "home"}
             onClick={() => onNavigate(home(folders[0]?.path ?? pictures))}
           />
+          {/* On Linux "Home" means the home directory, so it gets its own row
+              instead of being the page above. On Windows that name belongs to
+              the landing page, and Explorer has no separate home entry. */}
+          {landingLabel() !== "Home" ? (
+            <NavRow
+              glyph={<PlaceGlyph icon="home" size={16} />}
+              label={HOME_FOLDER_LABEL}
+              active={
+                location.kind === "folder" && location.path === folders[0]?.path
+              }
+              pinned
+              dropPath={folders[0]?.path}
+              onClick={() => onNavigate(folder(folders[0]?.path ?? pictures))}
+            />
+          ) : null}
           <NavRow
             glyph={<PlaceGlyph icon="image" size={16} />}
             label="Gallery"

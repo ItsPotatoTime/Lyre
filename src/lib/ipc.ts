@@ -256,10 +256,24 @@ export interface PasteHandlers {
  * The paste never overwrites: a name that already exists gets a numbered
  * sibling. Progress arrives per item, so a large folder shows movement.
  */
+/** What to do when the destination already holds an item of the same name. */
+export type Conflict = "rename" | "overwrite" | "skip";
+
+/** Which of these items already exist in the destination. */
+export async function pasteConflicts(
+  destination: string,
+  sources: string[],
+): Promise<string[]> {
+  if (!isTauri) return [];
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<string[]>("paste_conflicts", { destination, sources });
+}
+
 export async function pasteInto(
   destination: string,
   sources: string[],
   mode: "copy" | "cut",
+  conflict: Conflict,
   handlers: PasteHandlers,
 ): Promise<ScanHandle> {
   if (!isTauri) {
@@ -290,6 +304,7 @@ export async function pasteInto(
       destination,
       sources,
       mode,
+      conflict,
       onEvent: channel,
     });
   } catch (error) {

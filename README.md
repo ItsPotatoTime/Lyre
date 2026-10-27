@@ -54,9 +54,11 @@ Working now:
 Not implemented yet, and honest about it in the interface: share, drag and drop,
 file contents search, thumbnails and the preview pane.
 
-Copy, move and delete never overwrite. A paste onto an existing name becomes
-"name (2)", and delete moves to the freedesktop trash, which the desktop can put
-back.
+A paste that would land on an existing name asks first: keep both, which numbers
+the incoming item, or replace. Replacing merges a folder rather than deleting it,
+so files that exist only in the destination survive and only the files present in
+both are written over. Delete moves to the freedesktop trash, which the desktop
+can put back.
 
 "Open with" is implemented differently per platform, because the platforms are
 different. On Linux the list is read from the desktop's own `.desktop` entries

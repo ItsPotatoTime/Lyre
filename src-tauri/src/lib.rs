@@ -196,6 +196,7 @@ fn paste_into(
     destination: String,
     sources: Vec<String>,
     mode: fileops::Mode,
+    conflict: fileops::Conflict,
     on_event: Channel<fileops::PasteEvent>,
 ) -> Result<u64, String> {
     let (id, cancel) = state.begin();
@@ -206,7 +207,7 @@ fn paste_into(
     std::thread::Builder::new()
         .name("lyre-paste".into())
         .spawn(move || {
-            fileops::paste(&destination, &sources, mode, &cancel, |event| {
+            fileops::paste(&destination, &sources, mode, conflict, &cancel, |event| {
                 on_event.send(event).is_ok()
             });
             // Both ends changed: the destination gained rows and, when moving,
@@ -221,6 +222,13 @@ fn paste_into(
         .map_err(|err| format!("Could not start the paste: {err}"))?;
 
     Ok(id)
+}
+
+/// Which of these items already exist in the destination, so the interface can
+/// ask before anything is written.
+#[tauri::command]
+fn paste_conflicts(destination: String, sources: Vec<String>) -> Vec<String> {
+    fileops::conflicts(&destination, &sources)
 }
 
 /// Move entries to the trash and report how many went.
@@ -422,6 +430,7 @@ pub fn run() {
             rename_path,
             path_properties,
             paste_into,
+            paste_conflicts,
             delete_to_trash,
             apps_for_file,
             choose_app_with_system,

@@ -24,6 +24,18 @@ pub enum Mode {
     Cut,
 }
 
+/// What to do when the destination already holds an item of the same name.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Conflict {
+    /// Keep both, numbering the incoming one: "name (2)".
+    Rename,
+    /// Write over what is there, merging folders rather than replacing them.
+    Overwrite,
+    /// Leave the destination alone.
+    Skip,
+}
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum PasteEvent {
@@ -100,6 +112,80 @@ fn move_tree(from: &Path, to: &Path) -> io::Result<()> {
     }
 }
 
+/// Copy over an existing destination, merging folders.
+///
+/// This is the part that must not be done by deleting the destination first.
+/// A folder that already exists is merged: files present in both are written
+/// over, files that exist only in the destination are left alone. Deleting the
+/// old tree first would silently destroy everything the incoming copy did not
+/// happen to contain, which is exactly the loss this exists to avoid.
+fn copy_over(from: &Path, to: &Path) -> io::Result<()> {
+    let meta = fs::symlink_metadata(from)?;
+
+    if meta.is_dir() {
+        if to.exists() && !to.is_dir() {
+            // A file where a folder is going has to go, or the merge cannot
+            // create the directory.
+            fs::remove_file(to)?;
+        }
+        fs::create_dir_all(to)?;
+        for entry in fs::read_dir(from)? {
+            let entry = entry?;
+            copy_over(&entry.path(), &to.join(entry.file_name()))?;
+        }
+        return Ok(());
+    }
+
+    if to.is_dir() {
+        // A file replacing a folder: the folder cannot be kept, because two
+        // things cannot share one name.
+        fs::remove_dir_all(to)?;
+    }
+    // Copy over a symlink rather than through it, as a plain copy does.
+    if meta.is_symlink() {
+        #[cfg(unix)]
+        {
+            if to.exists() {
+                let _ = fs::remove_file(to);
+            }
+            let target = fs::read_link(from)?;
+            std::os::unix::fs::symlink(target, to)?;
+            return Ok(());
+        }
+    }
+    fs::copy(from, to)?;
+    Ok(())
+}
+
+/// Move over an existing destination, merging folders the same way a copy does.
+fn move_over(from: &Path, to: &Path) -> io::Result<()> {
+    if from.is_dir() && to.is_dir() {
+        for entry in fs::read_dir(from)? {
+            let entry = entry?;
+            move_over(&entry.path(), &to.join(entry.file_name()))?;
+        }
+        // Only the emptied source folder is removed; the destination keeps
+        // everything it already had.
+        fs::remove_dir(from)?;
+        return Ok(());
+    }
+
+    if to.exists() {
+        if to.is_dir() {
+            fs::remove_dir_all(to)?;
+        } else {
+            fs::remove_file(to)?;
+        }
+    }
+    match fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(_err) => {
+            copy_over(from, to)?;
+            remove_tree(from)
+        }
+    }
+}
+
 fn remove_tree(path: &Path) -> io::Result<()> {
     let meta = fs::symlink_metadata(path)?;
     if meta.is_dir() {
@@ -117,6 +203,7 @@ pub fn paste<F>(
     destination: &str,
     sources: &[String],
     mode: Mode,
+    conflict: Conflict,
     cancel: &std::sync::atomic::AtomicBool,
     mut emit: F,
 ) where
@@ -169,11 +256,27 @@ pub fn paste<F>(
 
         // A paste into the folder an item already lives in must not become a
         // rename of that item, so the destination name is always freed.
-        let target = free_path(&destination.join(&name));
+        let wanted = destination.join(&name);
+        let target = if wanted.exists() {
+            match conflict {
+                Conflict::Rename => free_path(&wanted),
+                // The destination is merged, never deleted wholesale.
+                Conflict::Overwrite => wanted,
+                Conflict::Skip => {
+                    skipped.push(format!("{name} is already here"));
+                    continue;
+                }
+            }
+        } else {
+            wanted
+        };
+        let replacing = target.exists();
 
-        let result = match mode {
-            Mode::Copy => copy_tree(from, &target),
-            Mode::Cut => move_tree(from, &target),
+        let result = match (mode, replacing) {
+            (Mode::Copy, false) => copy_tree(from, &target),
+            (Mode::Copy, true) => copy_over(from, &target),
+            (Mode::Cut, false) => move_tree(from, &target),
+            (Mode::Cut, true) => move_over(from, &target),
         };
         match result {
             Ok(()) => pasted += 1,
@@ -284,6 +387,22 @@ fn percent_encode(input: &str) -> String {
     out
 }
 
+/// The names in `sources` that already exist in `destination`.
+///
+/// Checked before the paste starts so the interface can ask what to do, rather
+/// than the operations thread stopping mid-way to ask a question it has no way
+/// to receive an answer to.
+pub fn conflicts(destination: &str, sources: &[String]) -> Vec<String> {
+    let destination = Path::new(destination);
+    sources
+        .iter()
+        .filter_map(|source| {
+            let name = Path::new(source).file_name()?.to_string_lossy().into_owned();
+            destination.join(&name).exists().then_some(name)
+        })
+        .collect()
+}
+
 /// Move items to the trash. Returns how many were moved.
 pub fn delete_to_trash(paths: &[String]) -> Result<usize, String> {
     let mut moved = 0usize;
@@ -317,6 +436,15 @@ mod tests {
     }
 
     fn run_paste(destination: &Path, sources: &[String], mode: Mode) -> (usize, Vec<String>) {
+        run_paste_with(destination, sources, mode, Conflict::Rename)
+    }
+
+    fn run_paste_with(
+        destination: &Path,
+        sources: &[String],
+        mode: Mode,
+        conflict: Conflict,
+    ) -> (usize, Vec<String>) {
         let cancel = AtomicBool::new(false);
         let mut pasted = 0;
         let mut skipped = Vec::new();
@@ -324,6 +452,7 @@ mod tests {
             &destination.to_string_lossy(),
             sources,
             mode,
+            conflict,
             &cancel,
             |event| match event {
                 PasteEvent::Done { pasted: p, skipped: s } => {
@@ -336,6 +465,154 @@ mod tests {
             },
         );
         (pasted, skipped)
+    }
+
+    #[test]
+    fn overwriting_a_folder_merges_it_and_keeps_files_only_the_destination_had() {
+        // The case that matters: the incoming folder must not erase anything
+        // the destination already had, and must win where both have a file.
+        let dir = scratch("merge");
+        let source = dir.join("project");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("shared.txt"), b"new").unwrap();
+        fs::write(source.join("incoming.txt"), b"added").unwrap();
+
+        let into = dir.join("into");
+        fs::create_dir_all(into.join("project/nested")).unwrap();
+        fs::write(into.join("project/shared.txt"), b"old").unwrap();
+        fs::write(into.join("project/only-here.txt"), b"keep me").unwrap();
+        fs::write(into.join("project/nested/deep.txt"), b"deep").unwrap();
+
+        let (pasted, skipped) = run_paste_with(
+            &into,
+            &[source.to_string_lossy().into_owned()],
+            Mode::Copy,
+            Conflict::Overwrite,
+        );
+
+        assert_eq!(pasted, 1, "skipped: {skipped:?}");
+        assert_eq!(
+            fs::read(into.join("project/shared.txt")).unwrap(),
+            b"new",
+            "the incoming file wins where both exist"
+        );
+        assert_eq!(
+            fs::read(into.join("project/only-here.txt")).unwrap(),
+            b"keep me",
+            "a file only the destination had must survive"
+        );
+        assert_eq!(
+            fs::read(into.join("project/nested/deep.txt")).unwrap(),
+            b"deep",
+            "nested destination files survive too"
+        );
+        assert_eq!(
+            fs::read(into.join("project/incoming.txt")).unwrap(),
+            b"added",
+            "a new file is added"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn overwriting_a_file_replaces_its_contents() {
+        let dir = scratch("overwrite-file");
+        let source = dir.join("note.txt");
+        fs::write(&source, b"replacement").unwrap();
+        let into = dir.join("into");
+        fs::create_dir(&into).unwrap();
+        fs::write(into.join("note.txt"), b"original and longer").unwrap();
+
+        let (pasted, _) = run_paste_with(
+            &into,
+            &[source.to_string_lossy().into_owned()],
+            Mode::Copy,
+            Conflict::Overwrite,
+        );
+        assert_eq!(pasted, 1);
+        assert_eq!(
+            fs::read(into.join("note.txt")).unwrap(),
+            b"replacement",
+            "no leftover bytes from the longer original"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn moving_over_a_folder_merges_it_too() {
+        let dir = scratch("merge-move");
+        let source = dir.join("project");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("shared.txt"), b"moved").unwrap();
+
+        let into = dir.join("into");
+        fs::create_dir_all(into.join("project")).unwrap();
+        fs::write(into.join("project/shared.txt"), b"old").unwrap();
+        fs::write(into.join("project/untouched.txt"), b"stay").unwrap();
+
+        let (pasted, _) = run_paste_with(
+            &into,
+            &[source.to_string_lossy().into_owned()],
+            Mode::Cut,
+            Conflict::Overwrite,
+        );
+        assert_eq!(pasted, 1);
+        assert!(!source.exists(), "the source folder is gone after a move");
+        assert_eq!(fs::read(into.join("project/shared.txt")).unwrap(), b"moved");
+        assert_eq!(
+            fs::read(into.join("project/untouched.txt")).unwrap(),
+            b"stay"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn skipping_leaves_the_destination_alone() {
+        let dir = scratch("skip");
+        let source = dir.join("same.txt");
+        fs::write(&source, b"new").unwrap();
+        let into = dir.join("into");
+        fs::create_dir(&into).unwrap();
+        fs::write(into.join("same.txt"), b"old").unwrap();
+
+        let (pasted, skipped) = run_paste_with(
+            &into,
+            &[source.to_string_lossy().into_owned()],
+            Mode::Copy,
+            Conflict::Skip,
+        );
+        assert_eq!(pasted, 0);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(fs::read(into.join("same.txt")).unwrap(), b"old");
+        assert!(!into.join("same (2).txt").exists());
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn conflicts_are_reported_before_anything_is_written() {
+        let dir = scratch("conflicts");
+        let into = dir.join("into");
+        fs::create_dir(&into).unwrap();
+        fs::write(into.join("here.txt"), b"x").unwrap();
+
+        let fresh = dir.join("fresh.txt");
+        fs::write(&fresh, b"y").unwrap();
+        let clash = dir.join("here.txt");
+
+        let names = conflicts(
+            &into.to_string_lossy(),
+            &[
+                fresh.to_string_lossy().into_owned(),
+                clash.to_string_lossy().into_owned(),
+            ],
+        );
+        assert_eq!(names, vec!["here.txt".to_string()]);
+
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

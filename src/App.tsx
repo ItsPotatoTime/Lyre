@@ -16,7 +16,9 @@ import {
   isTauri,
   createFolder,
   deleteToTrash,
+  pasteConflicts,
   pasteInto,
+  type Conflict,
   getHomeDir,
   getPathInfo,
   getPlaces,
@@ -76,6 +78,7 @@ import { ContextMenu, type ContextItem } from "@/components/ContextMenu";
 import { PropertiesDialog } from "@/components/PropertiesDialog";
 import { OpenWithDialog } from "@/components/OpenWithDialog";
 import { DefaultManagerPrompt } from "@/components/DefaultManagerPrompt";
+import { ConflictDialog } from "@/components/ConflictDialog";
 import { Icon } from "@/components/Icons";
 
 let tabSeq = 0;
@@ -224,6 +227,12 @@ function Browser({
   const [promptDefault, setPromptDefault] = useState(prefs.promptDefaultManager);
   const [library, setLibrary] = useState<Library>(() => loadLibrary());
   const [ejecting, setEjecting] = useState<string | null>(null);
+  const [pendingPaste, setPendingPaste] = useState<{
+    destination: string;
+    sources: string[];
+    mode: "copy" | "cut";
+    names: string[];
+  } | null>(null);
   const [manager, setManager] = useState<ManagerState | null>(null);
   const [showManagerPrompt, setShowManagerPrompt] = useState(false);
   const [managerBusy, setManagerBusy] = useState(false);
@@ -594,6 +603,49 @@ function Browser({
    * item already lives in is filtered out here as well as in Rust, so the
    * feedback says "nothing to do" instead of reporting a misleading success.
    */
+  const runPaste = useCallback(
+    (destination: string, sources: string[], mode: "copy" | "cut", conflict: Conflict) => {
+      void pasteInto(destination, sources, mode, conflict, {
+        onProgress: (done, total, name) => {
+          if (total > 1) {
+            flash(
+              `${mode === "cut" ? "Moving" : "Copying"} ${name} (${done + 1} of ${total})`,
+            );
+          }
+        },
+        onDone: (pasted, skipped) => {
+          refreshAfterChange();
+          if (mode === "cut") setClipboard(null);
+          flash(
+            skipped.length > 0
+              ? `${mode === "cut" ? "Moved" : "Copied"} ${pasted}, ${skipped.length} skipped`
+              : `${mode === "cut" ? "Moved" : "Copied"} ${pasted} item${pasted === 1 ? "" : "s"}`,
+          );
+        },
+        onFailed: (message) => flash(message),
+      }).catch((error: unknown) =>
+        flash(error instanceof Error ? error.message : "Could not finish the paste."),
+      );
+    },
+    [flash, refreshAfterChange],
+  );
+
+  /** Ask about collisions before anything is written. */
+  const requestPaste = useCallback(
+    (destination: string, sources: string[], mode: "copy" | "cut") => {
+      void pasteConflicts(destination, sources)
+        .then((names) => {
+          if (names.length === 0) {
+            runPaste(destination, sources, mode, "rename");
+          } else {
+            setPendingPaste({ destination, sources, mode, names });
+          }
+        })
+        .catch(() => runPaste(destination, sources, mode, "rename"));
+    },
+    [runPaste],
+  );
+
   const handleDrop = useCallback(
     (target: DragTarget, mode: DropMode, paths: string[]) => {
       const destination = target.path;
@@ -614,27 +666,12 @@ function Browser({
         return;
       }
 
-      void pasteInto(destination, sources, mode === "move" ? "cut" : "copy", {
-        onProgress: (done, total, name) => {
-          if (total > 1) flash(`${mode === "move" ? "Moving" : "Copying"} ${name} (${done + 1} of ${total})`);
-        },
-        onDone: (pasted, skipped) => {
-          refreshAfterChange();
-          flash(
-            skipped.length > 0
-              ? `${mode === "move" ? "Moved" : "Copied"} ${pasted}, ${skipped.length} skipped`
-              : `${mode === "move" ? "Moved" : "Copied"} ${pasted} item${pasted === 1 ? "" : "s"}`,
-          );
-        },
-        onFailed: (message) => flash(message),
-      }).catch((error: unknown) =>
-        flash(error instanceof Error ? error.message : "Could not finish the drop."),
-      );
+      requestPaste(destination, sources, mode === "move" ? "cut" : "copy");
 
       // Dropping onto a tab is also a request to look at that tab.
       if (target.kind === "tab" && target.id) setActiveId(target.id);
     },
-    [flash, refreshAfterChange],
+    [flash, requestPaste],
   );
 
   const drag = useDrag(handleDrop);
@@ -748,24 +785,8 @@ function Browser({
       flash("Open a folder to paste into.");
       return;
     }
-    void pasteInto(location.path, clipboard.paths, clipboard.mode, {
-      onProgress: (done, total, name) => {
-        if (total > 1) flash(`Pasting ${name} (${done + 1} of ${total})`);
-      },
-      onDone: (pasted, skipped) => {
-        refreshAfterChange();
-        if (clipboard.mode === "cut") setClipboard(null);
-        flash(
-          skipped.length > 0
-            ? `Pasted ${pasted}, ${skipped.length} could not be copied`
-            : `Pasted ${pasted} item${pasted === 1 ? "" : "s"}`,
-        );
-      },
-      onFailed: (message) => flash(message),
-    }).catch((error: unknown) =>
-      flash(error instanceof Error ? error.message : "Could not paste."),
-    );
-  }, [clipboard, flash, location.path, refreshAfterChange, showsFiles]);
+    requestPaste(location.path, clipboard.paths, clipboard.mode);
+  }, [clipboard, flash, location.path, requestPaste, showsFiles]);
 
   const beginOpenWith = useCallback(
     (entry: Entry) => {
@@ -1768,6 +1789,22 @@ function Browser({
               : contextItems(context.entry)
           }
           onClose={() => setContext(null)}
+        />
+      ) : null}
+
+      {pendingPaste ? (
+        <ConflictDialog
+          destinationName={pendingPaste.destination.split(/[\\/]/).filter(Boolean).pop() ?? pendingPaste.destination}
+          names={pendingPaste.names}
+          onCancel={() => setPendingPaste(null)}
+          onKeepBoth={() => {
+            runPaste(pendingPaste.destination, pendingPaste.sources, pendingPaste.mode, "rename");
+            setPendingPaste(null);
+          }}
+          onOverwrite={() => {
+            runPaste(pendingPaste.destination, pendingPaste.sources, pendingPaste.mode, "overwrite");
+            setPendingPaste(null);
+          }}
         />
       ) : null}
 

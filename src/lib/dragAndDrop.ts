@@ -32,6 +32,14 @@ interface DragSession {
   /** Last pointer position, so Shift can update the badge while stationary. */
   x: number;
   y: number;
+  /**
+   * Whether Shift is held, tracked from the key events themselves.
+   *
+   * WebKit reports `shiftKey: true` on the keyup of the Shift key, so reading
+   * that field there says "still held" after the person let go. Chromium
+   * reports false, which is why this only shows up on the real webview.
+   */
+  shiftHeld: boolean;
   active: boolean;
   target: DragTarget | null;
   hovered: Element | null;
@@ -100,6 +108,7 @@ export function useDrag(
         startY: event.clientY,
         x: event.clientX,
         y: event.clientY,
+        shiftHeld: event.shiftKey,
         active: false,
         target: EMPTY,
         hovered: null,
@@ -124,8 +133,10 @@ export function useDrag(
       if (!current) return;
 
       // Holding Shift switches a drag from moving to copying, and the badge
-      // says which one will happen before the button is released.
-      current.mode = event.shiftKey ? "copy" : "move";
+      // says which one will happen before the button is released. Pointer
+      // events do report modifiers correctly, so they are the reliable source.
+      current.shiftHeld = event.shiftKey;
+      current.mode = current.shiftHeld ? "copy" : "move";
       current.x = event.clientX;
       current.y = event.clientY;
 
@@ -190,26 +201,42 @@ export function useDrag(
       // Pausing over a folder and then pressing Shift is a normal way to
       // decide; nothing moves, so this has to update the badge itself instead
       // of waiting for the next pointermove.
-      if (event.key === "Shift" && current.active) {
-        current.mode = event.shiftKey ? "copy" : "move";
-        paintBadge(current.x, current.y, current.mode, current.paths.length);
-        document.body.dataset.dragging = current.mode;
+      if (event.key === "Shift") {
+        // The event's own type decides which way the key went. Its `shiftKey`
+        // field cannot be trusted for the Shift keyup on WebKit.
+        current.shiftHeld = event.type === "keydown";
+        current.mode = current.shiftHeld ? "copy" : "move";
+        if (current.active) {
+          paintBadge(current.x, current.y, current.mode, current.paths.length);
+          document.body.dataset.dragging = current.mode;
+        }
       }
     };
 
     window.addEventListener("pointermove", onMove);
     window.addEventListener("pointerup", onUp);
     window.addEventListener("pointercancel", cancel);
+    const onBlur = () => {
+      const current = session.current;
+      if (!current || !current.active) return;
+      current.shiftHeld = false;
+      current.mode = "move";
+      paintBadge(current.x, current.y, "move", current.paths.length);
+      document.body.dataset.dragging = "move";
+    };
+
     window.addEventListener("keydown", onKey, true);
     // Shift going up has to be seen too, or the badge keeps saying Copy after
     // the key is released.
     window.addEventListener("keyup", onKey, true);
+    window.addEventListener("blur", onBlur);
     return () => {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", cancel);
       window.removeEventListener("keydown", onKey, true);
       window.removeEventListener("keyup", onKey, true);
+      window.removeEventListener("blur", onBlur);
     };
   }, [cancel, clearHighlight, hideBadge, paintBadge]);
 

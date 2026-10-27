@@ -451,6 +451,8 @@
 }
 
 .place-text {
+  display: flex;
+  flex-direction: column;
   min-width: 0;
 }
 
@@ -463,13 +465,6 @@
   text-overflow: ellipsis;
 }
 
-.place-detail {
-  font-size: var(--text-caption);
-  color: var(--text-secondary);
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-}
 
 .pill {
   display: inline-flex;

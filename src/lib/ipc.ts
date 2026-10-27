@@ -104,6 +104,18 @@ export async function getDirStamp(path: string): Promise<number | null> {
   return invoke<number | null>("dir_stamp", { path });
 }
 
+/**
+ * Hand a file to whatever the operating system opens that type with.
+ * Directories are navigated instead, so this is only ever called for files.
+ */
+export async function openPath(path: string): Promise<void> {
+  if (!isTauri) {
+    throw new Error("Opening files needs the desktop app, not the browser preview.");
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("open_path", { path });
+}
+
 function describe(error: unknown): string {
   if (typeof error === "string") return error;
   if (error instanceof Error) return error.message;

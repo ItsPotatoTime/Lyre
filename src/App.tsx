@@ -11,7 +11,7 @@ import type {
   Tab,
   ViewMode,
 } from "@/types";
-import { getHomeDir, getPathInfo, getPlaces } from "@/lib/ipc";
+import { getHomeDir, getPathInfo, getPlaces, openPath } from "@/lib/ipc";
 import { useDirectory } from "@/lib/useDirectory";
 import { useReveal } from "@/lib/hooks";
 import { useTheme } from "@/lib/theme";
@@ -357,7 +357,11 @@ function Browser({
   const onOpen = useCallback(
     (entry: Entry) => {
       if (entry.isDir) navigate(folder(entry.path));
-      else flash("Opening files arrives with shell integration.");
+      else {
+        void openPath(entry.path).catch((error: unknown) => {
+          flash(error instanceof Error ? error.message : "Could not open that file.");
+        });
+      }
     },
     [flash, navigate],
   );
@@ -453,7 +457,13 @@ function Browser({
       : locationGlyph(location);
 
   return (
-    <div className="app" data-window-focused={windowFocused ? "true" : "false"}>
+    <div
+      className="app"
+      data-window-focused={windowFocused ? "true" : "false"}
+      // No shell context menus yet, and the webview's own menu exposes
+      // reload and inspect, which do not belong in a file manager.
+      onContextMenu={(event) => event.preventDefault()}
+    >
       <ResizeEdges />
 
       <TitleBar
@@ -543,7 +553,7 @@ function Browser({
           {location.kind === "home" ? (
             <HomeView
               places={quickAccess}
-              onNavigate={(path) => navigate(homeLocation(path))}
+              onNavigate={(path) => navigate(folder(path))}
               onUnavailable={flash}
             />
           ) : location.kind === "thisPc" ? (

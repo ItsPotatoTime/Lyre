@@ -17,8 +17,6 @@ pub struct Place {
     pub kind: &'static str,
     /// Glyph family the rail draws.
     pub icon: &'static str,
-    /// Free space summary for drives, item count hint otherwise.
-    pub detail: Option<String>,
     /// Volume size in bytes; zero for folders. The interface needs both
     /// numbers, not just the formatted summary, to draw a capacity bar.
     pub total: u64,
@@ -71,7 +69,6 @@ pub fn places() -> Vec<Place> {
         path: home.to_string_lossy().into_owned(),
         kind: "folder",
         icon: "home",
-        detail: None,
         total: 0,
         free: 0,
     });
@@ -99,7 +96,6 @@ pub fn places() -> Vec<Place> {
                 path: path.to_string_lossy().into_owned(),
                 kind: "folder",
                 icon,
-                detail: None,
                 total: 0,
                 free: 0,
             });
@@ -139,7 +135,6 @@ fn drives() -> Vec<Place> {
             path: mount.to_string_lossy().into_owned(),
             kind: if disk.is_removable() { "removable" } else { "drive" },
             icon: "drive",
-            detail: Some(format!("{} free of {}", bytes(free), bytes(total))),
             total,
             free,
         });
@@ -217,19 +212,3 @@ fn display_name(path: &Path) -> String {
         .unwrap_or_else(|| path.to_string_lossy().into_owned())
 }
 
-fn bytes(value: u64) -> String {
-    const UNITS: [&str; 6] = ["bytes", "KB", "MB", "GB", "TB", "PB"];
-    let mut size = value as f64;
-    let mut unit = 0;
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 {
-        format!("{value} bytes")
-    } else if size >= 100.0 {
-        format!("{size:.0} {}", UNITS[unit])
-    } else {
-        format!("{size:.1} {}", UNITS[unit])
-    }
-}

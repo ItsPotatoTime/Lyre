@@ -1,6 +1,5 @@
 import { useState } from "react";
 import type { Place } from "@/types";
-import { folder } from "@/lib/location";
 import { Icon } from "./Icons";
 import { PlaceGlyph } from "./FileGlyph";
 
@@ -27,7 +26,7 @@ function FavoritesArt() {
 
 /**
  * Explorer's Home page. It is not a directory listing: it is the six places
- * supplied from Content delivery and the favourites shelf below them.
+ * and the favourites shelf below them.
  */
 export function HomeView({
   places,
@@ -73,7 +72,6 @@ export function HomeView({
               </span>
               <span className="place-text">
                 <span className="place-name">{place.name}</span>
-                <span className="place-detail">Stored locally</span>
               </span>
             </button>
           ))}
@@ -106,5 +104,3 @@ export function HomeView({
     </div>
   );
 }
-
-export { folder };

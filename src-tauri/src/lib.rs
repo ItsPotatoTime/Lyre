@@ -114,6 +114,43 @@ fn places() -> Vec<places::Place> {
     list
 }
 
+/// The program each platform uses to hand a file to its registered handler.
+#[cfg(target_os = "windows")]
+fn opener() -> std::process::Command {
+    let mut command = std::process::Command::new("cmd");
+    // `start` treats its first argument as the window title, so an empty one
+    // keeps a path containing spaces from being read as the title.
+    command.args(["/C", "start", ""]);
+    command
+}
+
+#[cfg(target_os = "macos")]
+fn opener() -> std::process::Command {
+    std::process::Command::new("open")
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn opener() -> std::process::Command {
+    std::process::Command::new("xdg-open")
+}
+
+/// Open a file with whatever the desktop associates with its type.
+///
+/// Spawned and dropped rather than awaited: the handler outlives us, and a
+/// slow application launch must not block the interface.
+#[tauri::command]
+fn open_path(path: String) -> Result<(), String> {
+    let target = std::path::Path::new(&path);
+    if !target.exists() {
+        return Err("That item no longer exists.".into());
+    }
+    opener()
+        .arg(target)
+        .spawn()
+        .map(|_| ())
+        .map_err(|err| format!("Could not open that item: {err}"))
+}
+
 /// Start directory for a fresh window.
 #[tauri::command]
 fn home_dir() -> String {
@@ -145,7 +182,8 @@ pub fn run() {
             path_info,
             places,
             home_dir,
-            dir_stamp
+            dir_stamp,
+            open_path
         ])
         .run(tauri::generate_context!())
         .expect("error while running Lyre");
@@ -153,3 +191,29 @@ pub fn run() {
 
 #[cfg(test)]
 mod scan_tests;
+
+#[cfg(test)]
+mod opener_tests {
+    use super::*;
+
+    #[test]
+    fn a_missing_item_is_reported_instead_of_launched() {
+        let error = open_path("/definitely/not/here/lyre".into())
+            .expect_err("a missing path must not be handed to the launcher");
+        assert!(
+            error.contains("no longer exists"),
+            "unexpected message: {error}"
+        );
+    }
+
+    #[test]
+    fn each_platform_names_its_own_opener() {
+        let program = opener().get_program().to_string_lossy().into_owned();
+        #[cfg(target_os = "windows")]
+        assert_eq!(program, "cmd");
+        #[cfg(target_os = "macos")]
+        assert_eq!(program, "open");
+        #[cfg(all(unix, not(target_os = "macos")))]
+        assert_eq!(program, "xdg-open");
+    }
+}

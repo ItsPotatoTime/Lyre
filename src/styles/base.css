@@ -33,10 +33,18 @@ body {
   text-rendering: optimizeLegibility;
   font-synthesis: none;
   overflow: hidden;
-  /* Text is a control surface here, not a document: dragging a selection
-     across the file list is a range-select gesture, not a text selection. */
-  user-select: none;
   cursor: default;
+}
+
+/* Nothing in this window is a document. Dragging across rows is a range
+   selection, and a double click must never select a word inside a filename.
+   WebKit needs the prefixed form and does not inherit it into controls, hence
+   the universal rule plus the field exception below. */
+*,
+*::before,
+*::after {
+  -webkit-user-select: none;
+  user-select: none;
 }
 
 button,
@@ -51,8 +59,12 @@ button {
   cursor: default;
 }
 
-input {
+input,
+textarea,
+[contenteditable="true"] {
+  -webkit-user-select: text;
   user-select: text;
+  cursor: text;
 }
 
 svg {

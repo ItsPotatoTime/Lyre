@@ -24,11 +24,11 @@ Working now:
 - Explorer and compact density, hidden items toggle
 - Light, dark, and system themes
 - Window chrome: tabs in a custom title bar, caption buttons, edge resizing
+- Opening a file in whatever the desktop associates with its type
 
 Not implemented yet, and honest about it in the interface: copy, cut, paste,
-rename, delete, share, new folder, opening files with the handler the OS
-associates with them, drag and drop, search indexing, thumbnails, context menus
-and the preview pane.
+rename, delete, share, new folder, drag and drop, search indexing, thumbnails,
+context menus and the preview pane.
 
 ## Running it
 

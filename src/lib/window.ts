@@ -66,6 +66,13 @@ export const windowChrome = {
     };
   },
 
+  async toggleFullscreen() {
+    if (!isTauri) return;
+    const w = await current();
+    const fullscreen = await w.isFullscreen();
+    await w.setFullscreen(!fullscreen);
+  },
+
   startResize(edge: ResizeEdge) {
     if (!isTauri) return;
     void current().then((w) => w.startResizeDragging(edge));

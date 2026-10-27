@@ -137,6 +137,16 @@ impl Index {
     pub fn get(&self, path: &Path) -> Option<Arc<Vec<Entry>>> {
         self.state.lock().ok()?.map.get(path).cloned()
     }
+
+    /// Drop a folder's cached listing after something changed on disk, so a
+    /// search cannot answer from rows that no longer exist.
+    pub fn forget(&self, path: &Path) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.map.remove(path);
+        state.order.retain(|entry| entry != path);
+    }
 }
 
 /// Run a search, emitting results as they are known.

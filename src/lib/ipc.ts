@@ -207,6 +207,43 @@ export async function openPath(path: string): Promise<void> {
   await invoke("open_path", { path });
 }
 
+/** Create a folder and return the path it actually used. */
+export async function createFolder(parent: string, name: string): Promise<string> {
+  if (!isTauri) {
+    throw new Error("Creating folders needs the desktop app, not the browser preview.");
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<string>("create_folder", { parent, name });
+}
+
+/** Rename an item and return its new path. */
+export async function renamePath(path: string, name: string): Promise<string> {
+  if (!isTauri) {
+    throw new Error("Renaming needs the desktop app, not the browser preview.");
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<string>("rename_path", { path, name });
+}
+
+export interface PathProperties {
+  name: string;
+  path: string;
+  parent: string | null;
+  isDir: boolean;
+  size: number | null;
+  items: number | null;
+  modifiedMs: number | null;
+  readonly: boolean;
+}
+
+export async function pathProperties(path: string): Promise<PathProperties> {
+  if (!isTauri) {
+    throw new Error("Properties need the desktop app, not the browser preview.");
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<PathProperties>("path_properties", { path });
+}
+
 function describe(error: unknown): string {
   if (typeof error === "string") return error;
   if (error instanceof Error) return error.message;

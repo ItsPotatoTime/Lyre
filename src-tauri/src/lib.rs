@@ -4,6 +4,7 @@
 //! ever receives rows it is about to paint. Scans are cancellable, streamed,
 //! and never block the thread the window is waiting on.
 
+mod ops;
 mod places;
 mod scan;
 mod search;
@@ -156,6 +157,40 @@ fn search_dir(
     Ok(id)
 }
 
+/// Create a folder and return the path it actually used, so the interface can
+/// select it and start renaming, which is what Explorer does.
+#[tauri::command]
+fn create_folder(
+    state: State<'_, AppState>,
+    parent: String,
+    name: String,
+) -> Result<String, String> {
+    let created = ops::create_folder(&parent, &name)?;
+    // A cached listing for the parent is now missing a row.
+    state.index.forget(std::path::Path::new(&parent));
+    Ok(created)
+}
+
+/// Rename an item and return its new path.
+#[tauri::command]
+fn rename_path(
+    state: State<'_, AppState>,
+    path: String,
+    name: String,
+) -> Result<String, String> {
+    let renamed = ops::rename_path(&path, &name)?;
+    if let Some(parent) = std::path::Path::new(&path).parent() {
+        state.index.forget(parent);
+    }
+    Ok(renamed)
+}
+
+/// Everything the properties dialog shows for one item.
+#[tauri::command]
+fn path_properties(path: String) -> Result<ops::Properties, String> {
+    ops::properties(&path)
+}
+
 /// Resolve the breadcrumb, parent and existence of a path in one round trip.
 #[tauri::command]
 fn path_info(path: String) -> places::PathInfo {
@@ -246,7 +281,10 @@ pub fn run() {
             places,
             home_dir,
             dir_stamp,
-            open_path
+            open_path,
+            create_folder,
+            rename_path,
+            path_properties
         ])
         .run(tauri::generate_context!())
         .expect("error while running Lyre");

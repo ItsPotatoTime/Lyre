@@ -81,6 +81,10 @@ export function FileList({
   grouped,
   matched,
   sortable = true,
+  editing,
+  onRename,
+  onCancelRename,
+  onContextMenu,
   onRetry,
 }: {
   entries: Entry[];
@@ -103,6 +107,11 @@ export function FileList({
   /** Character offsets to emphasise, keyed by path. Present while searching. */
   matched?: Map<string, number[]> | undefined;
   sortable?: boolean;
+  /** Path currently being renamed in place, if any. */
+  editing?: string | null;
+  onRename?: (path: string, name: string) => void;
+  onCancelRename?: () => void;
+  onContextMenu?: (event: React.MouseEvent, entry: Entry | null) => void;
   onRetry: () => void;
 }) {
   const metrics = metricsFor(density);
@@ -541,6 +550,11 @@ export function FileList({
               ? undefined
               : ({ ["--row-h" as string]: `${rowHeight}px` } as React.CSSProperties)
           }
+          onContextMenu={(event) => {
+            if (event.target === event.currentTarget) {
+              onContextMenu?.(event, null);
+            }
+          }}
           onPointerDown={(event) => {
             if (event.target === event.currentTarget) {
               onSelection({ selected: new Set(), focused: null, anchor: null });
@@ -564,6 +578,7 @@ export function FileList({
                       key={entry.path}
                       className="tile"
                       role="option"
+                      data-path={entry.path}
                       aria-selected={selection.selected.has(entry.path)}
                       data-selected={
                         selection.selected.has(entry.path) ? "true" : "false"
@@ -577,6 +592,7 @@ export function FileList({
                       title={entry.name}
                       onPointerDown={(event) => handleRowPointerDown(event, index)}
                       onDoubleClick={() => onOpen(entry)}
+                      onContextMenu={(event) => onContextMenu?.(event, entry)}
                     >
                       <div className="tile-glyph">
                         <FileGlyph
@@ -624,10 +640,14 @@ export function FileList({
                         selected={selection.selected.has(row.entry.path)}
                         focused={row.index === focusedIndex}
                         indices={matched?.get(row.entry.path)}
+                        editing={editing === row.entry.path}
+                        onRename={onRename}
+                        onCancelRename={onCancelRename}
                         onPointerDown={(event) =>
                           handleRowPointerDown(event, row.index)
                         }
                         onDoubleClick={() => onOpen(row.entry)}
+                        onContextMenu={(event) => onContextMenu?.(event, row.entry)}
                       />
                     );
                   })
@@ -644,10 +664,14 @@ export function FileList({
                         selected={selection.selected.has(entry.path)}
                         focused={index === focusedIndex}
                         indices={matched?.get(entry.path)}
+                        editing={editing === entry.path}
+                        onRename={onRename}
+                        onCancelRename={onCancelRename}
                         onPointerDown={(event) =>
                           handleRowPointerDown(event, index)
                         }
                         onDoubleClick={() => onOpen(entry)}
+                        onContextMenu={(event) => onContextMenu?.(event, entry)}
                       />
                     );
                   })}
@@ -667,8 +691,12 @@ function DetailRow({
   selected,
   focused,
   indices,
+  editing = false,
+  onRename,
+  onCancelRename,
   onPointerDown,
   onDoubleClick,
+  onContextMenu,
 }: {
   entry: Entry;
   top: number;
@@ -678,13 +706,18 @@ function DetailRow({
   selected: boolean;
   focused: boolean;
   indices?: number[] | undefined;
+  editing?: boolean;
+  onRename?: ((path: string, name: string) => void) | undefined;
+  onCancelRename?: (() => void) | undefined;
   onPointerDown: (event: React.PointerEvent<HTMLDivElement>) => void;
   onDoubleClick: () => void;
+  onContextMenu?: ((event: React.MouseEvent) => void) | undefined;
 }) {
   return (
     <div
       className="row"
       role="option"
+      data-path={entry.path}
       aria-selected={selected}
       data-selected={selected ? "true" : "false"}
       data-focused={focused ? "true" : "false"}
@@ -696,10 +729,19 @@ function DetailRow({
       }}
       onPointerDown={onPointerDown}
       onDoubleClick={onDoubleClick}
+      onContextMenu={onContextMenu}
     >
       <div className="cell cell-name">
         <FileGlyph kind={entry.kind} size={16} isSymlink={entry.isSymlink} />
-        <MatchedName name={entry.name} indices={indices} />
+        {editing ? (
+          <RenameInput
+            name={entry.name}
+            onCommit={(next) => onRename?.(entry.path, next)}
+            onCancel={() => onCancelRename?.()}
+          />
+        ) : (
+          <MatchedName name={entry.name} indices={indices} />
+        )}
       </div>
       <div className="cell cell-muted tabular">{formatDate(entry.modifiedMs)}</div>
       <div className="cell cell-muted">
@@ -788,5 +830,55 @@ function MatchedName({
         ),
       )}
     </span>
+  );
+}
+
+/**
+ * In-place rename. The stem is preselected and the extension left out of the
+ * selection, so typing a new name cannot silently change a file's type; the
+ * Rust side adds the old extension back if none is given.
+ */
+function RenameInput({
+  name,
+  onCommit,
+  onCancel,
+}: {
+  name: string;
+  onCommit: (next: string) => void;
+  onCancel: () => void;
+}) {
+  const [draft, setDraft] = useState(name);
+  const ref = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    const input = ref.current;
+    if (!input) return;
+    input.focus();
+    const dot = name.lastIndexOf(".");
+    input.setSelectionRange(0, dot > 0 ? dot : name.length);
+  }, [name]);
+
+  return (
+    <input
+      ref={ref}
+      className="row-input"
+      value={draft}
+      spellCheck={false}
+      onChange={(event) => setDraft(event.target.value)}
+      onPointerDown={(event) => event.stopPropagation()}
+      onClick={(event) => event.stopPropagation()}
+      onDoubleClick={(event) => event.stopPropagation()}
+      onBlur={() => onCommit(draft)}
+      onKeyDown={(event) => {
+        event.stopPropagation();
+        if (event.key === "Enter") {
+          event.preventDefault();
+          onCommit(draft);
+        } else if (event.key === "Escape") {
+          event.preventDefault();
+          onCancel();
+        }
+      }}
+    />
   );
 }

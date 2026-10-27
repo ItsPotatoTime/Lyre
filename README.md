@@ -13,6 +13,10 @@ through the Rust core and paints whatever it finds.
 
 Working now:
 
+- Right-click menus: Open, Open in new tab, Copy path, Rename, Properties on an
+  item; New folder, Sort by, View, Refresh, Select all on the background
+- Creating a folder (Ctrl+Shift+N) and renaming in place (F2)
+- Properties dialog (Alt+Enter)
 - Directory listing with a parallel, streamed Rust scanner
 - Details and large-icon views, both virtualised
 - Tabs, navigation history, breadcrumb with folding, editable address field
@@ -59,6 +63,42 @@ bun run dev:web    # http://127.0.0.1:1420, synthetic filesystem
 
 In that mode `src/lib/mock.ts` supplies a deterministic filesystem, including a
 4,200 entry photo library for exercising the virtualiser.
+
+## Keyboard
+
+Explorer's shortcuts, as far as this build can honestly honour them.
+
+| Keys | Action |
+| --- | --- |
+| `Alt+Left` / `Alt+Right` / `Alt+Up` | Back, forward, up |
+| `Backspace` | Up one level |
+| `F5` | Refresh |
+| `Ctrl+T` / `Ctrl+W` | New tab, close tab |
+| `Ctrl+Tab` / `Ctrl+Shift+Tab` | Next, previous tab |
+| `Ctrl+1` … `Ctrl+9` | Go to tab |
+| `Ctrl+B` | Navigation pane |
+| `Alt+D`, `Ctrl+L`, `F4` | Edit the address bar |
+| `F3`, `Ctrl+F`, `Ctrl+E` | Focus search |
+| `F11` | Full screen |
+| `Enter` | Open |
+| `F2` | Rename |
+| `Ctrl+Shift+N` | New folder |
+| `Alt+Enter` | Properties |
+| `Ctrl+Shift+C` | Copy path |
+| `Shift+F10` | Context menu at the selection |
+| `Ctrl+Shift+2` / `Ctrl+Shift+6` | Large icons, details |
+| `Ctrl+A`, `Shift+arrows`, `Ctrl+click`, `Shift+click` | Selection |
+| `Home` / `End` / `PageUp` / `PageDown` | Move through the list |
+| `Space` | Toggle the focused item |
+| `Escape` | Clear selection, close a menu |
+| typing | Jump to a name |
+
+Deliberately absent, because the feature behind them does not exist yet: `Ctrl+C`
+/ `Ctrl+X` / `Ctrl+V`, `Delete`, `Ctrl+Z` / `Ctrl+Y`, `Ctrl+N` (a second window),
+`Ctrl+D` / `Alt+Z` (pinning), `Alt+P` (preview pane), `F6`, and the view sizes we
+do not render (`Ctrl+Shift+1/3/4/5/7/8`). The context menu shows cut, copy and
+delete greyed out with the reason, rather than looking functional and doing
+nothing.
 
 ## How it is fast
 

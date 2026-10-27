@@ -546,3 +546,38 @@
   font-size: var(--text-caption);
   color: var(--text-tertiary);
 }
+
+/* A context menu is positioned at the pointer, then clamped by the component. */
+.menu-context {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 80;
+  min-width: 232px;
+  transform-origin: top left;
+  animation: menu-in var(--dur-2) var(--ease-decel);
+}
+
+.menu-item-icon {
+  display: grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  flex: none;
+  color: var(--text-secondary);
+}
+
+.menu-item[data-disabled="true"] {
+  color: var(--text-disabled);
+  pointer-events: none;
+}
+
+.menu-item[data-disabled="true"] .menu-item-icon,
+.menu-item[data-disabled="true"] .menu-item-hint {
+  color: var(--text-disabled);
+  opacity: 0.7;
+}
+
+.menu-item .menu-item-hint {
+  margin-left: 18px;
+}

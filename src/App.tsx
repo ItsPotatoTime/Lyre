@@ -7,15 +7,27 @@ import type {
   PathInfo,
   Place,
   Selection,
+  SortKey,
   SortState,
   Tab,
   ViewMode,
 } from "@/types";
-import { getHomeDir, getPathInfo, getPlaces, openPath } from "@/lib/ipc";
+import {
+  isTauri,
+  createFolder,
+  getHomeDir,
+  getPathInfo,
+  getPlaces,
+  openPath,
+  pathProperties,
+  renamePath,
+  type PathProperties,
+} from "@/lib/ipc";
 import { useDirectory } from "@/lib/useDirectory";
 import { matchIndex, useSearch } from "@/lib/useSearch";
 import { useReveal } from "@/lib/hooks";
 import { useTheme } from "@/lib/theme";
+import { windowChrome } from "@/lib/window";
 import { DEFAULT_COLUMNS, type Mode } from "@/lib/modes";
 import {
   folder,
@@ -33,6 +45,8 @@ import { FileList } from "@/components/FileList";
 import { HomeView } from "@/components/HomeView";
 import { ThisPcView } from "@/components/ThisPcView";
 import { StatusBar } from "@/components/StatusBar";
+import { ContextMenu, type ContextItem } from "@/components/ContextMenu";
+import { PropertiesDialog } from "@/components/PropertiesDialog";
 import { Icon } from "@/components/Icons";
 
 let tabSeq = 0;
@@ -138,6 +152,13 @@ function Browser({
   const [editSignal, setEditSignal] = useState(0);
   const [driveSelected, setDriveSelected] = useState<string | null>(null);
   const [windowFocused, setWindowFocused] = useState(true);
+  const [renaming, setRenaming] = useState<string | null>(null);
+  const [properties, setProperties] = useState<PathProperties | null>(null);
+  const [context, setContext] = useState<{
+    x: number;
+    y: number;
+    entry: Entry | null;
+  } | null>(null);
   const [selection, setSelection] = useState<Selection>({
     selected: new Set(),
     focused: null,
@@ -312,6 +333,17 @@ function Browser({
     resetSelection();
   }, [home, resetSelection]);
 
+  const openInNewTab = useCallback(
+    (target: Location) => {
+      const tab = makeTab(target);
+      setTabs((prev) => [...prev, tab]);
+      setActiveId(tab.id);
+      setQuery("");
+      resetSelection();
+    },
+    [resetSelection],
+  );
+
   const closeTab = useCallback(
     (id: string) => {
       const index = tabs.findIndex((tab) => tab.id === id);
@@ -385,6 +417,290 @@ function Browser({
     [flash, navigate],
   );
 
+  // --- actions the interface can really perform ---------------------------
+  const refreshAfterChange = useCallback(
+    (select?: string) => {
+      setNonce((value) => value + 1);
+      if (select) {
+        setSelection({
+          selected: new Set([select]),
+          focused: select,
+          anchor: select,
+        });
+      }
+    },
+    [],
+  );
+
+  const newFolder = useCallback(() => {
+    if (!showsFiles) {
+      flash("Open a folder first, then create one with Ctrl+Shift+N.");
+      return;
+    }
+    void createFolder(location.path, "New folder")
+      .then((created) => {
+        refreshAfterChange(created);
+        // Explorer starts the name selected, so typing replaces it.
+        setRenaming(created);
+      })
+      .catch((error: unknown) =>
+        flash(error instanceof Error ? error.message : "Could not create the folder."),
+      );
+  }, [flash, location.path, refreshAfterChange, showsFiles]);
+
+  const beginRename = useCallback(() => {
+    const target = selection.focused;
+    if (!target || selection.selected.size !== 1) {
+      flash("Select one item to rename.");
+      return;
+    }
+    setRenaming(target);
+  }, [flash, selection.focused, selection.selected.size]);
+
+  const commitRename = useCallback(
+    (path: string, name: string) => {
+      setRenaming(null);
+      const current = visible.find((entry) => entry.path === path);
+      if (!current || name.trim() === current.name) return;
+      void renamePath(path, name)
+        .then((renamed) => refreshAfterChange(renamed))
+        .catch((error: unknown) =>
+          flash(error instanceof Error ? error.message : "Could not rename that item."),
+        );
+    },
+    [flash, refreshAfterChange, visible],
+  );
+
+  const showProperties = useCallback(
+    (path?: string) => {
+      const target = path ?? selection.focused;
+      if (!target) {
+        flash("Select an item to see its properties.");
+        return;
+      }
+      void pathProperties(target)
+        .then(setProperties)
+        .catch((error: unknown) => {
+          // The browser preview has no filesystem to describe; the row it is
+          // showing is data the scan already produced, so describe that.
+          const known = visible.find((entry) => entry.path === target);
+          if (!isTauri && known) {
+            setProperties({
+              name: known.name,
+              path: known.path,
+              parent: known.path.slice(0, Math.max(0, known.path.lastIndexOf("/"))),
+              isDir: known.isDir,
+              size: known.isDir ? null : known.size,
+              items: null,
+              modifiedMs: known.modifiedMs,
+              readonly: false,
+            });
+            return;
+          }
+          flash(error instanceof Error ? error.message : "Could not read properties.");
+        });
+    },
+    [flash, selection.focused],
+  );
+
+  const contextItems = useCallback(
+    (entry: Entry | null): ContextItem[] => {
+      const disabledOps = (): ContextItem[] => [
+        { kind: "sep" },
+        { kind: "label", text: "Needs file operations" },
+        {
+          kind: "item",
+          id: "cut",
+          label: "Cut",
+          icon: "cut",
+          shortcut: "Ctrl+X",
+          disabled: true,
+          note: "Arrives with file operations.",
+          onSelect: () => {},
+        },
+        {
+          kind: "item",
+          id: "copy",
+          label: "Copy",
+          icon: "copy",
+          shortcut: "Ctrl+C",
+          disabled: true,
+          note: "Arrives with file operations.",
+          onSelect: () => {},
+        },
+        {
+          kind: "item",
+          id: "delete",
+          label: "Delete",
+          icon: "trash",
+          shortcut: "Delete",
+          disabled: true,
+          note: "Arrives with file operations, and needs a trash to be safe.",
+          onSelect: () => {},
+        },
+      ];
+
+      if (!entry) {
+        return [
+          {
+            kind: "item",
+            id: "new-folder",
+            label: "New folder",
+            icon: "folderPlus",
+            shortcut: "Ctrl+Shift+N",
+            onSelect: newFolder,
+          },
+          { kind: "sep" },
+          { kind: "label", text: "Sort by" },
+          ...(
+            [
+              ["name", "Name"],
+              ["modified", "Date modified"],
+              ["type", "Type"],
+              ["size", "Size"],
+            ] as [SortKey, string][]
+          ).map(([key, labelText]) => ({
+            kind: "item" as const,
+            id: `sort-${key}`,
+            label: labelText,
+            checked: active.sort.key === key,
+            onSelect: () => setSort({ key, dir: active.sort.key === key ? active.sort.dir : 1 }),
+          })),
+          { kind: "sep" },
+          { kind: "label", text: "View" },
+          {
+            kind: "item",
+            id: "view-details",
+            label: "Details",
+            checked: active.view === "details",
+            shortcut: "Ctrl+Shift+6",
+            onSelect: () => setView("details"),
+          },
+          {
+            kind: "item",
+            id: "view-icons",
+            label: "Large icons",
+            checked: active.view === "grid",
+            shortcut: "Ctrl+Shift+2",
+            onSelect: () => setView("grid"),
+          },
+          { kind: "sep" },
+          {
+            kind: "item",
+            id: "refresh",
+            label: "Refresh",
+            icon: "refresh",
+            shortcut: "F5",
+            onSelect: refresh,
+          },
+          {
+            kind: "item",
+            id: "select-all",
+            label: "Select all",
+            shortcut: "Ctrl+A",
+            onSelect: () =>
+              setSelection({
+                selected: new Set(visible.map((item) => item.path)),
+                focused: visible[0]?.path ?? null,
+                anchor: visible[0]?.path ?? null,
+              }),
+          },
+        ];
+      }
+
+      return [
+        {
+          kind: "item",
+          id: "open",
+          label: entry.isDir ? "Open" : "Open with default app",
+          shortcut: "Enter",
+          onSelect: () => onOpen(entry),
+        },
+        {
+          kind: "item",
+          id: "open-tab",
+          label: "Open in new tab",
+          onSelect: () =>
+            openInNewTab(entry.isDir ? folder(entry.path) : location),
+        },
+        { kind: "sep" },
+        {
+          kind: "item",
+          id: "copy-path",
+          label: "Copy path",
+          shortcut: "Ctrl+Shift+C",
+          onSelect: () => void copyPath(),
+        },
+        {
+          kind: "item",
+          id: "rename",
+          label: "Rename",
+          icon: "rename",
+          shortcut: "F2",
+          onSelect: beginRename,
+        },
+        ...disabledOps(),
+        { kind: "sep" },
+        {
+          kind: "item",
+          id: "properties",
+          label: "Properties",
+          shortcut: "Alt+Enter",
+          onSelect: () => showProperties(entry.path),
+        },
+      ];
+    },
+    [
+      active.sort.dir,
+      active.sort.key,
+      active.view,
+      beginRename,
+      copyPath,
+      location.path,
+      newFolder,
+      onOpen,
+      openInNewTab,
+      location,
+      refresh,
+      setSort,
+      setView,
+      showProperties,
+      visible,
+    ],
+  );
+
+  const toggleFullscreen = useCallback(() => windowChrome.toggleFullscreen(), []);
+
+  const focusSearch = useCallback(() => {
+    searchRef.current?.focus();
+    searchRef.current?.select();
+  }, []);
+
+  const cycleTab = useCallback(
+    (step: number) => {
+      const index = tabs.findIndex((tab) => tab.id === activeIdRef.current);
+      if (index === -1 || tabs.length < 2) return;
+      const next = (index + step + tabs.length) % tabs.length;
+      setActiveId(tabs[next]!.id);
+    },
+    [tabs],
+  );
+
+  /** Shift+F10: the menu opens over the focused row. */
+  const openContextFromKeyboard = useCallback(() => {
+    const focused = selection.focused;
+    const row = focused
+      ? document.querySelector(`.row[data-path="${CSS.escape(focused)}"]`)
+      : null;
+    const rect = row?.getBoundingClientRect();
+    const entry = focused ? (visible.find((item) => item.path === focused) ?? null) : null;
+    setContext({
+      x: rect ? rect.left + 40 : window.innerWidth / 3,
+      y: rect ? rect.top + rect.height : window.innerHeight / 3,
+      entry,
+    });
+  }, [selection.focused, visible]);
+
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
       const target = event.target as HTMLElement | null;
@@ -396,8 +712,41 @@ function Browser({
         refresh();
         return;
       }
+      // Ctrl+Shift comes first: N creates a folder, C copies the path, and the
+      // number keys change the view.
+      if ((event.ctrlKey || event.metaKey) && event.shiftKey) {
+        const key = event.key.toLowerCase();
+        if (key === "n") {
+          event.preventDefault();
+          newFolder();
+          return;
+        }
+        if (key === "c") {
+          event.preventDefault();
+          void copyPath();
+          return;
+        }
+        if (key === "tab") {
+          event.preventDefault();
+          cycleTab(-1);
+          return;
+        }
+        if (event.key === "6") {
+          event.preventDefault();
+          setView("details");
+          return;
+        }
+        if (event.key === "2") {
+          event.preventDefault();
+          setView("grid");
+          return;
+        }
+        return;
+      }
+
       if ((event.ctrlKey || event.metaKey) && !event.shiftKey) {
-        switch (event.key.toLowerCase()) {
+        const key = event.key.toLowerCase();
+        switch (key) {
           case "t":
             event.preventDefault();
             newTab();
@@ -415,24 +764,30 @@ function Browser({
             setEditSignal((value) => value + 1);
             return;
           case "f":
+          case "e":
             event.preventDefault();
-            searchRef.current?.focus();
-            searchRef.current?.select();
+            focusSearch();
+            return;
+          case "tab":
+            event.preventDefault();
+            cycleTab(1);
             return;
           default:
             break;
         }
-      }
-      if ((event.ctrlKey || event.metaKey) && event.shiftKey) {
-        if (event.key === "1") {
-          event.preventDefault();
-          setView("details");
-        } else if (event.key === "2") {
-          event.preventDefault();
-          setView("grid");
+        // Ctrl+1..9 jumps to a tab, as in a browser and in Explorer's tabs.
+        if (/^[1-9]$/.test(event.key)) {
+          const index = Number(event.key) - 1;
+          const target = tabs[index];
+          if (target) {
+            event.preventDefault();
+            setActiveId(target.id);
+          }
+          return;
         }
         return;
       }
+
       if (event.altKey) {
         if (event.key === "ArrowLeft") {
           event.preventDefault();
@@ -443,13 +798,63 @@ function Browser({
         } else if (event.key === "ArrowUp") {
           event.preventDefault();
           goUp();
+        } else if (event.key.toLowerCase() === "d") {
+          event.preventDefault();
+          setEditSignal((value) => value + 1);
+        } else if (event.key === "Enter") {
+          event.preventDefault();
+          showProperties();
         }
+        return;
+      }
+
+      if (event.key === "F2" && !typing) {
+        event.preventDefault();
+        beginRename();
+        return;
+      }
+      if (event.key === "F3" && !typing) {
+        event.preventDefault();
+        focusSearch();
+        return;
+      }
+      if (event.key === "F4" && !typing) {
+        event.preventDefault();
+        setEditSignal((value) => value + 1);
+        return;
+      }
+      if (event.key === "F11") {
+        event.preventDefault();
+        void toggleFullscreen();
+        return;
+      }
+      // Shift+F10 is the keyboard's context menu key.
+      if (event.shiftKey && event.key === "F10" && !typing) {
+        event.preventDefault();
+        openContextFromKeyboard();
+        return;
       }
     };
 
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [closeTab, goBack, goForward, goUp, newTab, refresh, setView]);
+  }, [
+    beginRename,
+    closeTab,
+    copyPath,
+    cycleTab,
+    focusSearch,
+    goBack,
+    goForward,
+    goUp,
+    newFolder,
+    newTab,
+    openContextFromKeyboard,
+    refresh,
+    setView,
+    showProperties,
+    tabs,
+  ]);
 
   const pageTotal =
     location.kind === "home"
@@ -626,6 +1031,21 @@ function Browser({
               grouped={active.groupByDate}
               matched={searching ? highlights : undefined}
               sortable={!searching}
+              editing={renaming}
+              onRename={commitRename}
+              onCancelRename={() => setRenaming(null)}
+              onContextMenu={(event, entry) => {
+                event.preventDefault();
+                event.stopPropagation();
+                if (entry && !selection.selected.has(entry.path)) {
+                  setSelection({
+                    selected: new Set([entry.path]),
+                    focused: entry.path,
+                    anchor: entry.path,
+                  });
+                }
+                setContext({ x: event.clientX, y: event.clientY, entry });
+              }}
               onRetry={() => {
                 setNonce((value) => value + 1);
                 onRefreshPlaces();
@@ -634,6 +1054,22 @@ function Browser({
           )}
         </main>
       </div>
+
+      {context ? (
+        <ContextMenu
+          x={context.x}
+          y={context.y}
+          items={contextItems(context.entry)}
+          onClose={() => setContext(null)}
+        />
+      ) : null}
+
+      {properties ? (
+        <PropertiesDialog
+          properties={properties}
+          onClose={() => setProperties(null)}
+        />
+      ) : null}
 
       <StatusBar
         status={location.kind === "folder" || location.kind === "gallery" ? dir.status : "ready"}

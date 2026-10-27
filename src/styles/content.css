@@ -752,3 +752,126 @@
     animation: none;
   }
 }
+
+/* Rename happens in place, so the row does not jump. */
+.row-input {
+  flex: 1;
+  min-width: 0;
+  height: 20px;
+  padding: 0 4px;
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  background: var(--bg-field);
+  color: var(--text-primary);
+  font-size: var(--text-row);
+  font-family: inherit;
+}
+
+/* Properties: a small modal, because it is a thing you read. */
+.dialog-scrim {
+  position: fixed;
+  inset: 0;
+  z-index: 90;
+  display: grid;
+  place-items: center;
+  background: rgba(0, 0, 0, 0.32);
+  animation: notice-in var(--dur-2) var(--ease-decel);
+}
+
+.dialog {
+  width: min(440px, calc(100vw - 48px));
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-popup);
+  background: var(--bg-raised);
+  box-shadow: var(--shadow-popup);
+  outline: none;
+}
+
+.dialog-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.dialog-glyph {
+  display: grid;
+  place-items: center;
+  flex: none;
+}
+
+.dialog-title {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--text-body);
+  font-weight: var(--weight-semi);
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dialog-close {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: var(--radius-control);
+  color: var(--text-secondary);
+}
+
+.dialog-close:hover {
+  background: var(--hover);
+  color: var(--text-primary);
+}
+
+.dialog-rows {
+  display: grid;
+  gap: 6px;
+  padding: 12px 0 4px;
+  margin: 0;
+}
+
+.dialog-row {
+  display: grid;
+  grid-template-columns: 92px 1fr;
+  gap: 10px;
+  align-items: baseline;
+}
+
+.dialog-row dt {
+  font-size: var(--text-caption);
+  color: var(--text-secondary);
+}
+
+.dialog-row dd {
+  margin: 0;
+  font-size: var(--text-caption);
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.dialog-foot {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: 12px;
+  border-top: 1px solid var(--line-soft);
+}
+
+.dialog-action {
+  height: 30px;
+  padding: 0 18px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-control);
+  background: var(--bg-field);
+  color: var(--text-primary);
+  font-size: var(--text-caption);
+}
+
+.dialog-action:hover {
+  background: var(--bg-field-hover);
+}

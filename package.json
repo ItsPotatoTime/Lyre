@@ -12,7 +12,8 @@
     "preview": "vite preview",
     "app:build": "tauri build",
     "typecheck": "tsc --noEmit",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "buildit": "bun run scripts/buildit.ts"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.9.0",

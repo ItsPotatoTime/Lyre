@@ -55,8 +55,32 @@ bun dev            # builds the Rust core and opens the app, with hot reload
 crate, and opens the window against your real filesystem.
 
 ```bash
-bun run app:build  # production bundles for the host OS
+bun buildit        # build for whichever OS is running it
 ```
+
+`bun buildit` detects the platform and does the right thing. On Linux and macOS
+it installs dependencies and builds; it picks the installer formats the machine
+can actually produce (`deb` needs `dpkg-deb`, `rpm` needs `rpmbuild`) and builds
+just the executable, saying so, when neither is present.
+
+Flags: `--debug`, `--clean`, `--bundles deb`, `--dry-run` (prints every command
+without running it).
+
+On Windows it does more, because a Windows build cannot share state with a Linux
+one:
+
+- The source is copied to `%USERPROFILE%\lyre-winbuild` and built there, so the
+  two platforms never write object files into the same `target`.
+- MSVC is activated with `vcvars64.bat` inside the same shell that runs cargo,
+  and the presence of Git's GNU `link.exe` is checked for, since it shadows
+  MSVC's and produces link errors that look like source bugs.
+- These steps live in a generated `lyre-build.cmd`, so they can be read and
+  re-run by hand instead of being buried in a quoted `cmd /c` string.
+- Installers are copied back to `build/` on the shared disk.
+
+If a build fails after an edit on the other OS, run `bun buildit --clean`: on a
+shared filesystem the timestamps can be coarse enough that cargo reuses a stale
+build script.
 
 Requires Rust, Bun, and the Tauri prerequisites for your platform. On Linux
 that means `webkit2gtk-4.1`, `gtk3`, and `libsoup3` development packages.

@@ -33,8 +33,9 @@ import { useDirectory } from "@/lib/useDirectory";
 import { matchIndex, useSearch } from "@/lib/useSearch";
 import { useReveal } from "@/lib/hooks";
 import { useTheme } from "@/lib/theme";
+import { loadPrefs, savePrefs, type Prefs } from "@/lib/prefs";
 import { windowChrome } from "@/lib/window";
-import { DEFAULT_COLUMNS, type Mode } from "@/lib/modes";
+import { type Mode } from "@/lib/modes";
 import {
   folder,
   home as homeLocation,
@@ -58,17 +59,17 @@ import { Icon } from "@/components/Icons";
 
 let tabSeq = 0;
 
-function makeTab(location: Location): Tab {
+function makeTab(location: Location, prefs: Prefs): Tab {
   tabSeq += 1;
   return {
     id: `tab-${tabSeq}`,
     location,
     history: [location],
     index: 0,
-    sort: { key: "name", dir: 1 },
-    view: "details",
+    sort: prefs.sort,
+    view: prefs.view,
     filter: "all",
-    groupByDate: false,
+    groupByDate: prefs.groupByDate,
   };
 }
 
@@ -143,16 +144,18 @@ function Browser({
   const theme = useTheme();
   useReveal();
 
+  // Read once, so the first paint is already the saved arrangement.
+  const [prefs] = useState(() => loadPrefs());
   const [tabs, setTabs] = useState<Tab[]>(() => [
-    makeTab(homeLocation(home)),
+    makeTab(homeLocation(home), prefs),
   ]);
   const [activeId, setActiveId] = useState<string>(tabs[0]!.id);
   const [query, setQuery] = useState("");
-  const [navOpen, setNavOpen] = useState(true);
-  const [navWidth, setNavWidth] = useState(160);
-  const [showHidden, setShowHidden] = useState(false);
-  const [mode, setMode] = useState<Mode>("explorer");
-  const [columns, setColumns] = useState<ColumnWidths>(DEFAULT_COLUMNS);
+  const [navOpen, setNavOpen] = useState(prefs.navOpen);
+  const [navWidth, setNavWidth] = useState(prefs.navWidth);
+  const [showHidden, setShowHidden] = useState(prefs.showHidden);
+  const [mode, setMode] = useState<Mode>(prefs.mode);
+  const [columns, setColumns] = useState<ColumnWidths>(prefs.columns);
   const [notice, setNotice] = useState<string | null>(null);
   const [info, setInfo] = useState<PathInfo | null>(null);
   const [nonce, setNonce] = useState(0);
@@ -304,6 +307,30 @@ function Browser({
     resetSelection();
   }, [location.path, location.kind, resetSelection]);
 
+  // Persist the view as it changes. Cheap enough to write on each change and
+  // far simpler than tracking dirty fields.
+  useEffect(() => {
+    savePrefs({
+      sort: active.sort,
+      view: active.view,
+      groupByDate: active.groupByDate,
+      mode,
+      showHidden,
+      navOpen,
+      navWidth,
+      columns,
+    });
+  }, [
+    active.sort,
+    active.view,
+    active.groupByDate,
+    mode,
+    showHidden,
+    navOpen,
+    navWidth,
+    columns,
+  ]);
+
   useEffect(() => {
     const onFocus = () => setWindowFocused(true);
     const onBlur = () => setWindowFocused(false);
@@ -345,7 +372,11 @@ function Browser({
   }, [info, location, navigate]);
 
   const newTab = useCallback(() => {
-    const tab = makeTab(homeLocation(home));
+    const tab = makeTab(homeLocation(home), {
+      sort: active.sort,
+      view: active.view,
+      groupByDate: active.groupByDate,
+    } as Prefs);
     setTabs((prev) => [...prev, tab]);
     setActiveId(tab.id);
     setQuery("");
@@ -354,13 +385,17 @@ function Browser({
 
   const openInNewTab = useCallback(
     (target: Location) => {
-      const tab = makeTab(target);
+      const tab = makeTab(target, {
+        sort: active.sort,
+        view: active.view,
+        groupByDate: active.groupByDate,
+      } as Prefs);
       setTabs((prev) => [...prev, tab]);
       setActiveId(tab.id);
       setQuery("");
       resetSelection();
     },
-    [resetSelection],
+    [active.groupByDate, active.sort, active.view, resetSelection],
   );
 
   const closeTab = useCallback(
@@ -1163,36 +1198,13 @@ function Browser({
           />
         ) : null}
         <main className="content">
-          {searching ? (
-            <FileList
-              entries={visible}
-              version={dir.version}
-              view={active.view}
-              density={mode}
-              sort={active.sort}
-              onSort={setSort}
-              selection={selection}
-              onSelection={setSelection}
-              onOpen={onOpen}
-              onUp={goUp}
-              status={search.phase === "done" || search.items.length > 0 ? "ready" : "loading"}
-              error={search.error}
-              path={searchPath || location.kind}
-              filtering
-              columns={columns}
-              onColumns={setColumns}
-              grouped={false}
-              matched={highlights}
-              sortable={false}
-              onRetry={refresh}
-            />
-          ) : location.kind === "home" ? (
+          {location.kind === "home" && !searching ? (
             <HomeView
               places={quickAccess}
               onNavigate={(path) => navigate(folder(path))}
               onUnavailable={flash}
             />
-          ) : location.kind === "thisPc" ? (
+          ) : location.kind === "thisPc" && !searching ? (
             <ThisPcView
               places={volumes}
               selected={driveSelected}
@@ -1211,13 +1223,19 @@ function Browser({
               onSelection={setSelection}
               onOpen={onOpen}
               onUp={goUp}
-              status={dir.status}
-              error={dir.error}
-              path={location.path}
+              status={
+                searching
+                  ? search.phase === "done" || search.items.length > 0
+                    ? "ready"
+                    : "loading"
+                  : dir.status
+              }
+              error={searching ? search.error : dir.error}
+              path={searching ? searchPath || location.kind : location.path}
               filtering={filtering}
               columns={columns}
               onColumns={setColumns}
-              grouped={active.groupByDate}
+              grouped={!searching && active.groupByDate}
               matched={searching ? highlights : undefined}
               sortable={!searching}
               editing={renaming}

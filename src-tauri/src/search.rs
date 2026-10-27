@@ -556,9 +556,13 @@ where
         .unwrap_or(4)
         .min(12);
 
-    let mut found = 0usize;
     let mut accepted = 0usize;
     let walk_started = Instant::now();
+    // Matches are counted by every worker, but only the first `LIMIT` are
+    // turned into rows. Describing a file costs a `stat` and two allocations;
+    // doing that for a query like "libc" across a home folder meant 43,000 of
+    // them to display 1,000, and that is where four seconds went.
+    let matched = AtomicUsize::new(matched_so_far);
     // Set when the scan ceiling stopped the walk, so `Done` can say the answer
     // is incomplete rather than implying the tree was fully searched.
     let mut cut = false;
@@ -568,6 +572,7 @@ where
             let tx = tx.clone();
             let queue = &queue;
             let examined = &examined;
+            let matched = &matched;
             scope.spawn(move || {
                 let mut matcher = Matcher::new(Config::DEFAULT);
                 let mut buf = Vec::new();
@@ -639,6 +644,12 @@ where
                                 continue;
                             };
 
+                            // Counted first, so the total stays exact even once
+                            // the answer is full and rows stop being built.
+                            if matched.fetch_add(1, Ordering::Relaxed) >= LIMIT {
+                                continue;
+                            }
+
                             // Metadata is paid for only here, on a match.
                             let Some(entry) =
                                 scan::describe_entry(name, item.path(), is_dir, is_symlink)
@@ -680,7 +691,6 @@ where
         let mut last_flush = Instant::now();
 
         for hit in rx {
-            found += 1;
             if matched_so_far + accepted < LIMIT {
                 batch.push(hit);
                 accepted += 1;
@@ -723,9 +733,11 @@ where
     });
 
     Outcome {
-        matched: matched_so_far + found,
+        matched: matched.load(Ordering::Relaxed),
         scanned: examined.load(Ordering::Relaxed),
-        truncated: cut || found > accepted,
+        // Truncated when there were more matches than rows shown, or when the
+        // ceiling stopped the walk before the tree was finished.
+        truncated: cut || matched.load(Ordering::Relaxed) > matched_so_far + accepted,
     }
 }
 

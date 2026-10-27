@@ -146,6 +146,26 @@ the change takes effect.
 macOS is the one with no route at all: Finder is the shell and offers nothing
 equivalent.
 
+## Search
+
+Search runs in two phases: the folder on screen is answered from memory, then a
+parallel breadth-first walk covers the folders below it. The walk used to build
+a full result row for every match it found and then discard all but the first
+thousand, which cost a `stat` and two allocations per match. On a home folder
+that meant 43,000 of them to display 1,000.
+
+Matches are now counted without being built, and only the rows that will be
+shown are described and sent. Measured on this machine:
+
+- `/usr`, `libc`: 815 ms before, 120 ms after, 640k files examined
+- `/home`, `libc`: 4013 ms before, 218 ms after, 926k files examined
+- `/home`, no matches at all: 5371 ms before, 232 ms after
+
+The cost is now the directory walk itself, whatever the number of matches, so a
+query that matches everything costs the same as one that matches nothing.
+
+`cargo test --lib bench -- --ignored --nocapture` reruns the measurements.
+
 ## Memory
 
 Measured on a 20,000 file folder, with the numbers from `/proc/<pid>/smaps_rollup`

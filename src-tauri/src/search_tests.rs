@@ -461,3 +461,65 @@ fn bench_packed_folder() {
 
 
 
+
+/// What a keystroke costs when the answer lives below the folder on screen.
+///
+/// `cargo test --lib bench_recursive -- --ignored --nocapture`
+#[test]
+#[ignore = "timing run, not an assertion"]
+fn bench_recursive_tree() {
+    let root = scratch("bench-tree");
+    // 150 folders of 150 files: enough that a walk is real work, small enough
+    // to build quickly.
+    for d in 0..150 {
+        let dir = root.join(format!("section-{d:03}"));
+        fs::create_dir_all(&dir).unwrap();
+        for f in 0..150 {
+            fs::write(dir.join(format!("item-{d:03}-{f:03}.txt")), b"x").unwrap();
+        }
+    }
+
+    let index = Index::default();
+    println!("tree: 22,500 files across 150 folders");
+
+    for query in ["report", "item-042", "zzz"] {
+        let started = Instant::now();
+        let first = run(&index, &root, query, true);
+        let cold = started.elapsed().as_secs_f64() * 1000.0;
+
+        let started = Instant::now();
+        let second = run(&index, &root, query, true);
+        let warm = started.elapsed().as_secs_f64() * 1000.0;
+
+        println!(
+            "  {query:>9}: cold {cold:7.1} ms ({} hits, {} scanned) | again {warm:7.1} ms",
+            first.matched, first.scanned
+        );
+        assert_eq!(first.matched, second.matched, "the answer must not change");
+    }
+
+    fs::remove_dir_all(&root).ok();
+}
+
+/// A real tree, of the size where searching from This PC feels slow.
+///
+/// `cargo test --lib bench_real -- --ignored --nocapture`
+#[test]
+#[ignore = "timing run against the real filesystem"]
+fn bench_real_tree() {
+    let index = Index::default();
+    for root in ["/usr", "/home"] {
+        if !Path::new(root).exists() {
+            continue;
+        }
+        for query in ["libc", "zzzzzzz", "cargo"] {
+            let started = Instant::now();
+            let result = run(&index, Path::new(root), query, true);
+            let ms = started.elapsed().as_secs_f64() * 1000.0;
+            println!(
+                "{root:>6} {query:>8}: {ms:8.1} ms | {} hits | {} scanned | truncated {}",
+                result.matched, result.scanned, result.truncated
+            );
+        }
+    }
+}

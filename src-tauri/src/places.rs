@@ -19,6 +19,10 @@ pub struct Place {
     pub icon: &'static str,
     /// Free space summary for drives, item count hint otherwise.
     pub detail: Option<String>,
+    /// Volume size in bytes; zero for folders. The interface needs both
+    /// numbers, not just the formatted summary, to draw a capacity bar.
+    pub total: u64,
+    pub free: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -68,6 +72,8 @@ pub fn places() -> Vec<Place> {
         kind: "folder",
         icon: "home",
         detail: None,
+        total: 0,
+        free: 0,
     });
 
     // The XDG user directories are declared in a config file on Linux, and the
@@ -94,6 +100,8 @@ pub fn places() -> Vec<Place> {
                 kind: "folder",
                 icon,
                 detail: None,
+                total: 0,
+                free: 0,
             });
         }
     }
@@ -132,6 +140,8 @@ fn drives() -> Vec<Place> {
             kind: if disk.is_removable() { "removable" } else { "drive" },
             icon: "drive",
             detail: Some(format!("{} free of {}", bytes(free), bytes(total))),
+            total,
+            free,
         });
     }
     // Stable order: fixed drives by path, so the rail does not reshuffle

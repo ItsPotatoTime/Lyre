@@ -24,13 +24,23 @@ export function mockPlaces(): Place[] {
     ["Videos", "video", "folder"],
   ];
   return [
-    { name: "you", path: HOME, kind: "folder", icon: "home", detail: null },
+    {
+      name: "you",
+      path: HOME,
+      kind: "folder" as const,
+      icon: "home",
+      detail: null,
+      total: 0,
+      free: 0,
+    },
     ...folders.map(([name, icon, kind]) => ({
       name,
       path: `${HOME}/${name}`,
       kind: kind as Place["kind"],
       icon,
       detail: null,
+      total: 0,
+      free: 0,
     })),
     {
       name: "Local Disk",
@@ -38,6 +48,8 @@ export function mockPlaces(): Place[] {
       kind: "drive" as const,
       icon: "drive",
       detail: "182.4 GB free of 476.9 GB",
+      total: 476_900_000_000,
+      free: 182_400_000_000,
     },
     {
       name: "Seagate Backup",
@@ -45,6 +57,8 @@ export function mockPlaces(): Place[] {
       kind: "removable" as const,
       icon: "drive",
       detail: "1.2 TB free of 1.8 TB",
+      total: 1_800_000_000_000,
+      free: 1_200_000_000_000,
     },
   ];
 }

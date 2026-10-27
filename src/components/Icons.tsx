@@ -190,6 +190,24 @@ const GLYPHS = {
       <path d="M12.8 12.8 17 17M6.6 9h4.8M9 6.6v4.8" />
     </>
   ),
+  filter: (
+    <path d="M3.6 5.2h12.8l-4.9 5.9v4.4l-3 1.4v-5.8z" />
+  ),
+  network: (
+    <>
+      <circle cx="10" cy="10" r="6.6" />
+      <path d="M3.4 10h13.2" />
+      <path d="M10 3.4c1.9 2 1.9 11.2 0 13.2M10 3.4c-1.9 2-1.9 11.2 0 13.2" />
+    </>
+  ),
+  gallery: (
+    <>
+      <rect x="2.6" y="5.4" width="11.4" height="9" rx="1.6" />
+      <path d="M6 3.6h8.8a2 2 0 0 1 2 2v7.6" />
+      <circle cx="6.6" cy="8.8" r="1.1" />
+      <path d="M3.4 14.4 7 11l2.4 2 1.8-1.5 2.6 2.4" />
+    </>
+  ),
 } as const;
 
 export type IconName = keyof typeof GLYPHS;

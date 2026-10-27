@@ -1,28 +1,22 @@
 /* ============================================================================
-   The window chrome: tab strip, command bar, address bar, window controls.
-   Explorer's chrome is a single flat material with no dividers between the
-   three rows, which is why nothing here draws a horizontal rule except where
-   the content area begins.
+   Window chrome: title strip with tabs, toolbar (nav + address + search),
+   command bar, window controls.
+   The four rows are different tones separated by hairlines; nothing is boxed.
    ========================================================================= */
 
 .app {
   display: grid;
-  grid-template-rows: var(--tabbar-h) var(--commandbar-h) var(--addressbar-h) 1fr var(--statusbar-h);
+  grid-template-rows: var(--titlebar-h) var(--toolbar-h) var(--commandbar-h) 1fr var(--statusbar-h);
   height: 100%;
-  background: var(--surface-chrome);
-  /* The window is undecorated, so the 1px frame Windows draws around a
-     window is drawn here instead, inset so it is not clipped away. */
-  box-shadow: inset 0 0 0 1px var(--stroke-divider);
+  background: var(--bg-content);
   overflow: hidden;
 }
 
-/* Edge resize grips. The window is undecorated, so the resize affordance has
-   to exist in the page or the window cannot be resized at all. */
+/* Edge resize grips: an undecorated window has no other way to be resized. */
 .grip {
   position: fixed;
   z-index: 60;
 }
-
 .grip-n,
 .grip-s {
   left: var(--resize-grip);
@@ -77,55 +71,53 @@
   cursor: nesw-resize;
 }
 
-/* Tab strip ---------------------------------------------------------------- */
+/* Title strip -------------------------------------------------------------- */
 .titlebar {
   display: flex;
   align-items: stretch;
   min-width: 0;
+  background: var(--bg-titlebar);
   padding-left: 8px;
-  background: var(--surface-chrome);
-  background-image: linear-gradient(
-    var(--surface-chrome-tint),
-    var(--surface-chrome-tint)
-  );
 }
 
 .tabstrip {
   display: flex;
   align-items: flex-end;
-  gap: 2px;
   min-width: 0;
   flex: 1;
-  padding-top: 4px;
+  gap: 0;
 }
 
 .tab {
-  --tab-active: color-mix(in srgb, var(--surface-content) 88%, var(--surface-chrome));
   position: relative;
   display: flex;
   align-items: center;
-  gap: 8px;
-  height: 32px;
-  min-width: 132px;
-  max-width: 208px;
-  flex: 0 1 208px;
-  padding: 0 4px 0 12px;
-  border-radius: var(--radius-surface) var(--radius-surface) 0 0;
+  gap: 11px;
+  height: var(--titlebar-h);
+  width: 240px;
+  min-width: 120px;
+  flex: 0 1 240px;
+  padding: 0 6px 0 13px;
+  border-radius: var(--radius-tab) var(--radius-tab) 0 0;
   color: var(--text-secondary);
   background: transparent;
-  transition:
-    background-color var(--dur-2) var(--ease-standard),
-    color var(--dur-2) var(--ease-standard);
+  transition: background-color var(--dur-2) var(--ease-standard);
 }
 
 .tab:hover {
-  background: var(--surface-hover);
+  background: var(--hover);
   color: var(--text-primary);
 }
 
 .tab[data-active="true"] {
-  background: var(--tab-active);
+  background: var(--bg-tab);
   color: var(--text-primary);
+}
+
+.tab-glyph {
+  flex: none;
+  display: grid;
+  place-items: center;
 }
 
 .tab-label {
@@ -137,19 +129,18 @@
   overflow: hidden;
   text-overflow: ellipsis;
   text-align: left;
+  color: inherit;
 }
 
 .tab-close {
   display: grid;
   place-items: center;
-  width: 24px;
-  height: 24px;
+  width: 20px;
+  height: 20px;
   border-radius: var(--radius-control);
   color: var(--text-secondary);
   opacity: 0;
-  transition:
-    opacity var(--dur-2) var(--ease-standard),
-    background-color var(--dur-1) var(--ease-standard);
+  transition: background-color var(--dur-1) var(--ease-standard);
 }
 
 .tab:hover .tab-close,
@@ -159,34 +150,28 @@
 }
 
 .tab-close:hover {
-  background: var(--surface-pressed);
+  background: var(--hover);
   color: var(--text-primary);
-}
-
-.tab-close:active {
-  transform: scale(0.92);
 }
 
 .tab-new {
   display: grid;
   place-items: center;
-  width: 28px;
-  height: 28px;
-  margin: 0 2px 2px;
-  border-radius: var(--radius-control);
+  width: 32px;
+  height: 32px;
   color: var(--text-secondary);
+  border-radius: var(--radius-control);
 }
 
 .tab-new:hover {
-  background: var(--surface-hover);
+  background: var(--hover);
   color: var(--text-primary);
 }
 
-/* Window controls ---------------------------------------------------------- */
+/* Caption buttons are flat glyphs on the title strip, as in the reference. */
 .window-controls {
   display: flex;
-  align-items: flex-start;
-  height: var(--tabbar-h);
+  align-items: stretch;
   flex: none;
 }
 
@@ -194,13 +179,13 @@
   display: grid;
   place-items: center;
   width: 46px;
-  height: 32px;
+  height: var(--titlebar-h);
   color: var(--text-secondary);
   transition: background-color var(--dur-1) var(--ease-standard);
 }
 
 .caption-btn:hover {
-  background: var(--surface-hover);
+  background: var(--hover);
   color: var(--text-primary);
 }
 
@@ -210,119 +195,25 @@
 }
 
 .caption-btn:active {
-  background: var(--surface-pressed);
+  background: var(--pressed);
 }
 
-.caption-btn[data-kind="close"]:active {
-  background: #b0261a;
-  color: #ffffff;
-}
-
-/* Command bar -------------------------------------------------------------- */
-.cmd-chevron {
-  display: inline-block;
-  vertical-align: -1px;
-  margin-left: 3px;
-  opacity: 0.7;
-}
-
-.cmd-btn[data-active="true"] {
-  background: var(--surface-selected);
-  color: var(--accent);
-}
-
-.commandbar {
+/* Toolbar: navigation, address, search -------------------------------------- */
+.toolbar {
   display: flex;
   align-items: center;
-  gap: 2px;
-  padding: 0 8px;
+  /* Reference pitch: nav buttons are 40 wide on a 47px rhythm. */
+  gap: 7px;
+  padding: 0 8px 0 12px;
   min-width: 0;
-  background: var(--surface-chrome);
-  background-image: linear-gradient(
-    var(--surface-chrome-tint),
-    var(--surface-chrome-tint)
-  );
-}
-
-.cmd-group {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  min-width: 0;
-}
-
-.cmd-sep {
-  width: 1px;
-  height: 20px;
-  margin: 0 6px;
-  background: var(--stroke-divider);
-  flex: none;
-}
-
-.cmd-btn {
-  display: flex;
-  flex-direction: column;
-  align-items: center;
-  justify-content: center;
-  gap: 3px;
-  min-width: 46px;
-  height: 38px;
-  padding: 0 6px;
-  border-radius: var(--radius-control);
-  color: var(--text-primary);
-  transition:
-    background-color var(--dur-1) var(--ease-standard),
-    transform var(--dur-1) var(--ease-out);
-}
-
-.cmd-btn:hover {
-  background: var(--surface-hover);
-}
-
-.cmd-btn:active {
-  background: var(--surface-pressed);
-  transform: scale(0.97);
-}
-
-.cmd-btn[data-disabled="true"] {
-  color: var(--text-disabled);
-  pointer-events: none;
-}
-
-.cmd-label {
-  font-size: var(--text-caption);
-  line-height: 14px;
-  white-space: nowrap;
-}
-
-.cmd-btn[data-compact="true"] {
-  min-width: 34px;
-  flex-direction: row;
-}
-
-.cmd-spacer {
-  flex: 1;
-  min-width: 8px;
-}
-
-/* Address bar -------------------------------------------------------------- */
-.addressbar {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-  padding: 0 8px;
-  min-width: 0;
-  background: var(--surface-chrome);
-  background-image: linear-gradient(
-    var(--surface-chrome-tint),
-    var(--surface-chrome-tint)
-  );
+  background: var(--bg-toolbar);
+  border-bottom: 1px solid var(--line);
 }
 
 .nav-btn {
   display: grid;
   place-items: center;
-  width: 32px;
+  width: 40px;
   height: 32px;
   border-radius: var(--radius-control);
   color: var(--text-secondary);
@@ -333,12 +224,12 @@
 }
 
 .nav-btn:hover:not([data-disabled="true"]) {
-  background: var(--surface-hover);
+  background: var(--hover);
   color: var(--text-primary);
 }
 
 .nav-btn:active:not([data-disabled="true"]) {
-  transform: scale(0.95);
+  background: var(--pressed);
 }
 
 .nav-btn[data-disabled="true"] {
@@ -346,31 +237,34 @@
   pointer-events: none;
 }
 
-/* The address field is a control surface, not a text input, until it is
-   clicked. Explorer makes the same substitution. */
 .address-field {
   display: flex;
   align-items: center;
   flex: 1;
   min-width: 0;
   height: 32px;
-  margin: 0 4px;
-  padding: 0 2px;
-  border: 1px solid var(--stroke-control);
+  padding: 0 4px;
+  border: 1px solid var(--line-field);
   border-radius: var(--radius-control);
-  background: var(--surface-raised);
-  transition:
-    border-color var(--dur-2) var(--ease-standard),
-    background-color var(--dur-2) var(--ease-standard);
+  background: var(--bg-field);
+  transition: background-color var(--dur-2) var(--ease-standard);
 }
 
 .address-field:hover {
-  background: color-mix(in srgb, var(--surface-raised) 94%, var(--text-primary));
+  background: var(--bg-field-hover);
 }
 
 .address-field[data-editing="true"] {
   border-color: var(--accent);
   padding: 0 6px;
+}
+
+.address-glyph {
+  display: grid;
+  place-items: center;
+  margin: 0 4px 0 2px;
+  color: var(--text-secondary);
+  flex: none;
 }
 
 .address-input {
@@ -384,7 +278,6 @@
 .crumbs {
   display: flex;
   align-items: center;
-  gap: 0;
   min-width: 0;
   overflow: hidden;
   flex: 1;
@@ -401,21 +294,17 @@
   align-items: center;
   gap: 6px;
   height: 24px;
-  padding: 0 6px;
+  padding: 0 5px;
   border-radius: var(--radius-control);
   font-size: var(--text-caption);
   color: var(--text-primary);
   white-space: nowrap;
-  max-width: 220px;
+  max-width: 320px;
   transition: background-color var(--dur-1) var(--ease-standard);
 }
 
 .crumb:hover {
-  background: var(--surface-hover);
-}
-
-.crumb:active {
-  background: var(--surface-pressed);
+  background: var(--hover);
 }
 
 .crumb-label {
@@ -438,25 +327,30 @@
   font-size: var(--text-caption);
   color: var(--text-primary);
   text-align: left;
-  padding: 0 6px;
+  padding: 0 5px;
   display: flex;
   align-items: center;
 }
 
-/* Search ------------------------------------------------------------------- */
+/* Search sits at the far right with the magnifier on its right edge. */
 .search {
   display: flex;
   align-items: center;
-  gap: 6px;
-  width: 248px;
+  gap: 4px;
+  /* The reference search box is about a quarter of the window. */
+  width: min(503px, 32vw);
   flex: none;
   height: 32px;
-  padding: 0 8px;
-  border: 1px solid var(--stroke-control);
+  padding: 0 8px 0 10px;
+  border: 1px solid var(--line-field);
   border-radius: var(--radius-control);
-  background: var(--surface-raised);
-  color: var(--text-tertiary);
-  transition: border-color var(--dur-2) var(--ease-standard);
+  background: var(--bg-field);
+  color: var(--text-secondary);
+  transition: background-color var(--dur-2) var(--ease-standard);
+}
+
+.search:hover {
+  background: var(--bg-field-hover);
 }
 
 .search:focus-within {
@@ -470,7 +364,7 @@
   color: var(--text-primary);
 }
 
-.search-clear {
+.search button {
   display: grid;
   place-items: center;
   width: 20px;
@@ -479,9 +373,94 @@
   color: var(--text-secondary);
 }
 
-.search-clear:hover {
-  background: var(--surface-hover);
+/* Command bar -------------------------------------------------------------- */
+.commandbar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: var(--commandbar-h);
+  padding: 0 6px;
+  min-width: 0;
+  background: var(--bg-command);
+  border-bottom: 1px solid var(--line);
+}
+
+/* A labelled command: icon, 12px label, optional chevron. */
+.cmd {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 8px;
+  border-radius: var(--radius-control);
   color: var(--text-primary);
+  font-size: var(--text-caption);
+  white-space: nowrap;
+  transition: background-color var(--dur-1) var(--ease-standard);
+}
+
+.cmd:hover {
+  background: var(--hover);
+}
+
+.cmd:active {
+  background: var(--pressed);
+}
+
+.cmd[data-disabled="true"] {
+  color: var(--text-disabled);
+}
+
+/* An icon-only command, the shape the reference uses for the edit actions. */
+.cmd-icon {
+  display: grid;
+  place-items: center;
+  width: 40px;
+  height: 32px;
+  border-radius: var(--radius-control);
+  color: var(--text-primary);
+  transition: background-color var(--dur-1) var(--ease-standard);
+}
+
+.cmd-icon:hover {
+  background: var(--hover);
+}
+
+.cmd-icon:active {
+  background: var(--pressed);
+}
+
+.cmd-icon[data-disabled="true"] {
+  color: var(--text-disabled);
+}
+
+.cmd-chevron {
+  opacity: 0.75;
+  margin-left: -1px;
+}
+
+.cmd-group {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.cmd-gap {
+  width: 16px;
+  flex: none;
+}
+
+.cmd-sep {
+  width: 1px;
+  height: 18px;
+  margin: 0 5px;
+  background: var(--line);
+  flex: none;
+}
+
+.cmd-spacer {
+  flex: 1;
+  min-width: 4px;
 }
 
 /* Menus -------------------------------------------------------------------- */
@@ -496,9 +475,9 @@
   z-index: 50;
   min-width: 180px;
   padding: 4px;
-  border-radius: var(--radius-surface);
-  background: var(--surface-raised);
-  box-shadow: var(--shadow-flyout);
+  border-radius: var(--radius-popup);
+  background: var(--bg-raised);
+  box-shadow: var(--shadow-popup);
   transform-origin: top left;
   animation: menu-in var(--dur-2) var(--ease-decel);
 }
@@ -525,7 +504,7 @@
   align-items: center;
   gap: 10px;
   width: 100%;
-  height: 32px;
+  height: 30px;
   padding: 0 8px;
   border-radius: var(--radius-control);
   font-size: var(--text-body);
@@ -534,16 +513,16 @@
 }
 
 .menu-item:hover {
-  background: var(--surface-hover);
+  background: var(--hover);
 }
 
 .menu-item[data-checked="true"] {
-  background: var(--surface-selected);
+  background: var(--hover);
 }
 
 .menu-item-check {
   width: 16px;
-  color: var(--accent);
+  color: var(--text-primary);
   flex: none;
 }
 
@@ -559,7 +538,7 @@
 .menu-sep {
   height: 1px;
   margin: 4px 8px;
-  background: var(--stroke-divider);
+  background: var(--line);
 }
 
 .menu-label {

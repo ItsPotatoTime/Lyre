@@ -20,7 +20,7 @@ body,
 
 html {
   /* The window is undecorated, so the document itself is the window body. */
-  background: var(--surface-chrome);
+  background: var(--bg-titlebar);
   overscroll-behavior: none;
 }
 

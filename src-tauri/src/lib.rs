@@ -103,7 +103,15 @@ fn path_info(path: String) -> places::PathInfo {
 /// The navigation rail's contents: home, known folders, and mounted volumes.
 #[tauri::command]
 fn places() -> Vec<places::Place> {
-    places::places()
+    let list = places::places();
+    if std::env::var_os("LYRE_TRACE").is_some() {
+        let volumes = list.iter().filter(|place| place.kind != "folder").count();
+        eprintln!(
+            "[lyre] places {} entries, {volumes} volumes",
+            list.len()
+        );
+    }
+    list
 }
 
 /// Start directory for a fresh window.

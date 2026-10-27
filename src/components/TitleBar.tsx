@@ -1,13 +1,15 @@
 import { useEffect, useState } from "react";
 import type { Tab } from "@/types";
 import { windowChrome, type ResizeEdge } from "@/lib/window";
+import { locationGlyph, locationLabel } from "@/lib/location";
 import { Icon } from "./Icons";
+import { PlaceGlyph } from "./FileGlyph";
 
-function tabName(path: string): string {
-  const parts = path.split(/[\\/]/).filter(Boolean);
-  return parts[parts.length - 1] ?? path;
-}
-
+/**
+ * The title strip carries the tabs, and nothing else. It is the darkest tone
+ * in the window (#0A0A0A in the reference) so the active tab reads as a raised
+ * card sitting on it.
+ */
 export function TitleBar({
   tabs,
   activeId,
@@ -31,43 +33,47 @@ export function TitleBar({
   return (
     <header className="titlebar" data-tauri-drag-region>
       <div className="tabstrip" data-tauri-drag-region>
-        {tabs.map((tab) => (
-          <div
-            key={tab.id}
-            className="tab"
-            data-active={tab.id === activeId ? "true" : "false"}
-            onPointerDown={(event) => {
-              // Middle click closes a tab, as in Explorer.
-              if (event.button === 1) {
-                event.preventDefault();
-                onClose(tab.id);
-                return;
-              }
-              if (event.button === 0) onSelect(tab.id);
-            }}
-          >
-            <Icon name="folder" size={14} />
-            <button
-              type="button"
-              className="tab-label"
-              title={tab.path}
-              onClick={() => onSelect(tab.id)}
-            >
-              {tabName(tab.path)}
-            </button>
-            <button
-              type="button"
-              className="tab-close"
-              aria-label={`Close ${tabName(tab.path)}`}
-              onClick={(event) => {
-                event.stopPropagation();
-                onClose(tab.id);
+        {tabs.map((tab) => {
+          const label = locationLabel(tab.location);
+          return (
+            <div
+              key={tab.id}
+              className="tab"
+              data-active={tab.id === activeId ? "true" : "false"}
+              onPointerDown={(event) => {
+                if (event.button === 1) {
+                  event.preventDefault();
+                  onClose(tab.id);
+                  return;
+                }
+                if (event.button === 0) onSelect(tab.id);
               }}
             >
-              <Icon name="close" size={10} />
-            </button>
-          </div>
-        ))}
+              <span className="tab-glyph">
+                <PlaceGlyph icon={locationGlyph(tab.location)} size={14} />
+              </span>
+              <button
+                type="button"
+                className="tab-label"
+                title={tab.location.path || label}
+                onClick={() => onSelect(tab.id)}
+              >
+                {label}
+              </button>
+              <button
+                type="button"
+                className="tab-close"
+                aria-label={`Close ${label}`}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onClose(tab.id);
+                }}
+              >
+                <Icon name="close" size={9} strokeWidth={1.6} />
+              </button>
+            </div>
+          );
+        })}
         <button
           type="button"
           className="tab-new"
@@ -87,7 +93,7 @@ export function TitleBar({
           aria-label="Minimize"
           onClick={() => windowChrome.minimize()}
         >
-          <Icon name="minimize" size={12} strokeWidth={1} />
+          <Icon name="minimize" size={10} strokeWidth={1} />
         </button>
         <button
           type="button"
@@ -100,7 +106,7 @@ export function TitleBar({
         >
           <Icon
             name={maximized ? "restore" : "maximize"}
-            size={12}
+            size={10}
             strokeWidth={1}
           />
         </button>
@@ -111,7 +117,7 @@ export function TitleBar({
           aria-label="Close"
           onClick={() => windowChrome.close()}
         >
-          <Icon name="close" size={12} strokeWidth={1} />
+          <Icon name="close" size={10} strokeWidth={1} />
         </button>
       </div>
     </header>
@@ -129,8 +135,8 @@ const EDGES: { className: string; edge: ResizeEdge }[] = [
   { className: "grip-sw", edge: "SouthWest" },
 ];
 
-/** Invisible hit areas on the window perimeter. Without these an undecorated
- *  window cannot be resized by dragging its edges. */
+/** Invisible hit areas on the perimeter. Without these an undecorated window
+ *  cannot be resized by dragging its edges. */
 export function ResizeEdges() {
   return (
     <>

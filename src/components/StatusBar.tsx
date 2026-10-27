@@ -2,9 +2,9 @@ import type { DirStatus } from "@/lib/useDirectory";
 import { formatCount } from "@/lib/format";
 
 /**
- * Explorer's status bar, plus one addition: how long the directory took to
- * read. That number is the product's whole claim, so it is stated as plain
- * fact next to the item count rather than hidden in a debug panel.
+ * Explorer's status bar: item count, then selection, separated by a rule.
+ * The scan time on the right is the one addition, because it is the whole
+ * claim the product makes.
  */
 export function StatusBar({
   status,
@@ -26,6 +26,7 @@ export function StatusBar({
   notice: string | null;
 }) {
   const scanning = status === "loading";
+  const plural = (n: number) => (n === 1 ? "item" : "items");
 
   return (
     <footer className="statusbar">
@@ -44,13 +45,15 @@ export function StatusBar({
       ) : (
         <>
           <span className="tabular">
-            <strong>{formatCount(total)}</strong>{" "}
-            {total === 1 ? "item" : "items"}
+            {formatCount(total)} {plural(total)}
           </span>
           {selectedCount > 0 ? (
-            <span className="tabular">
-              <strong>{formatCount(selectedCount)}</strong> selected
-            </span>
+            <>
+              <span className="status-sep">|</span>
+              <span className="tabular">
+                {formatCount(selectedCount)} {plural(selectedCount)} selected
+              </span>
+            </>
           ) : null}
         </>
       )}
@@ -59,7 +62,7 @@ export function StatusBar({
 
       {filtering ? (
         <span className="tabular">
-          {formatCount(visibleCount)} of {formatCount(total)} match
+          {formatCount(visibleCount)} shown
         </span>
       ) : null}
 

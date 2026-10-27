@@ -1,61 +1,33 @@
-import type { SortKey, SortState, ViewMode } from "@/types";
+import type { KindFilter, SortKey, SortState, ViewMode } from "@/types";
 import type { Mode } from "@/lib/modes";
 import type { ThemePref } from "@/lib/theme";
-
 import { Icon, type IconName } from "./Icons";
 import { Menu, type MenuEntry } from "./Menu";
 
-function CmdButton({
-  icon,
-  label,
-  onClick,
-  title,
-  disabled = false,
-  chevron = false,
-  active = false,
-}: {
-  icon: IconName;
-  label: string;
-  onClick?: () => void;
-  title: string;
-  disabled?: boolean;
-  chevron?: boolean;
-  active?: boolean;
-}) {
-  return (
-    <button
-      type="button"
-      className="cmd-btn"
-      data-reveal="true"
-      data-disabled={disabled ? "true" : "false"}
-      data-active={active ? "true" : "false"}
-      aria-disabled={disabled}
-      title={title}
-      onClick={onClick}
-    >
-      <Icon name={icon} size={18} />
-      <span className="cmd-label">
-        {label}
-        {chevron ? (
-          <Icon
-            name="chevronDown"
-            size={8}
-            strokeWidth={2}
-            className="cmd-chevron"
-          />
-        ) : null}
-      </span>
-    </button>
-  );
-}
-
 const DEFERRED = "Arrives with file operations";
+
+const FILTERS: { id: KindFilter; label: string }[] = [
+  { id: "all", label: "All items" },
+  { id: "folder", label: "Folders" },
+  { id: "document", label: "Documents" },
+  { id: "image", label: "Images" },
+  { id: "video", label: "Video" },
+  { id: "audio", label: "Audio" },
+  { id: "archive", label: "Compressed archives" },
+  { id: "code", label: "Code and programs" },
+];
 
 export function CommandBar({
   view,
   onView,
+  mode,
+  onMode,
   sort,
   onSort,
+  filter,
+  onFilter,
+  groupByDate,
+  onGroupByDate,
   navOpen,
   onToggleNav,
   showHidden,
@@ -64,16 +36,20 @@ export function CommandBar({
   onSelectAll,
   onCopyPath,
   onRefresh,
-  mode,
-  onMode,
   theme,
   onTheme,
   notice,
 }: {
   view: ViewMode;
   onView: (next: ViewMode) => void;
+  mode: Mode;
+  onMode: (next: Mode) => void;
   sort: SortState;
   onSort: (next: SortState) => void;
+  filter: KindFilter;
+  onFilter: (next: KindFilter) => void;
+  groupByDate: boolean;
+  onGroupByDate: (next: boolean) => void;
   navOpen: boolean;
   onToggleNav: () => void;
   showHidden: boolean;
@@ -82,12 +58,12 @@ export function CommandBar({
   onSelectAll: () => void;
   onCopyPath: () => void;
   onRefresh: () => void;
-  mode: Mode;
-  onMode: (next: Mode) => void;
   theme: ThemePref;
   onTheme: (next: ThemePref) => void;
   notice: (text: string) => void;
 }) {
+  const hasSelection = selectedCount > 0;
+
   const sortItems: MenuEntry[] = (
     [
       ["name", "Name"],
@@ -95,10 +71,10 @@ export function CommandBar({
       ["type", "Type"],
       ["size", "Size"],
     ] as [SortKey, string][]
-  ).map(([key, label]) => ({
+  ).map(([key, labelText]) => ({
     kind: "item",
     id: key,
-    label,
+    label: labelText,
     checked: sort.key === key,
     onSelect: () => onSort({ key, dir: sort.key === key ? sort.dir : 1 }),
   }));
@@ -125,48 +101,51 @@ export function CommandBar({
     { kind: "sep" },
     {
       kind: "item",
+      id: "compact",
+      label: "Compact view",
+      checked: mode === "compact",
+      onSelect: () => onMode(mode === "compact" ? "explorer" : "compact"),
+    },
+    { kind: "sep" },
+    {
+      kind: "item",
       id: "hidden",
       label: "Show hidden items",
       checked: showHidden,
       onSelect: onToggleHidden,
     },
-  ];
-
-  const moreItems: MenuEntry[] = [
-    { kind: "item", id: "refresh", label: "Refresh", icon: "refresh", hint: "F5", onSelect: onRefresh },
-    { kind: "item", id: "selectall", label: "Select all", hint: "Ctrl+A", onSelect: onSelectAll },
-    {
-      kind: "item",
-      id: "copypath",
-      label: "Copy path",
-      disabled: selectedCount === 0,
-      onSelect: onCopyPath,
-    },
-    { kind: "sep" },
     {
       kind: "item",
       id: "nav",
       label: "Navigation pane",
-      icon: "sidebar",
       checked: navOpen,
       hint: "Ctrl+B",
       onSelect: onToggleNav,
     },
-    { kind: "sep" },
-    { kind: "label", text: "Layout" },
+  ];
+
+  const moreItems: MenuEntry[] = [
     {
       kind: "item",
-      id: "mode-explorer",
-      label: "Explorer",
-      checked: mode === "explorer",
-      onSelect: () => onMode("explorer"),
+      id: "refresh",
+      label: "Refresh",
+      icon: "refresh",
+      hint: "F5",
+      onSelect: onRefresh,
     },
     {
       kind: "item",
-      id: "mode-compact",
-      label: "Compact",
-      checked: mode === "compact",
-      onSelect: () => onMode("compact"),
+      id: "selectall",
+      label: "Select all",
+      hint: "Ctrl+A",
+      onSelect: onSelectAll,
+    },
+    {
+      kind: "item",
+      id: "copypath",
+      label: "Copy path",
+      disabled: !hasSelection,
+      onSelect: onCopyPath,
     },
     { kind: "sep" },
     { kind: "label", text: "Theme" },
@@ -193,53 +172,72 @@ export function CommandBar({
     },
   ];
 
+  const op = (
+    icon: IconName,
+    label: string,
+    message: string,
+  ) => (
+    <button
+      type="button"
+      className="cmd-icon"
+      data-disabled={hasSelection ? "false" : "true"}
+      aria-label={label}
+      title={`${label}: ${DEFERRED}`}
+      onClick={() => notice(message)}
+    >
+      <Icon name={icon} size={16} />
+    </button>
+  );
+
   return (
     <div className="commandbar">
-      <CmdButton
-        icon="sidebar"
-        label="Pane"
-        title="Navigation pane (Ctrl+B)"
-        onClick={onToggleNav}
-        active={navOpen}
+      <Menu
+        entries={[
+          {
+            kind: "item",
+            id: "folder",
+            label: "Folder",
+            disabled: true,
+            onSelect: () => {},
+          },
+          {
+            kind: "item",
+            id: "shortcut",
+            label: "Shortcut",
+            disabled: true,
+            onSelect: () => {},
+          },
+        ]}
+        trigger={({ toggle }) => (
+          <button
+            type="button"
+            className="cmd"
+            data-reveal="true"
+            title={`New: ${DEFERRED}`}
+            onClick={() => {
+              notice("Creating folders and shortcuts arrives with file operations.");
+              toggle();
+            }}
+          >
+            <Icon name="folderPlus" size={16} />
+            <span>New</span>
+            <Icon name="chevronDown" size={9} className="cmd-chevron" />
+          </button>
+        )}
       />
 
-      <div className="cmd-sep" />
+      <div className="cmd-gap" />
 
       <div className="cmd-group">
-        <Menu
-          entries={[
-            { kind: "item", id: "folder", label: "Folder", disabled: true, onSelect: () => {} },
-            { kind: "item", id: "shortcut", label: "Shortcut", disabled: true, onSelect: () => {} },
-          ]}
-          trigger={({ toggle }) => (
-            <CmdButton
-              icon="folderPlus"
-              label="New"
-              chevron
-              title={DEFERRED}
-              onClick={() => {
-                notice("Creating folders and shortcuts arrives with file operations.");
-                toggle();
-              }}
-            />
-          )}
-        />
-        <div className="cmd-sep" />
-
-        <CmdButton icon="cut" label="Cut" title={DEFERRED} onClick={() => notice("Cut arrives with file operations.")} />
-        <CmdButton icon="copy" label="Copy" title={DEFERRED} onClick={() => notice("Copy arrives with file operations.")} />
-        <CmdButton icon="paste" label="Paste" title={DEFERRED} onClick={() => notice("Paste arrives with file operations.")} />
-        <CmdButton
-          icon="rename"
-          label="Rename"
-          title={DEFERRED}
-          onClick={() => notice("Renaming arrives with file operations.")}
-        />
-        <CmdButton icon="share" label="Share" title={DEFERRED} onClick={() => notice("Sharing arrives with file operations.")} />
-        <CmdButton icon="trash" label="Delete" title={DEFERRED} onClick={() => notice("Deleting arrives with file operations.")} />
+        {op("cut", "Cut", "Cut arrives with file operations.")}
+        {op("copy", "Copy", "Copy arrives with file operations.")}
+        {op("paste", "Paste", "Paste arrives with file operations.")}
+        {op("rename", "Rename", "Renaming arrives with file operations.")}
+        {op("share", "Share", "Sharing arrives with file operations.")}
+        {op("trash", "Delete", "Deleting arrives with file operations.")}
       </div>
 
-      <div className="cmd-sep" />
+      <div className="cmd-gap" />
 
       <Menu
         align="start"
@@ -260,28 +258,86 @@ export function CommandBar({
             checked: sort.dir === -1,
             onSelect: () => onSort({ key: sort.key, dir: -1 }),
           },
+          { kind: "sep" },
+          {
+            kind: "item",
+            id: "group",
+            label: "Group by date",
+            checked: groupByDate,
+            onSelect: () => onGroupByDate(!groupByDate),
+          },
         ]}
         trigger={({ toggle }) => (
-          <CmdButton
-            icon="sort"
-            label="Sort"
-            chevron
+          <button
+            type="button"
+            className="cmd"
+            data-reveal="true"
             title="Sort by"
             onClick={toggle}
-          />
+          >
+            <Icon name="sort" size={16} />
+            <span>Sort</span>
+            <Icon name="chevronDown" size={9} className="cmd-chevron" />
+          </button>
         )}
       />
+
       <Menu
         align="start"
         entries={viewItems}
         trigger={({ toggle }) => (
-          <CmdButton
-            icon={view === "details" ? "viewDetails" : "viewGrid"}
-            label="View"
-            chevron
+          <button
+            type="button"
+            className="cmd"
+            data-reveal="true"
             title="Change your view"
             onClick={toggle}
-          />
+          >
+            <Icon name="viewDetails" size={16} />
+            <span>View</span>
+            <Icon name="chevronDown" size={9} className="cmd-chevron" />
+          </button>
+        )}
+      />
+
+      <Menu
+        align="start"
+        entries={FILTERS.map((entry) => ({
+          kind: "item" as const,
+          id: entry.id,
+          label: entry.label,
+          checked: filter === entry.id,
+          onSelect: () => onFilter(entry.id),
+        }))}
+        trigger={({ toggle }) => (
+          <button
+            type="button"
+            className="cmd"
+            data-reveal="true"
+            data-active={filter !== "all" ? "true" : "false"}
+            title="Filter by type"
+            onClick={toggle}
+          >
+            <Icon name="filter" size={16} />
+            <span>Filter</span>
+            <Icon name="chevronDown" size={9} className="cmd-chevron" />
+          </button>
+        )}
+      />
+
+      <Menu
+        align="start"
+        entries={moreItems}
+        trigger={({ toggle }) => (
+          <button
+            type="button"
+            className="cmd-icon"
+            aria-label="More"
+            title="More"
+            onClick={toggle}
+          >
+            <Icon name="more" size={16} />
+          </button>
         )}
       />
 
@@ -289,18 +345,40 @@ export function CommandBar({
 
       <Menu
         align="end"
-        entries={moreItems}
+        entries={[
+          {
+            kind: "item",
+            id: "details",
+            label: "Details",
+            checked: view === "details",
+            onSelect: () => onView("details"),
+          },
+          {
+            kind: "item",
+            id: "grid",
+            label: "Large icons",
+            checked: view === "grid",
+            onSelect: () => onView("grid"),
+          },
+          { kind: "sep" },
+          {
+            kind: "item",
+            id: "compact",
+            label: "Compact view",
+            checked: mode === "compact",
+            onSelect: () => onMode(mode === "compact" ? "explorer" : "compact"),
+          },
+        ]}
         trigger={({ toggle }) => (
           <button
             type="button"
-            className="cmd-btn"
-            data-compact="true"
+            className="cmd"
             data-reveal="true"
-            aria-label="More"
-            title="More"
+            title="Change your view"
             onClick={toggle}
           >
-            <Icon name="more" size={18} />
+            <Icon name="viewDetails" size={14} />
+            <span>{view === "details" ? "Details" : "Large icons"}</span>
           </button>
         )}
       />

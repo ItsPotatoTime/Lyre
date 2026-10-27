@@ -58,6 +58,22 @@ export function useDirectory(
     entriesRef.current = [];
     pendingRef.current = [];
     versionRef.current = 0;
+
+    // Virtual locations (Home, This PC) have no directory behind them; the
+    // interface renders them from the places list instead of a scan.
+    if (path === "") {
+      setState({
+        entries: entriesRef.current,
+        version: 0,
+        status: "ready",
+        error: null,
+        scanned: 0,
+        total: 0,
+        elapsedMs: null,
+      });
+      return;
+    }
+
     setState({
       entries: entriesRef.current,
       version: 0,

@@ -1,32 +1,64 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { Entry, Selection, SortKey, SortState, ViewMode } from "@/types";
+import type {
+  ColumnWidths,
+  Entry,
+  Selection,
+  SortKey,
+  SortState,
+  ViewMode,
+} from "@/types";
 import type { DirStatus } from "@/lib/useDirectory";
-import { metricsFor, type Mode } from "@/lib/modes";
+import { MIN_COLUMN, metricsFor, type Mode } from "@/lib/modes";
 import { formatDate, formatSize, typeLabel } from "@/lib/format";
-import { sortLabel } from "@/lib/sort";
 import { useDelayed, useVirtual } from "@/lib/hooks";
 import { FileGlyph } from "./FileGlyph";
 import { Icon } from "./Icons";
 
-const COLUMNS: {
-  key: SortKey;
-  label: string;
-  width: string;
-  align: "start" | "end";
-}[] = [
-  { key: "name", label: "Name", width: "minmax(200px, 1fr)", align: "start" },
-  { key: "modified", label: "Date modified", width: "184px", align: "start" },
-  { key: "type", label: "Type", width: "150px", align: "start" },
-  { key: "size", label: "Size", width: "104px", align: "end" },
+const COLUMNS: { key: SortKey; label: string; min: number }[] = [
+  { key: "name", label: "Name", min: 160 },
+  { key: "modified", label: "Date modified", min: MIN_COLUMN },
+  { key: "type", label: "Type", min: MIN_COLUMN },
+  { key: "size", label: "Size", min: 46 },
 ];
 
-const TEMPLATE = COLUMNS.map((column) => column.width).join(" ");
+/** One display row: either a date group header or a file. */
+type Row =
+  | { kind: "group"; label: string; count: number; key: string }
+  | { kind: "entry"; entry: Entry; index: number };
 
-function findIndex(entries: Entry[], path: string): number {
+const DAY = 86_400_000;
+
+/** Explorer's date buckets, in the order it writes them. */
+function bucketOf(ms: number | null, now: number): string {
+  if (ms === null) return "A long time ago";
+  const age = now - ms;
+  if (age < DAY) return "Today";
+  if (age < 2 * DAY) return "Yesterday";
+  if (age < 7 * DAY) return "Last week";
+  if (age < 30 * DAY) return "Earlier this month";
+  if (age < 60 * DAY) return "Last month";
+  if (age < 365 * DAY) return "Earlier this year";
+  return "A long time ago";
+}
+
+function buildGroups(entries: Entry[]): Row[] {
+  const now = Date.now();
+  const rows: Row[] = [];
+  let bucket: string | null = null;
+  let group: Extract<Row, { kind: "group" }> | null = null;
+
   for (let i = 0; i < entries.length; i += 1) {
-    if (entries[i]!.path === path) return i;
+    const entry = entries[i]!;
+    const next = bucketOf(entry.modifiedMs, now);
+    if (next !== bucket) {
+      bucket = next;
+      group = { kind: "group", label: next, count: 0, key: `${next}-${i}` };
+      rows.push(group);
+    }
+    if (group) group.count += 1;
+    rows.push({ kind: "entry", entry, index: i });
   }
-  return -1;
+  return rows;
 }
 
 export function FileList({
@@ -44,6 +76,9 @@ export function FileList({
   error,
   path,
   filtering,
+  columns,
+  onColumns,
+  grouped,
   onRetry,
 }: {
   entries: Entry[];
@@ -59,31 +94,66 @@ export function FileList({
   status: DirStatus;
   error: string | null;
   path: string;
-  /** True when a search is scoping the list, so an empty result says why. */
   filtering: boolean;
+  columns: ColumnWidths;
+  onColumns: (next: ColumnWidths) => void;
+  grouped: boolean;
   onRetry: () => void;
 }) {
   const metrics = metricsFor(density);
   const rowHeight = view === "grid" ? metrics.tileHeight : metrics.rowHeight;
-  const [columns, setColumns] = useState(1);
-  // The virtualiser counts rows, not items: in grid view one row holds a whole
-  // line of tiles, so the scroll height and the render window are both in row
-  // units. Getting this wrong makes the scrollbar lie about the folder size.
-  const rowCount =
-    view === "grid" ? Math.ceil(entries.length / Math.max(1, columns)) : entries.length;
-  const { ref, bounds } = useVirtual(rowCount, rowHeight, view === "grid" ? 1 : 8);
+  const tableWidth = columns.reduce((sum, width) => sum + width, 0);
+  const template = columns.map((width) => `${width}px`).join(" ");
+
+  const display = useMemo(
+    () => (grouped && view === "details" ? buildGroups(entries) : null),
+    // `version` advances when the streamed array is mutated in place.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [grouped, view, entries, version],
+  );
+
+  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  useEffect(() => setCollapsed(new Set()), [path]);
+
+  const rows = useMemo(() => {
+    if (!display) return null;
+    if (collapsed.size === 0) return display;
+    const visible: Row[] = [];
+    let hiding = false;
+    for (const row of display) {
+      if (row.kind === "group") {
+        hiding = collapsed.has(row.label);
+        visible.push(row);
+      } else if (!hiding) {
+        visible.push(row);
+      }
+    }
+    return visible;
+  }, [display, collapsed]);
+
+  const [gridColumns, setGridColumns] = useState(1);
+  const rowCount = rows
+    ? rows.length
+    : view === "grid"
+      ? Math.ceil(entries.length / Math.max(1, gridColumns))
+      : entries.length;
+
+  const { ref, bounds } = useVirtual(rowCount, rowHeight, view === "grid" ? 1 : 6);
   const scrolling = ref as React.RefObject<HTMLDivElement | null>;
 
   useEffect(() => {
     if (view !== "grid") {
-      setColumns(1);
+      setGridColumns(1);
       return;
     }
     const element = scrolling.current;
     if (!element) return;
     const update = () =>
-      setColumns(
-        Math.max(1, Math.floor((element.clientWidth - 12) / metrics.tileWidth)),
+      setGridColumns(
+        Math.max(
+          1,
+          Math.floor((element.clientWidth - 12) / metrics.tileWidth),
+        ),
       );
     update();
     const observer = new ResizeObserver(update);
@@ -91,41 +161,46 @@ export function FileList({
     return () => observer.disconnect();
   }, [view, metrics.tileWidth, scrolling]);
 
-  const firstIndex = view === "grid" ? bounds.start * columns : bounds.start;
-  const lastIndex =
-    view === "grid"
-      ? Math.min(entries.length, bounds.end * columns)
-      : Math.min(entries.length, bounds.end);
-
-  // A new directory starts at the top, as in Explorer.
+  // A new directory starts at the top.
   useEffect(() => {
     const element = scrolling.current;
     if (element) element.scrollTop = 0;
   }, [path, view, scrolling]);
 
-  // A linear scan, not a path-keyed Map: during a long scan the row array is
-  // republished many times a second, and building a 50,000 entry Map on each
-  // republish costs more in allocation than these lookups ever do. This runs
-  // only when the focused row or the array changes.
+  const firstIndex = view === "grid" ? bounds.start * gridColumns : bounds.start;
+  const lastIndex =
+    view === "grid"
+      ? Math.min(entries.length, bounds.end * gridColumns)
+      : Math.min(entries.length, bounds.end);
+
+  const findIndex = useCallback(
+    (target: string) => {
+      for (let i = 0; i < entries.length; i += 1) {
+        if (entries[i]!.path === target) return i;
+      }
+      return -1;
+    },
+    [entries],
+  );
+
   const focusedIndex = useMemo(
-    () => (selection.focused === null ? -1 : findIndex(entries, selection.focused)),
+    () => (selection.focused === null ? -1 : findIndex(selection.focused)),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [entries, version, selection.focused],
+    [entries, version, selection.focused, findIndex],
   );
   const anchorIndex = useMemo(
-    () => (selection.anchor === null ? -1 : findIndex(entries, selection.anchor)),
+    () => (selection.anchor === null ? -1 : findIndex(selection.anchor)),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [entries, version, selection.anchor],
+    [entries, version, selection.anchor, findIndex],
   );
 
   const selectSingle = useCallback(
-    (entry: Entry) => {
+    (entry: Entry) =>
       onSelection({
         selected: new Set([entry.path]),
         focused: entry.path,
         anchor: entry.path,
-      });
-    },
+      }),
     [onSelection],
   );
 
@@ -154,17 +229,24 @@ export function FileList({
     [onSelection, selection.selected],
   );
 
+  const handleRowPointerDown = useCallback(
+    (event: React.PointerEvent<HTMLDivElement>, index: number) => {
+      if (event.button !== 0) return;
+      const entry = entries[index]!;
+      if (event.shiftKey && anchorIndex >= 0) selectRange(index, anchorIndex);
+      else if (event.ctrlKey || event.metaKey) toggle(entry);
+      else selectSingle(entry);
+    },
+    [anchorIndex, entries, selectRange, selectSingle, toggle],
+  );
+
   const focusIndex = useCallback(
     (next: number, extend: boolean) => {
       if (entries.length === 0) return;
       const clamped = Math.min(entries.length - 1, Math.max(0, next));
-      const entry = entries[clamped]!;
       const base = extend && anchorIndex >= 0 ? anchorIndex : clamped;
-      if (extend) {
-        selectRange(clamped, base);
-      } else {
-        selectSingle(entry);
-      }
+      if (extend) selectRange(clamped, base);
+      else selectSingle(entries[clamped]!);
     },
     [anchorIndex, entries, selectRange, selectSingle],
   );
@@ -173,16 +255,17 @@ export function FileList({
   useEffect(() => {
     const element = scrolling.current;
     if (!element || focusedIndex < 0) return;
-    const row = view === "grid" ? Math.floor(focusedIndex / columns) : focusedIndex;
+    const row =
+      view === "grid"
+        ? Math.floor(focusedIndex / Math.max(1, gridColumns))
+        : focusedIndex;
     const top = row * rowHeight;
-    if (top < element.scrollTop) {
-      element.scrollTop = top;
-    } else if (top + rowHeight > element.scrollTop + element.clientHeight) {
+    if (top < element.scrollTop) element.scrollTop = top;
+    else if (top + rowHeight > element.scrollTop + element.clientHeight) {
       element.scrollTop = top + rowHeight - element.clientHeight;
     }
-  }, [focusedIndex, rowHeight, view, columns, scrolling]);
+  }, [focusedIndex, rowHeight, view, gridColumns, scrolling]);
 
-  // Type-ahead: Explorer's incremental jump-to-name.
   const typeahead = useRef({ buffer: "", at: 0 });
 
   useEffect(() => {
@@ -210,11 +293,12 @@ export function FileList({
 
       const total = entries.length;
       if (total === 0) return;
-      const advance = view === "grid" ? columns : 1;
-      const page = Math.max(
-        1,
-        Math.floor((scrolling.current?.clientHeight ?? 400) / rowHeight) - 1,
-      ) * advance;
+      const advance = view === "grid" ? Math.max(1, gridColumns) : 1;
+      const page =
+        Math.max(
+          1,
+          Math.floor((scrolling.current?.clientHeight ?? 400) / rowHeight) - 1,
+        ) * advance;
 
       switch (event.key) {
         case "ArrowDown":
@@ -253,7 +337,7 @@ export function FileList({
           return;
         case "Enter": {
           event.preventDefault();
-          const entry = entries[focusedIndex];
+          const entry = entries[focusedIndex < 0 ? 0 : focusedIndex];
           if (entry) onOpen(entry);
           return;
         }
@@ -278,9 +362,10 @@ export function FileList({
           event.preventDefault();
           onUp();
           return;
+        default:
+          break;
       }
 
-      // Printable characters accumulate for type-ahead.
       if (event.key.length === 1) {
         const now = performance.now();
         const state = typeahead.current;
@@ -288,7 +373,6 @@ export function FileList({
         typeahead.current = { buffer, at: now };
         const needle = buffer.toLowerCase();
         const start = Math.max(0, focusedIndex);
-        // Search forward from the focused row, wrapping once.
         for (let step = 0; step < total; step += 1) {
           const index = (start + step) % total;
           if (entries[index]!.name.toLowerCase().startsWith(needle)) {
@@ -302,10 +386,10 @@ export function FileList({
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
   }, [
-    columns,
     entries,
     focusIndex,
     focusedIndex,
+    gridColumns,
     onOpen,
     onSelection,
     onUp,
@@ -316,6 +400,24 @@ export function FileList({
     toggle,
     view,
   ]);
+
+  const startResize = (index: number) => (event: React.PointerEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    event.stopPropagation();
+    const startX = event.clientX;
+    const startWidth = columns[index]!;
+    const onMove = (move: PointerEvent) => {
+      const next = [...columns] as ColumnWidths;
+      next[index] = Math.max(COLUMNS[index]!.min, startWidth + move.clientX - startX);
+      onColumns(next);
+    };
+    const onUp = () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  };
 
   const ready = status === "ready";
   const waiting = useDelayed(status === "loading" && entries.length === 0);
@@ -328,18 +430,13 @@ export function FileList({
       {view === "details" ? (
         <div
           className="columns"
-          style={{
-            gridTemplateColumns: TEMPLATE,
-            height: metrics.columnHeaderHeight,
-          }}
+          style={{ gridTemplateColumns: template }}
         >
-          {COLUMNS.map((column) => (
+          {COLUMNS.map((column, index) => (
             <button
               key={column.key}
               type="button"
               className="col"
-              data-align={column.align}
-              data-sorted={sort.key === column.key ? "true" : "false"}
               onClick={() =>
                 onSort({
                   key: column.key,
@@ -352,9 +449,20 @@ export function FileList({
               {sort.key === column.key ? (
                 <Icon
                   name={sort.dir === 1 ? "chevronUp" : "chevronDown"}
-                  size={10}
+                  size={9}
                   strokeWidth={1.8}
                   className="col-sort"
+                />
+              ) : null}
+              {index < COLUMNS.length - 1 ? (
+                <span
+                  className="col-grip"
+                  onPointerDown={startResize(index)}
+                  onDoubleClick={() => {
+                    const next = [...columns] as ColumnWidths;
+                    next[index] = [271, 122, 122, 82][index]!;
+                    onColumns(next);
+                  }}
                 />
               ) : null}
             </button>
@@ -364,7 +472,7 @@ export function FileList({
 
       {showError ? (
         <div className="state">
-          <Icon name="folder" size={40} strokeWidth={1} />
+          <Icon name="folder" size={36} strokeWidth={1} />
           <div className="state-title">This folder can’t be opened</div>
           <div className="state-body">{error}</div>
           <button type="button" className="state-action" onClick={onRetry}>
@@ -388,13 +496,13 @@ export function FileList({
         </div>
       ) : showEmpty ? (
         <div className="state">
-          <Icon name="folder" size={40} strokeWidth={1} />
+          <Icon name="folder" size={36} strokeWidth={1} />
           {filtering ? (
             <>
               <div className="state-title">No items match your search</div>
               <div className="state-body">
-                Nothing in this folder matches what you typed. Clear the search
-                to see everything again.
+                Nothing in this folder matches what you typed or the filter you
+                chose. Clear them to see everything again.
               </div>
             </>
           ) : (
@@ -421,7 +529,6 @@ export function FileList({
               : ({ ["--row-h" as string]: `${rowHeight}px` } as React.CSSProperties)
           }
           onPointerDown={(event) => {
-            // Clicking the empty area below the rows clears the selection.
             if (event.target === event.currentTarget) {
               onSelection({ selected: new Set(), focused: null, anchor: null });
             }
@@ -429,61 +536,104 @@ export function FileList({
         >
           <div
             className={view === "grid" ? "grid-spacer" : "list-spacer"}
-            style={{ height: rowCount * rowHeight }}
+            style={{
+              height: rowCount * rowHeight,
+              width: view === "grid" ? undefined : tableWidth + 14,
+            }}
           >
-            {view === "details"
+            {view === "grid"
               ? entries.slice(firstIndex, lastIndex).map((entry, offset) => {
                   const index = firstIndex + offset;
+                  const column = index % Math.max(1, gridColumns);
+                  const row = Math.floor(index / Math.max(1, gridColumns));
                   return (
-                    <DetailRow
+                    <div
                       key={entry.path}
-                      entry={entry}
-                      index={index}
-                      rowHeight={rowHeight}
-                      selected={selection.selected.has(entry.path)}
-                      focused={index === focusedIndex}
-                      onPointerDown={(event) => {
-                        if (event.button !== 0) return;
-                        if (event.shiftKey && anchorIndex >= 0) {
-                          selectRange(index, anchorIndex);
-                        } else if (event.ctrlKey || event.metaKey) {
-                          toggle(entry);
-                        } else {
-                          selectSingle(entry);
-                        }
-                      }}
-                      onDoubleClick={() => onOpen(entry)}
-                    />
-                  );
-                })
-              : entries.slice(firstIndex, lastIndex).map((entry, offset) => {
-                  const index = firstIndex + offset;
-                  return (
-                    <GridTile
-                      key={entry.path}
-                      entry={entry}
-                      index={index}
-                      columns={columns}
-                      tile={{
+                      className="tile"
+                      role="option"
+                      aria-selected={selection.selected.has(entry.path)}
+                      data-selected={
+                        selection.selected.has(entry.path) ? "true" : "false"
+                      }
+                      data-focused={index === focusedIndex ? "true" : "false"}
+                      style={{
                         width: metrics.tileWidth,
                         height: metrics.tileHeight,
+                        transform: `translate(${column * metrics.tileWidth}px, ${row * metrics.tileHeight}px)`,
                       }}
-                      selected={selection.selected.has(entry.path)}
-                      focused={index === focusedIndex}
-                      onPointerDown={(event) => {
-                        if (event.button !== 0) return;
-                        if (event.shiftKey && anchorIndex >= 0) {
-                          selectRange(index, anchorIndex);
-                        } else if (event.ctrlKey || event.metaKey) {
-                          toggle(entry);
-                        } else {
-                          selectSingle(entry);
-                        }
-                      }}
+                      title={entry.name}
+                      onPointerDown={(event) => handleRowPointerDown(event, index)}
                       onDoubleClick={() => onOpen(entry)}
-                    />
+                    >
+                      <div className="tile-glyph">
+                        <FileGlyph
+                          kind={entry.kind}
+                          size={40}
+                          isSymlink={entry.isSymlink}
+                        />
+                      </div>
+                      <div className="tile-label">{entry.name}</div>
+                    </div>
                   );
-                })}
+                })
+              : rows
+                ? rows.slice(firstIndex, lastIndex).map((row, offset) => {
+                    const position = firstIndex + offset;
+                    if (row.kind === "group") {
+                      return (
+                        <GroupRow
+                          key={row.key}
+                          label={row.label}
+                          count={row.count}
+                          top={position * rowHeight}
+                          collapsed={collapsed.has(row.label)}
+                          onToggle={() =>
+                            setCollapsed((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(row.label)) next.delete(row.label);
+                              else next.add(row.label);
+                              return next;
+                            })
+                          }
+                        />
+                      );
+                    }
+                    return (
+                      <DetailRow
+                        key={row.entry.path}
+                        entry={row.entry}
+                        top={position * rowHeight}
+                        template={template}
+                        width={tableWidth}
+                        rowHeight={rowHeight}
+                        selected={selection.selected.has(row.entry.path)}
+                        focused={row.index === focusedIndex}
+                        onPointerDown={(event) =>
+                          handleRowPointerDown(event, row.index)
+                        }
+                        onDoubleClick={() => onOpen(row.entry)}
+                      />
+                    );
+                  })
+                : entries.slice(firstIndex, lastIndex).map((entry, offset) => {
+                    const index = firstIndex + offset;
+                    return (
+                      <DetailRow
+                        key={entry.path}
+                        entry={entry}
+                        top={index * rowHeight}
+                        template={template}
+                        width={tableWidth}
+                        rowHeight={rowHeight}
+                        selected={selection.selected.has(entry.path)}
+                        focused={index === focusedIndex}
+                        onPointerDown={(event) =>
+                          handleRowPointerDown(event, index)
+                        }
+                        onDoubleClick={() => onOpen(entry)}
+                      />
+                    );
+                  })}
           </div>
         </div>
       )}
@@ -493,7 +643,9 @@ export function FileList({
 
 function DetailRow({
   entry,
-  index,
+  top,
+  template,
+  width,
   rowHeight,
   selected,
   focused,
@@ -501,7 +653,9 @@ function DetailRow({
   onDoubleClick,
 }: {
   entry: Entry;
-  index: number;
+  top: number;
+  template: string;
+  width: number;
   rowHeight: number;
   selected: boolean;
   focused: boolean;
@@ -516,9 +670,10 @@ function DetailRow({
       data-selected={selected ? "true" : "false"}
       data-focused={focused ? "true" : "false"}
       style={{
-        gridTemplateColumns: TEMPLATE,
+        gridTemplateColumns: template,
+        width,
         height: rowHeight,
-        transform: `translateY(${index * rowHeight}px)`,
+        transform: `translateY(${top}px)`,
       }}
       onPointerDown={onPointerDown}
       onDoubleClick={onDoubleClick}
@@ -533,56 +688,42 @@ function DetailRow({
       <div className="cell cell-muted">
         <span className="cell-text">{typeLabel(entry)}</span>
       </div>
-      <div className="cell cell-muted tabular" data-align="end">
+      <div className="cell cell-muted tabular">
         {formatSize(entry.size, entry.isDir)}
       </div>
     </div>
   );
 }
 
-function GridTile({
-  entry,
-  index,
-  columns,
-  tile,
-  selected,
-  focused,
-  onPointerDown,
-  onDoubleClick,
+function GroupRow({
+  label,
+  count,
+  top,
+  collapsed,
+  onToggle,
 }: {
-  entry: Entry;
-  index: number;
-  columns: number;
-  tile: { width: number; height: number };
-  selected: boolean;
-  focused: boolean;
-  onPointerDown: (event: React.PointerEvent<HTMLDivElement>) => void;
-  onDoubleClick: () => void;
+  label: string;
+  count: number;
+  top: number;
+  collapsed: boolean;
+  onToggle: () => void;
 }) {
-  const column = index % columns;
-  const row = Math.floor(index / columns);
   return (
     <div
-      className="tile"
-      role="option"
-      aria-selected={selected}
-      data-selected={selected ? "true" : "false"}
-      data-focused={focused ? "true" : "false"}
-      style={{
-        width: tile.width,
-        height: tile.height,
-        transform: `translate(${column * tile.width}px, ${row * tile.height}px)`,
-      }}
-      title={entry.name}
-      onPointerDown={onPointerDown}
-      onDoubleClick={onDoubleClick}
+      className="group"
+      data-collapsed={collapsed ? "true" : "false"}
+      style={{ transform: `translateY(${top}px)` }}
+      onClick={onToggle}
+      role="presentation"
     >
-      <div className="tile-glyph">
-        <FileGlyph kind={entry.kind} size={48} isSymlink={entry.isSymlink} />
-      </div>
-      <div className="tile-label">{entry.name}</div>
+      <Icon
+        name="chevronDown"
+        size={12}
+        strokeWidth={1.6}
+        className="group-chevron"
+      />
+      <span className="group-label">{label}</span>
+      {collapsed ? <span className="group-count">{count}</span> : null}
     </div>
   );
 }
-
-export { sortLabel };

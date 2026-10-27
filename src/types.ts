@@ -37,13 +37,20 @@ export type ScanEvent =
   | { type: "done"; total: number; elapsedMs: number }
   | { type: "failed"; message: string };
 
-export type Place = {
+export type PlaceKind = "folder" | "drive" | "removable";
+
+export interface Place {
   name: string;
   path: string;
-  kind: "folder" | "drive" | "removable";
+  kind: PlaceKind;
   icon: string;
+  /** Free space summary for volumes. */
   detail: string | null;
-};
+  /** Volume size in bytes; 0 for folders. */
+  total: number;
+  /** Free space in bytes; 0 for folders. */
+  free: number;
+}
 
 export interface PathInfo {
   path: string;
@@ -52,6 +59,18 @@ export interface PathInfo {
   segments: { name: string; path: string }[];
   exists: boolean;
   isDir: boolean;
+}
+
+/**
+ * What a tab is pointed at. Explorer distinguishes real folders from its Home
+ * page, the This PC page, and Gallery, and so does this: three of those have no
+ * directory behind them to read.
+ */
+export type LocationKind = "folder" | "home" | "thisPc" | "gallery";
+
+export interface Location {
+  kind: LocationKind;
+  path: string;
 }
 
 export type SortKey = "name" | "modified" | "type" | "size";
@@ -63,13 +82,26 @@ export interface SortState {
 
 export type ViewMode = "details" | "grid";
 
+/** Content filter from the command bar's Filter menu. */
+export type KindFilter =
+  | "all"
+  | "folder"
+  | "document"
+  | "image"
+  | "video"
+  | "audio"
+  | "archive"
+  | "code";
+
 export interface Tab {
   id: string;
-  path: string;
-  history: string[];
+  location: Location;
+  history: Location[];
   index: number;
   sort: SortState;
   view: ViewMode;
+  filter: KindFilter;
+  groupByDate: boolean;
 }
 
 export interface Selection {
@@ -77,3 +109,6 @@ export interface Selection {
   focused: string | null;
   anchor: string | null;
 }
+
+/** Column widths in px, in visual order: name, modified, type, size. */
+export type ColumnWidths = [number, number, number, number];

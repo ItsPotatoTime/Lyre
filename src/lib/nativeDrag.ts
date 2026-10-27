@@ -26,10 +26,20 @@ export async function startNativeDrag(
       import("@crabnebula/tauri-plugin-drag"),
       import("@tauri-apps/api/core"),
     ]);
+    void invoke("trace", {
+      message: `drag out: ${paths.length} item(s), mode ${mode}`,
+    }).catch(() => {});
     const icon = await invoke<string>("drag_icon");
     await startDrag({ item: paths, icon, mode });
+    void invoke("trace", { message: "drag out: started" }).catch(() => {});
     return null;
   } catch (error) {
-    return error instanceof Error ? error.message : String(error);
+    const message = error instanceof Error ? error.message : String(error);
+    void import("@tauri-apps/api/core")
+      .then(({ invoke }) =>
+        invoke("trace", { message: `drag out: failed: ${message}` }),
+      )
+      .catch(() => {});
+    return message;
   }
 }

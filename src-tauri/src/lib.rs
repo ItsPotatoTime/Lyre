@@ -264,6 +264,16 @@ fn drag_icon() -> Result<String, String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
+/// A line of diagnostics from the interface, printed when LYRE_TRACE is set.
+/// Used for the paths that cross the boundary to the platform, where a silent
+/// failure is otherwise invisible.
+#[tauri::command]
+fn trace(message: String) {
+    if std::env::var_os("LYRE_TRACE").is_some() {
+        eprintln!("[lyre] {message}");
+    }
+}
+
 /// Watch for volumes appearing and disappearing while the window is open.
 ///
 /// A stick plugged in after startup was invisible until the next manual
@@ -454,6 +464,7 @@ pub fn run() {
             startup_folder,
             eject_volume,
             drag_icon,
+            trace,
             open_with_app,
             set_default_app
         ])

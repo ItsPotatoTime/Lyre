@@ -22,6 +22,17 @@ export type DragTarget =
 
 export type DropMode = "move" | "copy";
 
+/**
+ * How close to the window edge a drag has to get before it is handed to the
+ * operating system.
+ *
+ * Handing off after the pointer has left does not work: by then the window no
+ * longer holds the pointer grab, and a native drag cannot be started without
+ * one. So the handoff happens at the edge, while the button is still down and
+ * the pointer is still ours.
+ */
+const HANDOFF_MARGIN = 6;
+
 /** Movement before a press becomes a drag. Below this a press is a click. */
 const THRESHOLD = 4;
 
@@ -192,12 +203,12 @@ export function useDrag(
         current.active = true;
       }
 
-      // Off the window entirely: this drag is meant for another application.
+      // Near or past an edge: this drag is meant for another application.
       const outside =
-        event.clientX <= 0 ||
-        event.clientY <= 0 ||
-        event.clientX >= window.innerWidth - 1 ||
-        event.clientY >= window.innerHeight - 1;
+        event.clientX <= HANDOFF_MARGIN ||
+        event.clientY <= HANDOFF_MARGIN ||
+        event.clientX >= window.innerWidth - HANDOFF_MARGIN ||
+        event.clientY >= window.innerHeight - HANDOFF_MARGIN;
       if (current.active && outside) {
         const paths = current.paths;
         const mode = current.mode;
@@ -249,12 +260,12 @@ export function useDrag(
 
       // Re-run the hit test at the release point: the last pointermove may have
       // been a few pixels away from where the button actually came up.
-      // Off the window entirely: this drag is meant for another application.
+      // Near or past an edge: this drag is meant for another application.
       const outside =
-        event.clientX <= 0 ||
-        event.clientY <= 0 ||
-        event.clientX >= window.innerWidth - 1 ||
-        event.clientY >= window.innerHeight - 1;
+        event.clientX <= HANDOFF_MARGIN ||
+        event.clientY <= HANDOFF_MARGIN ||
+        event.clientX >= window.innerWidth - HANDOFF_MARGIN ||
+        event.clientY >= window.innerHeight - HANDOFF_MARGIN;
       if (current.active && outside) {
         const paths = current.paths;
         const mode = current.mode;

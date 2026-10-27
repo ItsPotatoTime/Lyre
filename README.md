@@ -16,6 +16,8 @@ Working now:
 - Drag and drop: onto a folder, a breadcrumb, a tab, the navigation rail, or
   the folder itself. Within one volume it moves, across volumes it copies,
   Shift inverts whichever applies, and the pointer shows which will happen
+- A preview pane on the right, on by default, showing images, video and PDF
+  thumbnails, text excerpts and the file's details
 - Drops from the operating system, copied into wherever they land
 - Rubber-band selection: drag from empty space to select everything the
   rectangle touches, with Shift or Ctrl to add
@@ -145,6 +147,22 @@ the change takes effect.
 
 macOS is the one with no route at all: Finder is the shell and offers nothing
 equivalent.
+
+## Preview pane
+
+The pane shows the focused file: a picture for images, video and PDFs, the first
+lines of a text file, and the name, type, size and date for everything.
+
+Thumbnails are made in the main process and handed over as PNG bytes, never as
+the original file. That is deliberate: letting the webview decode a 50 megapixel
+photograph to show it 300 pixels wide costs a couple of hundred megabytes, which
+is the opposite of what the pane should do. Each thumbnail is scaled to 480
+pixels, cached on disk under `~/.cache/lyre/thumbnails` and keyed by the file's
+identity, so selecting it again is a file read.
+
+Decoding is delegated to tools a desktop already has: `pdftoppm` for PDFs,
+`ffmpegthumbnailer` for video, `ffmpeg` or ImageMagick for images. When none is
+installed the pane still shows the file's details rather than failing.
 
 ## Search
 

@@ -46,6 +46,8 @@ export function CommandBar({
   onMeasureFrameRate,
   canRestoreFileManager,
   onRestoreFileManager,
+  previewOpen,
+  onTogglePreview,
   reducedMemory,
   onToggleReducedMemory,
   canRestorePins,
@@ -80,6 +82,8 @@ export function CommandBar({
   onMeasureFrameRate: () => void;
   canRestoreFileManager: boolean;
   onRestoreFileManager: () => void;
+  previewOpen: boolean;
+  onTogglePreview: () => void;
   reducedMemory: boolean;
   onToggleReducedMemory: () => void;
   canRestorePins: boolean;
@@ -137,6 +141,13 @@ export function CommandBar({
       label: "Show hidden items",
       checked: showHidden,
       onSelect: onToggleHidden,
+    },
+    {
+      kind: "item",
+      id: "preview",
+      label: "Preview pane",
+      checked: previewOpen,
+      onSelect: onTogglePreview,
     },
     {
       kind: "item",

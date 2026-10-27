@@ -331,6 +331,50 @@ export async function deleteToTrash(paths: string[]): Promise<number> {
   return invoke<number>("delete_to_trash", { paths });
 }
 
+export interface PreviewInfo {
+  kind: "image" | "video" | "audio" | "pdf" | "text" | "folder" | "other";
+  size: number;
+  modifiedMs: number | null;
+  /** First lines of a text file. */
+  excerpt: string | null;
+  hasThumbnail: boolean;
+}
+
+export async function previewInfo(path: string): Promise<PreviewInfo> {
+  if (!isTauri) {
+    // The browser preview cannot run the thumbnail tools, so it reports the
+    // same shape with no picture, which exercises the fallback path.
+    const ext = path.split(".").pop()?.toLowerCase() ?? "";
+    const kind = ["png", "jpg", "jpeg", "gif", "webp"].includes(ext)
+      ? "image"
+      : ["mp4", "mkv", "webm", "mov"].includes(ext)
+        ? "video"
+        : ext === "pdf"
+          ? "pdf"
+          : ["txt", "md", "json", "ts", "tsx"].includes(ext)
+            ? "text"
+            : "other";
+    return {
+      kind,
+      size: 0,
+      modifiedMs: null,
+      excerpt: kind === "text" ? "Preview text is produced by the desktop app." : null,
+      hasThumbnail: kind === "image" || kind === "video" || kind === "pdf",
+    };
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<PreviewInfo>("preview_info", { path });
+}
+
+/** A thumbnail for the file as an object URL, or null when there is none. */
+export async function previewThumbnail(path: string): Promise<string | null> {
+  if (!isTauri) return null;
+  const { invoke } = await import("@tauri-apps/api/core");
+  const bytes = await invoke<ArrayBuffer>("preview_thumbnail", { path });
+  if (!bytes || bytes.byteLength === 0) return null;
+  return URL.createObjectURL(new Blob([bytes], { type: "image/png" }));
+}
+
 export interface GraphicsSettings {
   reducedMemory: boolean;
   active: boolean;

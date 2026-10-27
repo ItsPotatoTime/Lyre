@@ -10,6 +10,7 @@ mod fileops;
 mod fold;
 mod graphics;
 mod openwith;
+mod preview;
 mod ops;
 mod places;
 mod scan;
@@ -307,6 +308,19 @@ fn drag_icon() -> Result<String, String> {
     Ok(path.to_string_lossy().into_owned())
 }
 
+/// What the preview pane should show for a file.
+#[tauri::command]
+fn preview_info(path: String) -> preview::PreviewInfo {
+    preview::info(&path)
+}
+
+/// The thumbnail for a file, as PNG bytes rather than a path, so the webview
+/// never gets permission to read the file itself.
+#[tauri::command]
+fn preview_thumbnail(path: String) -> Result<tauri::ipc::Response, String> {
+    preview::thumbnail(&path).map(tauri::ipc::Response::new)
+}
+
 /// Whether the reduced-memory graphics path is set, and whether it is active.
 #[tauri::command]
 fn graphics_settings() -> graphics::GraphicsSettings {
@@ -534,6 +548,8 @@ pub fn run() {
             trace,
             graphics_settings,
             set_graphics_settings,
+            preview_info,
+            preview_thumbnail,
             open_with_app,
             set_default_app
         ])

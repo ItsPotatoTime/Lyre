@@ -83,6 +83,7 @@ import { ContextMenu, type ContextItem } from "@/components/ContextMenu";
 import { PropertiesDialog } from "@/components/PropertiesDialog";
 import { OpenWithDialog } from "@/components/OpenWithDialog";
 import { DefaultManagerPrompt } from "@/components/DefaultManagerPrompt";
+import { PreviewPane } from "@/components/PreviewPane";
 import { ConflictDialog } from "@/components/ConflictDialog";
 import { Icon } from "@/components/Icons";
 
@@ -233,6 +234,7 @@ function Browser({
   const [library, setLibrary] = useState<Library>(() => loadLibrary());
   const [ejecting, setEjecting] = useState<string | null>(null);
   const [reducedMemory, setReducedMemory] = useState(false);
+  const [previewOpen, setPreviewOpen] = useState(prefs.previewOpen);
   const [pendingPaste, setPendingPaste] = useState<{
     destination: string;
     sources: string[];
@@ -409,6 +411,7 @@ function Browser({
       navWidth,
       columns,
       promptDefaultManager: promptDefault,
+      previewOpen,
     });
   }, [
     active.sort,
@@ -420,6 +423,7 @@ function Browser({
     navWidth,
     columns,
     promptDefault,
+    previewOpen,
   ]);
 
   useEffect(() => {
@@ -970,6 +974,15 @@ function Browser({
     },
     [flash, selection.focused],
   );
+
+  /** The row the preview pane describes: the focused one, or a lone selection. */
+  const previewEntry = useMemo(() => {
+    const path =
+      selection.focused ??
+      (selection.selected.size === 1 ? [...selection.selected][0] : null);
+    if (!path) return null;
+    return visible.find((entry) => entry.path === path) ?? null;
+  }, [selection.focused, selection.selected, visible]);
 
   const favorites = useMemo(
     () => library.favorites.map(placeForPath),
@@ -1694,6 +1707,8 @@ function Browser({
               flash(error instanceof Error ? error.message : "Could not save."),
             );
         }}
+        previewOpen={previewOpen}
+        onTogglePreview={() => setPreviewOpen((value) => !value)}
         canRestorePins={
           library.hiddenPins.length > 0 || library.extraPins.length > 0
         }
@@ -1711,6 +1726,7 @@ function Browser({
       <div
         className="body"
         data-nav={navOpen ? "true" : "false"}
+        data-preview={previewOpen && showsFiles ? "true" : "false"}
         style={
           navOpen
             ? ({ ["--nav-w" as string]: `${navWidth}px` } as React.CSSProperties)
@@ -1831,6 +1847,8 @@ function Browser({
             />
           )}
         </main>
+        {previewOpen && showsFiles ? <PreviewPane entry={previewEntry} /> : null}
+
       </div>
 
       {showManagerPrompt && manager ? (

@@ -14,6 +14,102 @@
   grid-template-columns: 1fr;
 }
 
+/* The preview pane takes a fixed column on the right, the way Explorer's does. */
+.body[data-preview="true"] {
+  grid-template-columns: var(--nav-w, var(--navrail-w)) 1px 1fr var(--preview-w, 300px);
+}
+
+.body[data-preview="true"][data-nav="false"] {
+  grid-template-columns: 1fr var(--preview-w, 300px);
+}
+
+.preview {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  padding: 12px;
+  overflow-y: auto;
+  border-left: 1px solid var(--line-soft);
+  background: var(--bg-content);
+}
+
+.preview-stage {
+  display: grid;
+  place-items: center;
+  min-height: 160px;
+  padding: 8px;
+  border: 1px solid var(--line-soft);
+  border-radius: var(--radius-control);
+  background: color-mix(in srgb, var(--text-primary) 4%, transparent);
+}
+
+.preview-image {
+  max-width: 100%;
+  max-height: 220px;
+  object-fit: contain;
+  border-radius: 2px;
+}
+
+.preview-placeholder {
+  display: grid;
+  place-items: center;
+  gap: 6px;
+  color: var(--text-tertiary);
+}
+
+.preview-note {
+  font-size: 11px;
+  color: var(--text-tertiary);
+}
+
+.preview-name {
+  margin-top: 10px;
+  font-size: var(--text-body);
+  font-weight: var(--weight-semi);
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.preview-text {
+  margin: 8px 0 0;
+  padding: 8px;
+  max-height: 180px;
+  overflow: auto;
+  border-radius: var(--radius-control);
+  background: var(--bg-field);
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  line-height: 15px;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.preview-meta {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 3px 10px;
+  margin: 12px 0 0;
+  font-size: var(--text-caption);
+}
+
+.preview-meta dt {
+  color: var(--text-tertiary);
+}
+
+.preview-meta dd {
+  margin: 0;
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+
+.preview-empty {
+  margin: 10px 0 0;
+  font-size: var(--text-caption);
+  color: var(--text-tertiary);
+}
+
 /* Navigation rail ---------------------------------------------------------- */
 .navrail {
   display: flex;

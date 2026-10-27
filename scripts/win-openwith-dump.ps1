@@ -6,13 +6,23 @@
 # Run from the repo root:
 #     powershell -ExecutionPolicy Bypass -File scripts\win-openwith-dump.ps1
 #
-# It writes build\openwith-dump.txt, which is on the shared disk, so the Linux
-# side can read it without copying anything.
+# It writes build\openwith-dump.txt inside the repo, which is on the shared
+# disk, so the Linux side can read it without copying anything.
+#
+# If the share is not showing the script, copy it somewhere local and point it
+# back at the shared folder:
+#     powershell -File C:\Temp\dump.ps1 -OutDir "C:\Users\potato\Desktop\Shared\Seafile\Projects\Rust\Lyre\build"
+
+param(
+    # Where the dump is written. Defaults to build\ next to the repo.
+    [string]$OutDir
+)
 
 $ErrorActionPreference = 'SilentlyContinue'
 
-$root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
-$outDir = Join-Path $root 'build'
+$scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$root = Split-Path -Parent $scriptDir
+$outDir = if ($OutDir) { $OutDir } else { Join-Path $root 'build' }
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 $out = Join-Path $outDir 'openwith-dump.txt'
 

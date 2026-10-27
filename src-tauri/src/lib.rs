@@ -436,6 +436,9 @@ fn dir_stamp(path: String) -> Option<i64> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        // Lets a drag that reaches the window edge become a real operating
+        // system drag, so files can be dropped into other applications.
+        .plugin(tauri_plugin_drag::init())
         .setup(|app| {
             watch_places(app.handle().clone());
             Ok(())

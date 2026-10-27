@@ -25,10 +25,13 @@ Working now:
 - Light, dark, and system themes
 - Window chrome: tabs in a custom title bar, caption buttons, edge resizing
 - Opening a file in whatever the desktop associates with its type
+- Search: instant results for the folder on screen, then matches from every
+  subfolder streaming in behind them, ranked by relevance with the matched
+  letters emphasised
 
 Not implemented yet, and honest about it in the interface: copy, cut, paste,
-rename, delete, share, new folder, drag and drop, search indexing, thumbnails,
-context menus and the preview pane.
+rename, delete, share, new folder, drag and drop, file contents search,
+thumbnails, context menus and the preview pane.
 
 ## Running it
 
@@ -79,6 +82,40 @@ files: **16 ms** from call to final total. `cargo test --lib bench -- --ignored
 Rendering is windowed: a 4,200 entry folder keeps about 30 rows in the DOM, and
 the row arrays live in refs rather than React state so a fast scan does not push
 50,000 element array copies through the reconciler.
+
+## How search stays in milliseconds
+
+`src-tauri/src/search.rs`. Matching is [nucleo](https://github.com/helix-editor/nucleo),
+the engine behind Helix: fuzzy subsequence matching that rewards contiguous runs
+and word boundaries, and it returns the match positions so results highlight
+what matched. Frizbee is faster on some benchmarks but newer, SIMD-dependent and
+has no equivalent maturity story.
+
+Four decisions carry the latency:
+
+1. **The folder on screen is already in memory.** Each scan publishes its
+   entries to an index keyed by path, so the first phase of a search reads no
+   disk at all.
+2. **Names are matched, metadata is not.** A recursive search reads directory
+   entries and matches file names; only the items that match are stat'ed.
+3. **Two phases, one keystroke.** The local phase is emitted before the walk
+   starts, so results appear immediately and deeper matches stream in behind
+   them. Both are cancelled the moment the query moves.
+4. **The comparator does not allocate.** Ranking 30,000 tied matches ran through
+   `char::to_lowercase` iterators per comparison and cost 21 ms of a 23 ms
+   search. A byte-wise comparison cut that to 2.7 ms.
+
+Measured on a 6-core Ryzen 5 3600, 30,000 files in one folder, warm index:
+
+| query | matches | time |
+| --- | --- | --- |
+| `re` | 30,000 | 2.1 ms |
+| `report` | 30,000 | 2.6 ms |
+| `doc7` | 10,317 | 1.6 ms |
+| `dcmnt` (fuzzy) | 30,000 | 3.7 ms |
+
+`cd src-tauri && cargo test --lib bench_packed_folder -- --ignored --nocapture`
+reproduces it.
 
 ## Layout
 

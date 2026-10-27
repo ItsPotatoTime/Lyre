@@ -130,3 +130,21 @@ Themed rather than left at browser defaults: selection colour, caret, focus ring
 No gradients, no glass as decoration, no shadows except on flyouts, no cards, no
 icon-plus-heading-plus-text blocks, no coloured left borders, no rounded chunk
 standing in for content. Explorer has none of them and neither does this.
+
+## Search
+
+Results replace the listing in place: the same rows, the same columns, the same
+selection behaviour. Three details carry it.
+
+Matched characters are emphasised with weight rather than colour, so a match
+stays legible on top of a selection fill or a hover wash. Runs of matched
+characters collapse into one element, and offsets are character offsets, so a
+name with an emoji highlights correctly.
+
+Column headers stop being sortable while a search is live. Results are ordered
+by relevance, and a sort arrow above them would describe an order that is not
+being shown.
+
+The status bar switches to what the user is actually asking: how many results,
+how much of the tree was examined, and how long it took. A capped result set
+says so ("showing the best") instead of implying the list is complete.

@@ -111,3 +111,24 @@ export interface Selection {
 
 /** Column widths in px, in visual order: name, modified, type, size. */
 export type ColumnWidths = [number, number, number, number];
+
+/** One search result: the row plus its relevance and match positions. */
+export interface Hit extends Entry {
+  score: number;
+  /** Character offsets of the matched characters, for highlighting. */
+  indices: number[];
+}
+
+export type SearchPhase = "idle" | "local" | "walking" | "done" | "error";
+
+export interface SearchState {
+  items: Hit[];
+  /** Total matches found, which can exceed the number of items returned. */
+  matched: number;
+  /** Directory entries examined by the recursive phase. */
+  scanned: number;
+  elapsedMs: number | null;
+  truncated: boolean;
+  phase: SearchPhase;
+  error: string | null;
+}

@@ -13,6 +13,7 @@ import type {
 } from "@/types";
 import { getHomeDir, getPathInfo, getPlaces, openPath } from "@/lib/ipc";
 import { useDirectory } from "@/lib/useDirectory";
+import { matchIndex, useSearch } from "@/lib/useSearch";
 import { useReveal } from "@/lib/hooks";
 import { useTheme } from "@/lib/theme";
 import { DEFAULT_COLUMNS, type Mode } from "@/lib/modes";
@@ -174,6 +175,10 @@ function Browser({
     active.sort,
     nonce,
   );
+
+  const searching = showsFiles && query.trim().length > 0;
+  const search = useSearch(location.path, query, showHidden, searching);
+  const highlights = useMemo(() => matchIndex(search.items), [search.items]);
 
   const patchTab = useCallback((patch: (tab: Tab) => Tab) => {
     const id = activeIdRef.current;
@@ -340,19 +345,18 @@ function Browser({
     }
   }, [flash, selection.selected]);
 
-  const filtering = query.trim().length > 0 || active.filter !== "all";
+  const filtering = searching;
   const visible = useMemo(() => {
-    const needle = query.trim().toLowerCase();
-    return dir.entries.filter((entry) => {
-      if (active.filter !== "all" && !matchesFilter(entry, active.filter)) {
-        return false;
-      }
-      if (needle && !entry.name.toLowerCase().includes(needle)) return false;
-      return true;
-    });
+    const matchesKind = (entry: Entry) =>
+      active.filter === "all" || matchesFilter(entry, active.filter);
+
+    // Ranked by relevance in Rust; the kind filter still applies on top.
+    if (searching) return search.items.filter(matchesKind);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    return dir.entries.filter(matchesKind);
     // `dir.version` advances when the streamed array is mutated in place.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [dir.entries, dir.version, query, active.filter]);
+  }, [searching, search.items, dir.entries, dir.version, active.filter]);
 
   const onOpen = useCallback(
     (entry: Entry) => {
@@ -582,6 +586,8 @@ function Browser({
               columns={columns}
               onColumns={setColumns}
               grouped={active.groupByDate}
+              matched={searching ? highlights : undefined}
+              sortable={!searching}
               onRetry={() => {
                 setNonce((value) => value + 1);
                 onRefreshPlaces();
@@ -604,6 +610,7 @@ function Browser({
         visibleCount={visible.length}
         filtering={filtering}
         notice={notice}
+        search={searching ? search : null}
       />
     </div>
   );

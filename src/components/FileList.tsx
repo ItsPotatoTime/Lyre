@@ -79,6 +79,8 @@ export function FileList({
   columns,
   onColumns,
   grouped,
+  matched,
+  sortable = true,
   onRetry,
 }: {
   entries: Entry[];
@@ -98,6 +100,9 @@ export function FileList({
   columns: ColumnWidths;
   onColumns: (next: ColumnWidths) => void;
   grouped: boolean;
+  /** Character offsets to emphasise, keyed by path. Present while searching. */
+  matched?: Map<string, number[]> | undefined;
+  sortable?: boolean;
   onRetry: () => void;
 }) {
   const metrics = metricsFor(density);
@@ -433,39 +438,47 @@ export function FileList({
           style={{ gridTemplateColumns: template }}
         >
           {COLUMNS.map((column, index) => (
-            <button
-              key={column.key}
-              type="button"
-              className="col"
-              onClick={() =>
-                onSort({
-                  key: column.key,
-                  dir: sort.key === column.key && sort.dir === 1 ? -1 : 1,
-                })
-              }
-              title={`Sort by ${column.label.toLowerCase()}`}
-            >
-              <span className="col-label">{column.label}</span>
-              {sort.key === column.key ? (
-                <Icon
-                  name={sort.dir === 1 ? "chevronUp" : "chevronDown"}
-                  size={9}
-                  strokeWidth={1.8}
-                  className="col-sort"
-                />
-              ) : null}
-              {index < COLUMNS.length - 1 ? (
-                <span
-                  className="col-grip"
-                  onPointerDown={startResize(index)}
-                  onDoubleClick={() => {
-                    const next = [...columns] as ColumnWidths;
-                    next[index] = [271, 122, 122, 82][index]!;
-                    onColumns(next);
-                  }}
-                />
-              ) : null}
-            </button>
+            sortable ? (
+              <button
+                key={column.key}
+                type="button"
+                className="col"
+                onClick={() =>
+                  onSort({
+                    key: column.key,
+                    dir: sort.key === column.key && sort.dir === 1 ? -1 : 1,
+                  })
+                }
+                title={`Sort by ${column.label.toLowerCase()}`}
+              >
+                <span className="col-label">{column.label}</span>
+                {sort.key === column.key ? (
+                  <Icon
+                    name={sort.dir === 1 ? "chevronUp" : "chevronDown"}
+                    size={9}
+                    strokeWidth={1.8}
+                    className="col-sort"
+                  />
+                ) : null}
+                {index < COLUMNS.length - 1 ? (
+                  <span
+                    className="col-grip"
+                    onPointerDown={startResize(index)}
+                    onDoubleClick={() => {
+                      const next = [...columns] as ColumnWidths;
+                      next[index] = [271, 122, 122, 82][index]!;
+                      onColumns(next);
+                    }}
+                  />
+                ) : null}
+              </button>
+            ) : (
+              // Results are ranked by relevance; a sort arrow would contradict
+              // the order the user is looking at.
+              <div key={column.key} className="col" data-static="true">
+                <span className="col-label">{column.label}</span>
+              </div>
+            )
           ))}
         </div>
       ) : null}
@@ -572,7 +585,9 @@ export function FileList({
                           isSymlink={entry.isSymlink}
                         />
                       </div>
-                      <div className="tile-label">{entry.name}</div>
+                      <div className="tile-label">
+                        <MatchedName name={entry.name} indices={matched?.get(entry.path)} />
+                      </div>
                     </div>
                   );
                 })
@@ -608,6 +623,7 @@ export function FileList({
                         rowHeight={rowHeight}
                         selected={selection.selected.has(row.entry.path)}
                         focused={row.index === focusedIndex}
+                        indices={matched?.get(row.entry.path)}
                         onPointerDown={(event) =>
                           handleRowPointerDown(event, row.index)
                         }
@@ -627,6 +643,7 @@ export function FileList({
                         rowHeight={rowHeight}
                         selected={selection.selected.has(entry.path)}
                         focused={index === focusedIndex}
+                        indices={matched?.get(entry.path)}
                         onPointerDown={(event) =>
                           handleRowPointerDown(event, index)
                         }
@@ -649,6 +666,7 @@ function DetailRow({
   rowHeight,
   selected,
   focused,
+  indices,
   onPointerDown,
   onDoubleClick,
 }: {
@@ -659,6 +677,7 @@ function DetailRow({
   rowHeight: number;
   selected: boolean;
   focused: boolean;
+  indices?: number[] | undefined;
   onPointerDown: (event: React.PointerEvent<HTMLDivElement>) => void;
   onDoubleClick: () => void;
 }) {
@@ -680,9 +699,7 @@ function DetailRow({
     >
       <div className="cell cell-name">
         <FileGlyph kind={entry.kind} size={16} isSymlink={entry.isSymlink} />
-        <span className="cell-text" title={entry.name}>
-          {entry.name}
-        </span>
+        <MatchedName name={entry.name} indices={indices} />
       </div>
       <div className="cell cell-muted tabular">{formatDate(entry.modifiedMs)}</div>
       <div className="cell cell-muted">
@@ -725,5 +742,51 @@ function GroupRow({
       <span className="group-label">{label}</span>
       {collapsed ? <span className="group-count">{count}</span> : null}
     </div>
+  );
+}
+
+/**
+ * A file name with the searched characters emphasised, the way Explorer marks
+ * what matched. `indices` are character offsets, so the string is walked as
+ * code points rather than UTF-16 units, and runs of hits collapse into one
+ * element instead of one per character.
+ */
+function MatchedName({
+  name,
+  indices,
+}: {
+  name: string;
+  indices?: number[] | undefined;
+}) {
+  if (!indices || indices.length === 0) {
+    return (
+      <span className="cell-text" title={name}>
+        {name}
+      </span>
+    );
+  }
+
+  const chars = Array.from(name);
+  const marked = new Set(indices);
+  const parts: { text: string; hit: boolean }[] = [];
+  for (let i = 0; i < chars.length; i += 1) {
+    const hit = marked.has(i);
+    const last = parts[parts.length - 1];
+    if (last && last.hit === hit) last.text += chars[i];
+    else parts.push({ text: chars[i]!, hit });
+  }
+
+  return (
+    <span className="cell-text" title={name}>
+      {parts.map((part, index) =>
+        part.hit ? (
+          <span key={index} className="hit">
+            {part.text}
+          </span>
+        ) : (
+          part.text
+        ),
+      )}
+    </span>
   );
 }

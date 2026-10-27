@@ -194,18 +194,36 @@ where
 }
 
 fn stat(item: &Raw) -> Option<Entry> {
-    let meta = fs::symlink_metadata(&item.path).ok();
+    describe_entry(
+        item.name.clone(),
+        item.path.clone(),
+        item.is_dir,
+        item.is_symlink,
+    )
+}
+
+/// Build the row for one name, including its metadata.
+///
+/// Shared with search, which matches on names first and only pays for this on
+/// the entries that actually matched, so a recursive search never stats a tree.
+pub(crate) fn describe_entry(
+    name: String,
+    path: PathBuf,
+    is_dir_hint: bool,
+    is_symlink: bool,
+) -> Option<Entry> {
+    let meta = fs::symlink_metadata(&path).ok();
 
     // A symlink's own metadata describes the link, which is never what the
     // user wants to see: display the target's size and type when it resolves.
-    let target = if item.is_symlink {
-        fs::metadata(&item.path).ok()
+    let target = if is_symlink {
+        fs::metadata(&path).ok()
     } else {
         None
     };
 
     let effective = target.as_ref().or(meta.as_ref());
-    let is_dir = effective.map(|m| m.is_dir()).unwrap_or(item.is_dir);
+    let is_dir = effective.map(|m| m.is_dir()).unwrap_or(is_dir_hint);
     let size = match effective {
         Some(m) if !is_dir => m.len(),
         _ => 0,
@@ -214,29 +232,28 @@ fn stat(item: &Raw) -> Option<Entry> {
         .and_then(|m| m.modified().ok())
         .and_then(to_epoch_ms);
 
-    let ext = item
-        .name
+    let ext = name
         .rsplit_once('.')
         .filter(|(stem, _)| !stem.is_empty())
         .map(|(_, ext)| ext.to_ascii_lowercase())
         .unwrap_or_default();
 
     Some(Entry {
-        name: item.name.clone(),
-        path: item.path.to_string_lossy().into_owned(),
+        name: name.clone(),
+        path: path.to_string_lossy().into_owned(),
         is_dir,
-        is_symlink: item.is_symlink,
+        is_symlink,
         size,
         modified_ms,
         kind: if is_dir {
             "folder"
-        } else if item.is_symlink {
+        } else if is_symlink {
             "shortcut"
         } else {
             classify(&ext)
         },
         ext,
-        hidden: is_hidden_name(&item.name) || meta.as_ref().map(is_hidden_meta).unwrap_or(false),
+        hidden: is_hidden_name(&name) || meta.as_ref().map(is_hidden_meta).unwrap_or(false),
         readable: meta.is_some(),
     })
 }
@@ -268,7 +285,7 @@ fn is_hidden_meta(_meta: &fs::Metadata) -> bool {
 
 /// Map an extension to a glyph family. This runs once per entry and allocates
 /// nothing, which matters: it is the only per-file work besides the `stat`.
-fn classify(ext: &str) -> &'static str {
+pub(crate) fn classify(ext: &str) -> &'static str {
     match ext {
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "ico" | "tif" | "tiff" | "avif"
         | "heic" | "raw" | "psd" => "image",

@@ -1,4 +1,4 @@
-import type { Entry, PathInfo, Place, ScanEvent } from "@/types";
+import type { Entry, Hit, PathInfo, Place, ScanEvent } from "@/types";
 
 /**
  * The interface talks to this module rather than to `invoke` directly, so the
@@ -63,12 +63,102 @@ export async function scanDir(
     cancel: () => {
       cancelled = true;
       if (jobId !== null) {
-        void invoke("cancel_scan", { id: jobId });
-        void invoke("release_scan", { id: jobId });
+        void invoke("cancel_job", { id: jobId });
+        void invoke("release_job", { id: jobId });
       }
     },
   };
 }
+
+export interface SearchHandlers {
+  onLocal: (items: Hit[], matched: number, elapsedMs: number) => void;
+  onBatch: (items: Hit[], scanned: number) => void;
+  onDone: (
+    matched: number,
+    scanned: number,
+    elapsedMs: number,
+    truncated: boolean,
+  ) => void;
+  onFailed: (message: string) => void;
+}
+
+/**
+ * Search a folder, and optionally everything below it.
+ *
+ * Results arrive in two waves: the folder on screen first, from memory, then
+ * matches from deeper in the tree as the walk finds them.
+ */
+export async function searchDir(
+  path: string,
+  query: string,
+  recursive: boolean,
+  showHidden: boolean,
+  handlers: SearchHandlers,
+): Promise<ScanHandle> {
+  if (!isTauri) {
+    const { mockSearch } = await import("./mock");
+    return mockSearch(path, query, recursive, showHidden, handlers);
+  }
+
+  const { Channel, invoke } = await import("@tauri-apps/api/core");
+  const channel = new Channel<SearchEventWire>();
+  let jobId: number | null = null;
+  let cancelled = false;
+
+  channel.onmessage = (event) => {
+    if (cancelled) return;
+    switch (event.type) {
+      case "local":
+        handlers.onLocal(event.items, event.matched, event.elapsedMs);
+        break;
+      case "batch":
+        handlers.onBatch(event.items, event.scanned);
+        break;
+      case "done":
+        handlers.onDone(
+          event.matched,
+          event.scanned,
+          event.elapsedMs,
+          event.truncated,
+        );
+        break;
+      case "failed":
+        handlers.onFailed(event.message);
+        break;
+    }
+  };
+
+  try {
+    jobId = await invoke<number>("search_dir", {
+      request: { path, query, recursive, showHidden },
+      onEvent: channel,
+    });
+  } catch (error) {
+    handlers.onFailed(describe(error));
+  }
+
+  return {
+    cancel: () => {
+      cancelled = true;
+      if (jobId !== null) {
+        void invoke("cancel_job", { id: jobId });
+        void invoke("release_job", { id: jobId });
+      }
+    },
+  };
+}
+
+type SearchEventWire =
+  | { type: "local"; items: Hit[]; matched: number; elapsedMs: number }
+  | { type: "batch"; items: Hit[]; scanned: number }
+  | {
+      type: "done";
+      matched: number;
+      scanned: number;
+      elapsedMs: number;
+      truncated: boolean;
+    }
+  | { type: "failed"; message: string };
 
 export async function getPlaces(): Promise<Place[]> {
   if (!isTauri) {

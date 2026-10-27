@@ -163,6 +163,11 @@
   color: var(--text-primary);
 }
 
+.col[data-static="true"]:hover {
+  background: none;
+  color: var(--text-secondary);
+}
+
 .col-label {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -281,6 +286,15 @@
 .cell-text {
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+/* Matched characters in a search result, emphasised rather than coloured so
+   selection and hover fills stay readable underneath. */
+.hit {
+  font-weight: var(--weight-semi);
+  color: inherit;
+  background: none;
+  border-radius: 2px;
 }
 
 .cell-muted {

@@ -1,4 +1,5 @@
 import type { DirStatus } from "@/lib/useDirectory";
+import type { SearchState } from "@/types";
 import { formatCount } from "@/lib/format";
 
 /**
@@ -15,6 +16,7 @@ export function StatusBar({
   visibleCount,
   filtering,
   notice,
+  search,
 }: {
   status: DirStatus;
   scanned: number;
@@ -24,9 +26,51 @@ export function StatusBar({
   visibleCount: number;
   filtering: boolean;
   notice: string | null;
+  search: SearchState | null;
 }) {
   const scanning = status === "loading";
   const plural = (n: number) => (n === 1 ? "item" : "items");
+
+  // While searching, the count that matters is matches, not items, and the
+  // walk reports how much of the tree it has looked at.
+  if (search && search.phase !== "idle") {
+    const busy = search.phase === "local" || search.phase === "walking";
+    return (
+      <footer className="statusbar">
+        {search.error ? (
+          <span>{search.error}</span>
+        ) : (
+          <>
+            <span className="tabular">
+              {formatCount(search.matched)}{" "}
+              {search.matched === 1 ? "result" : "results"}
+              {search.truncated ? " (showing the best)" : ""}
+            </span>
+            {search.scanned > 0 ? (
+              <>
+                <span className="status-sep">|</span>
+                <span className="tabular">
+                  {formatCount(search.scanned)} examined
+                </span>
+              </>
+            ) : null}
+            <span className="status-spacer" />
+            {busy ? (
+              <span className="status-scan">
+                <span className="status-dot" />
+                Searching
+              </span>
+            ) : null}
+            {search.elapsedMs !== null ? (
+              <span className="tabular" title="Time to return results">
+                {search.elapsedMs < 1 ? "<1" : formatCount(search.elapsedMs)} ms
+              </span>
+            ) : null}
+          </>
+        )}
+      </footer>
+    );
+  }
 
   return (
     <footer className="statusbar">

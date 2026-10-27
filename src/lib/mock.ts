@@ -7,8 +7,8 @@
  * This module is loaded lazily, so it costs nothing in the packaged app.
  */
 
-import type { Entry, EntryKind, PathInfo, Place } from "@/types";
-import type { ScanHandlers, ScanHandle } from "./ipc";
+import type { Entry, EntryKind, Hit, PathInfo, Place } from "@/types";
+import type { ScanHandlers, ScanHandle, SearchHandlers } from "./ipc";
 
 const HOME = "/home/you";
 
@@ -432,4 +432,111 @@ function mulberry32(seed: number): () => number {
     t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
+}
+
+/**
+ * Browser-preview search.
+ *
+ * The packaged app scores with nucleo in Rust. This stands in for it so the
+ * result list, the streaming behaviour and the highlighting can be exercised
+ * without a Rust build; it is a simplified matcher, not a second definition of
+ * the real ranking.
+ */
+export async function mockSearch(
+  path: string,
+  query: string,
+  recursive: boolean,
+  showHidden: boolean,
+  handlers: SearchHandlers,
+): Promise<ScanHandle> {
+  const started = performance.now();
+  let cancelled = false;
+
+  const local = listing(path)
+    .filter((entry) => showHidden || !entry.hidden)
+    .map((entry) => toHit(entry, query))
+    .filter((hit): hit is Hit => hit !== null)
+    .sort((a, b) => b.score - a.score);
+
+  setTimeout(() => {
+    if (cancelled) return;
+    handlers.onLocal(local, local.length, Math.round(performance.now() - started));
+    if (!recursive) {
+      handlers.onDone(local.length, 0, Math.round(performance.now() - started), false);
+      return;
+    }
+
+    // Walk the synthetic tree's known folders, a few results per tick, so the
+    // interface sees the same two-wave arrival as the real engine.
+    const prefix = path.endsWith("/") ? path : `${path}/`;
+    const deeper: Hit[] = [];
+    for (const key of Object.keys(CHILDREN)) {
+      if (!key.startsWith(prefix) || key === path) continue;
+      const dirName = key.split("/").filter(Boolean).pop() ?? "";
+      const dirEntry = makeEntry(key.slice(0, key.lastIndexOf("/")) || "/", dirName, "folder", mulberry32(hash(key)), Date.now());
+      const dirHit = toHit({ ...dirEntry, path: key }, query);
+      if (dirHit) deeper.push(dirHit);
+      for (const [name, kind] of CHILDREN[key]!) {
+        const entry = makeEntry(key, name, kind, mulberry32(hash(key + name)), Date.now());
+        const hit = toHit(entry, query);
+        if (hit) deeper.push(hit);
+      }
+    }
+
+    let sent = 0;
+    const tick = () => {
+      if (cancelled) return;
+      const batch = deeper.slice(sent, sent + 6);
+      sent += batch.length;
+      if (batch.length > 0) handlers.onBatch(batch, sent);
+      if (sent < deeper.length) {
+        setTimeout(tick, 24);
+      } else {
+        handlers.onDone(
+          local.length + deeper.length,
+          deeper.length,
+          Math.round(performance.now() - started),
+          false,
+        );
+      }
+    };
+    setTimeout(tick, 16);
+  }, 2);
+
+  return {
+    cancel: () => {
+      cancelled = true;
+    },
+  };
+}
+
+/** Subsequence match with a contiguity and word-start bonus. */
+function toHit(entry: Entry, query: string): Hit | null {
+  const haystack = entry.name.toLowerCase();
+  const needle = query.trim().toLowerCase();
+  if (!needle) return null;
+
+  const indices: number[] = [];
+  let score = 0;
+  let run = 0;
+  let cursor = 0;
+
+  for (const char of needle) {
+    const found = haystack.indexOf(char, cursor);
+    if (found === -1) return null;
+    if (run > 0 && found === cursor) {
+      run += 1;
+      score += 8 + run * 2;
+    } else {
+      run = 1;
+      score += 4;
+      if (found === 0) score += 12;
+      else if (haystack[found - 1] === " " || haystack[found - 1] === "-") score += 6;
+    }
+    indices.push(found);
+    cursor = found + 1;
+  }
+
+  score += Math.max(0, 24 - entry.name.length);
+  return { ...entry, score, indices };
 }

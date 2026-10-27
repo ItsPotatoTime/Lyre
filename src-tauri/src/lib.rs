@@ -6,6 +6,7 @@
 
 mod places;
 mod scan;
+mod search;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -14,12 +15,15 @@ use tauri::ipc::Channel;
 use tauri::State;
 
 #[derive(Default)]
-struct ScanState {
+struct AppState {
     jobs: Mutex<HashMap<u64, Arc<AtomicBool>>>,
     next_id: AtomicU64,
+    /// What the last scan of each folder read, so search never reads the disk
+    /// for a folder that is already on screen.
+    index: Arc<search::Index>,
 }
 
-impl ScanState {
+impl AppState {
     fn begin(&self) -> (u64, Arc<AtomicBool>) {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let cancel = Arc::new(AtomicBool::new(false));
@@ -51,11 +55,12 @@ impl ScanState {
 /// needed to cancel.
 #[tauri::command]
 fn scan_dir(
-    state: State<'_, ScanState>,
+    state: State<'_, AppState>,
     request: scan::ScanRequest,
     on_event: Channel<scan::ScanEvent>,
 ) -> Result<u64, String> {
     let (id, cancel) = state.begin();
+    let index = Arc::clone(&state.index);
     let path = std::path::PathBuf::from(&request.path);
     let trace = std::env::var_os("LYRE_TRACE").is_some();
     if trace {
@@ -67,14 +72,26 @@ fn scan_dir(
     std::thread::Builder::new()
         .name("lyre-scan".into())
         .spawn(move || {
+            let mut collected: Vec<scan::Entry> = Vec::new();
+            let mut complete = false;
             scan::scan(&path, request.show_hidden, &cancel, |event| {
                 if trace {
                     if let scan::ScanEvent::Done { total, elapsed_ms } = &event {
                         eprintln!("[lyre] scan {id} done {total} in {elapsed_ms} ms");
                     }
                 }
+                match &event {
+                    scan::ScanEvent::Batch { entries, .. } => collected.extend(entries.iter().cloned()),
+                    scan::ScanEvent::Done { .. } => complete = true,
+                    scan::ScanEvent::Failed { .. } => {}
+                }
                 on_event.send(event).is_ok()
             });
+            // Only a complete read is worth indexing; a cancelled scan would
+            // leave the search answering from a partial folder.
+            if complete {
+                index.store(&path, Arc::new(collected));
+            }
         })
         .map_err(|err| format!("Could not start the directory scan: {err}"))?;
 
@@ -83,15 +100,60 @@ fn scan_dir(
 
 /// Release a scan's bookkeeping and ask it to stop.
 #[tauri::command]
-fn cancel_scan(state: State<'_, ScanState>, id: u64) {
+fn cancel_job(state: State<'_, AppState>, id: u64) {
     state.cancel(id);
 }
 
 /// Called by the interface once it has consumed a job, so the map does not grow
 /// for the life of the window.
 #[tauri::command]
-fn release_scan(state: State<'_, ScanState>, id: u64) {
+fn release_job(state: State<'_, AppState>, id: u64) {
     state.finish(id);
+}
+
+/// Start a search and stream results back.
+///
+/// Returns a job id immediately: the first results come from memory and are
+/// emitted on the worker thread, so nothing about this call waits.
+#[tauri::command]
+fn search_dir(
+    state: State<'_, AppState>,
+    request: search::SearchRequest,
+    on_event: Channel<search::SearchEvent>,
+) -> Result<u64, String> {
+    let (id, cancel) = state.begin();
+    let index = Arc::clone(&state.index);
+    let trace = std::env::var_os("LYRE_TRACE").is_some();
+    if trace {
+        eprintln!(
+            "[lyre] search {id} {:?} in {:?} recursive={}",
+            request.query, request.path, request.recursive
+        );
+    }
+
+    std::thread::Builder::new()
+        .name("lyre-search".into())
+        .spawn(move || {
+            search::search(&index, &request, &cancel, |event| {
+                if trace {
+                    if let search::SearchEvent::Done {
+                        matched,
+                        scanned,
+                        elapsed_ms,
+                        ..
+                    } = &event
+                    {
+                        eprintln!(
+                            "[lyre] search {id} done {matched} matches, {scanned} scanned, {elapsed_ms} ms"
+                        );
+                    }
+                }
+                on_event.send(event).is_ok()
+            });
+        })
+        .map_err(|err| format!("Could not start the search: {err}"))?;
+
+    Ok(id)
 }
 
 /// Resolve the breadcrumb, parent and existence of a path in one round trip.
@@ -174,11 +236,12 @@ fn dir_stamp(path: String) -> Option<i64> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .manage(ScanState::default())
+        .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             scan_dir,
-            cancel_scan,
-            release_scan,
+            search_dir,
+            cancel_job,
+            release_job,
             path_info,
             places,
             home_dir,
@@ -191,6 +254,9 @@ pub fn run() {
 
 #[cfg(test)]
 mod scan_tests;
+
+#[cfg(test)]
+mod search_tests;
 
 #[cfg(test)]
 mod opener_tests {

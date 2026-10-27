@@ -107,24 +107,41 @@ function fail(message: string): never {
   process.exit(1);
 }
 
-/** Run a command in the foreground, inheriting stdio. */
-function run(command: string, commandArgs: string[], cwd = root, env?: Record<string, string>) {
+/**
+ * Run a command in the foreground, inheriting stdio.
+ *
+ * `okUpTo` exists for robocopy, which reports *how much it did* through its
+ * exit code: 1 means files were copied, and anything below 8 is success. Only
+ * 8 and above are real failures.
+ */
+function run(
+  command: string,
+  commandArgs: string[],
+  options: { cwd?: string; env?: Record<string, string>; okUpTo?: number } = {},
+) {
   const line = [command, ...commandArgs].join(" ");
   if (dryRun) {
     console.log(colour.dim(`  would run: ${line}`));
-    return;
+    return 0;
   }
   console.log(colour.dim(`  $ ${line}`));
   const result = Bun.spawnSync({
     cmd: [command, ...commandArgs],
-    cwd,
-    env: { ...process.env, ...env },
+    cwd: options.cwd ?? root,
+    env: { ...process.env, ...options.env },
     stdout: "inherit",
     stderr: "inherit",
   });
-  if (result.exitCode !== 0) {
-    fail(`${line} exited with ${result.exitCode}`);
+  const code = result.exitCode ?? 0;
+  const limit = options.okUpTo ?? 0;
+  if (code > limit) {
+    fail(
+      options.okUpTo !== undefined
+        ? `${line} exited with ${code}, above the ${limit} that counts as success`
+        : `${line} exited with ${code}`,
+    );
   }
+  return code;
 }
 
 /** Run a command and capture its trimmed stdout. */
@@ -186,25 +203,31 @@ if (platform === "windows") {
 
   stage(2, `Copying the source to ${localRoot}`);
   console.log(colour.dim("  A Windows build must not share target/ with Linux."));
-  run("robocopy", [
-    root,
-    localRoot,
-    "/MIR",
-    "/NFL",
-    "/NDL",
-    "/NJH",
-    "/NJS",
-    "/XD",
-    "node_modules",
-    "target",
-    ".git",
-    ".cairn",
-    "dist",
-    "build",
-    ".reference",
-  ]);
-  // robocopy reports 0-7 for success; 8 and above is a real failure.
+  // 0 to 7 all mean success for robocopy: 1 is "files were copied", which is
+  // the normal case and not an error.
+  const copyCode = run(
+    "robocopy",
+    [
+      root,
+      localRoot,
+      "/MIR",
+      "/NFL",
+      "/NDL",
+      "/NJH",
+      "/NJS",
+      "/XD",
+      "node_modules",
+      "target",
+      ".git",
+      ".cairn",
+      "dist",
+      "build",
+      ".reference",
+    ],
+    { okUpTo: 7 },
+  );
   if (!dryRun) {
+    if (copyCode >= 8) fail(`robocopy failed with ${copyCode}`);
     if (!existsSync(join(localRoot, "package.json"))) {
       fail(`the copy is missing package.json; is ${root} readable?`);
     }
@@ -239,10 +262,10 @@ if (platform === "windows") {
   stage(4, "Installing dependencies in the Windows copy");
   // --force because the local node_modules is reused between runs while the
   // lockfile keeps arriving from the other OS.
-  run("bun", ["install", "--force"], localRoot);
+  run("bun", ["install", "--force"], { cwd: localRoot });
 
   stage(5, "Building the Rust crate and the installers");
-  if (clean) run("cargo", ["clean"], join(localRoot, "src-tauri"));
+  if (clean) run("cargo", ["clean"], { cwd: join(localRoot, "src-tauri") });
 
   // vcvars64 only affects the shell that runs it, so the build has to happen in
   // a cmd session that called it. That session is a generated .cmd file rather
@@ -280,7 +303,7 @@ if (platform === "windows") {
     console.log(colour.dim(`  would run: cmd /d /s /c "${scriptPath}"`));
   } else {
     writeFileSync(scriptPath, script);
-    run("cmd", ["/d", "/s", "/c", scriptPath], localRoot);
+    run("cmd", ["/d", "/s", "/c", scriptPath], { cwd: localRoot });
   }
 
   stage(6, `Collecting installers into ${outDir}`);
@@ -323,7 +346,7 @@ if (platform === "windows") {
   }
 
   stage(3, "Building the Rust crate and the installers");
-  if (clean) run("cargo", ["clean"], join(root, "src-tauri"));
+  if (clean) run("cargo", ["clean"], { cwd: join(root, "src-tauri") });
   run("bun", [
     "tauri",
     "build",

@@ -51,6 +51,7 @@ export function StatusBar({
                 <span className="status-sep">|</span>
                 <span className="tabular">
                   {formatCount(search.scanned)} examined
+                  {search.truncated && search.phase === "done" ? ", stopped early" : ""}
                 </span>
               </>
             ) : null}

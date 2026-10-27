@@ -97,11 +97,17 @@ Four decisions carry the latency:
    entries to an index keyed by path, so the first phase of a search reads no
    disk at all.
 2. **Names are matched, metadata is not.** A recursive search reads directory
-   entries and matches file names; only the items that match are stat'ed.
+   entries and matches file names; only the items that match are stat'ed. The
+   walk is breadth-first: depth-first disappears into the first large system
+   tree it meets and spends its whole budget there before reaching your own
+   folders.
 3. **Two phases, one keystroke.** The local phase is emitted before the walk
    starts, so results appear immediately and deeper matches stream in behind
    them. Both are cancelled the moment the query moves.
-4. **The comparator does not allocate.** Ranking 30,000 tied matches ran through
+4. **One sort, at the end.** Results stream in the order they are found, so the
+   list never jumps while you type. A single stable sort by relevance runs when
+   the walk completes.
+5. **The comparator does not allocate.** Ranking 30,000 tied matches ran through
    `char::to_lowercase` iterators per comparison and cost 21 ms of a 23 ms
    search. A byte-wise comparison cut that to 2.7 ms.
 

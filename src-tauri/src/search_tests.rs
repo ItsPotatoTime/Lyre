@@ -301,6 +301,33 @@ fn searching_with_no_current_folder_covers_every_root() {
 }
 
 #[test]
+fn a_root_inside_another_root_is_only_walked_once() {
+    // Volumes routinely list a folder that already lives inside another one.
+    let outer = scratch("outer");
+    let inner = outer.join("inner");
+    fs::create_dir_all(&inner).unwrap();
+    fs::write(inner.join("only-report.txt"), b"x").unwrap();
+
+    let index = Index::default();
+    let result = run_roots(
+        &index,
+        &[outer.clone(), inner.clone(), inner.clone()],
+        "report",
+    );
+
+    let mut all = result.local;
+    all.extend(result.batches);
+    assert_eq!(
+        all.iter().filter(|name| *name == "only-report.txt").count(),
+        1,
+        "a nested root must not produce a second copy: {all:?}"
+    );
+    assert_eq!(result.matched, 1);
+
+    fs::remove_dir_all(&outer).ok();
+}
+
+#[test]
 fn a_folder_search_does_not_read_its_own_entries_twice() {
     // Phase one lists the folder; the walk must only descend from it, or a
     // match in the current folder would be reported twice.
@@ -428,3 +455,5 @@ fn bench_packed_folder() {
 
     fs::remove_dir_all(&dir).ok();
 }
+
+

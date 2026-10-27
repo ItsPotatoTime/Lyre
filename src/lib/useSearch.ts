@@ -102,6 +102,11 @@ export function useSearch(
           if (disposed) return;
           setState((prev) => ({
             ...prev,
+            // One relevance sort when the walk finishes, never during it: the
+            // list stays still while results stream in, then settles into the
+            // order the scores actually describe. Sorting is stable, so equal
+            // scores keep the order they arrived in.
+            items: [...prev.items].sort((a, b) => b.score - a.score),
             matched,
             scanned,
             elapsedMs,

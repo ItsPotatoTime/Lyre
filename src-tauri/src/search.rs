@@ -38,9 +38,14 @@ use std::time::{Duration, Instant};
 /// Results handed to the interface. Past this the list is noise, and every
 /// extra row is bytes across the IPC boundary on every keystroke.
 const LIMIT: usize = 1000;
-/// Ceiling on entries examined by a recursive walk, so searching a whole disk
-/// still ends and can say what it did.
-const MAX_SCANNED: usize = 400_000;
+/// Ceiling on entries examined by a recursive walk. The walker reads a few
+/// million names a second, so this is a guard against a pathological tree
+/// rather than a normal stopping point; the time budget below usually binds
+/// first on slow disks, and this one on fast ones.
+const MAX_SCANNED: usize = 5_000_000;
+/// Wall-clock budget for the walk. Results have already been streaming for
+/// this long by the time it applies, so the interface is never waiting.
+const TIME_BUDGET_MS: u128 = 3000;
 const MAX_DEPTH: usize = 32;
 /// How long the walker may accumulate before flushing a batch.
 const BATCH_MS: u64 = 40;
@@ -419,13 +424,21 @@ where
     // Every root is queued at depth zero. A root that phase one already listed
     // is walked for its subfolders only, so its own entries are not read, and
     // counted, twice.
-    let mut queue: Vec<(PathBuf, usize)> = Vec::new();
-    for root in roots {
-        if !is_virtual_filesystem(root) {
-            queue.push((root.clone(), 0));
+    // Breadth-first, not depth-first. A depth-first walk of a whole volume
+    // disappears into the first large system tree it meets (/opt, /usr) and
+    // spends the entire budget there before reaching the user's own folders.
+    // Taking folders from the front spreads the walk across the top of the
+    // tree first, which is where the user's files are.
+    // A volume list usually contains folders that live inside other volumes
+    // (/ and /home, C:\ and C:\Users), so walking every root as given examines
+    // the same files twice.
+    let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::new();
+    for root in without_nested(roots) {
+        if !is_virtual_filesystem(&root) {
+            queue.push_back((root, 0));
         }
     }
-    let stack: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(queue);
+    let queue: Mutex<VecDeque<(PathBuf, usize)>> = Mutex::new(queue);
     let examined = AtomicUsize::new(scanned_so_far);
     let (tx, rx) = mpsc::channel::<Hit>();
     let workers = thread::available_parallelism()
@@ -435,6 +448,7 @@ where
 
     let mut found = 0usize;
     let mut accepted = 0usize;
+    let walk_started = Instant::now();
     // Set when the scan ceiling stopped the walk, so `Done` can say the answer
     // is incomplete rather than implying the tree was fully searched.
     let mut cut = false;
@@ -442,7 +456,7 @@ where
     thread::scope(|scope| {
         for _ in 0..workers {
             let tx = tx.clone();
-            let stack = &stack;
+            let queue = &queue;
             let examined = &examined;
             scope.spawn(move || {
                 let mut matcher = Matcher::new(Config::DEFAULT);
@@ -454,10 +468,10 @@ where
                     // Several folders at a time, so the lock is not the
                     // bottleneck on a wide tree.
                     let next = {
-                        let Ok(mut stack) = stack.lock() else { return };
+                        let Ok(mut queue) = queue.lock() else { return };
                         let mut batch = Vec::with_capacity(4);
                         for _ in 0..4 {
-                            match stack.pop() {
+                            match queue.pop_front() {
                                 Some(item) => batch.push(item),
                                 None => break,
                             }
@@ -474,8 +488,8 @@ where
                         if covered.is_some_and(|path| path == dir) {
                             let children = subfolders(&dir, show_hidden, depth);
                             if !children.is_empty() {
-                                if let Ok(mut stack) = stack.lock() {
-                                    stack.extend(children);
+                                if let Ok(mut queue) = queue.lock() {
+                                    queue.extend(children);
                                 }
                             }
                             continue;
@@ -542,8 +556,8 @@ where
                             }
                         }
                         if !subdirs.is_empty() {
-                            if let Ok(mut stack) = stack.lock() {
-                                stack.extend(subdirs);
+                            if let Ok(mut queue) = queue.lock() {
+                                queue.extend(subdirs);
                             }
                         }
                     }
@@ -582,6 +596,12 @@ where
                 cancel.store(true, Ordering::Relaxed);
                 break;
             }
+
+            if walk_started.elapsed().as_millis() >= TIME_BUDGET_MS {
+                cut = true;
+                cancel.store(true, Ordering::Relaxed);
+                break;
+            }
         }
 
         if !batch.is_empty() {
@@ -597,6 +617,22 @@ where
         scanned: examined.load(Ordering::Relaxed),
         truncated: cut || found > accepted,
     }
+}
+
+/// Drop any root that another root already contains. Sorted by depth first, so
+/// a parent is always seen before its children.
+fn without_nested(roots: &[PathBuf]) -> Vec<PathBuf> {
+    let mut ordered: Vec<&PathBuf> = roots.iter().collect();
+    ordered.sort_by_key(|path| path.components().count());
+
+    let mut kept: Vec<PathBuf> = Vec::with_capacity(ordered.len());
+    for root in ordered {
+        if kept.iter().any(|parent| root.starts_with(parent)) {
+            continue;
+        }
+        kept.push(root.clone());
+    }
+    kept
 }
 
 /// Filesystems that are not real storage. Walking them is slow and their

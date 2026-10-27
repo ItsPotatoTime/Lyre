@@ -165,14 +165,14 @@ export function CommandBar({
       id: "default-manager",
       label: isDefaultManager
         ? "Lyre is the default file manager"
-        : "Make Lyre the default file manager…",
+        : "Set as default file manager…",
       disabled: isDefaultManager || managerUnsupported,
       onSelect: onSetDefaultManager,
     },
     {
       kind: "item",
       id: "prompt-manager",
-      label: "Offer to be the default at startup",
+      label: "Offer this at startup",
       checked: promptDefaultManager,
       onSelect: onTogglePromptManager,
     },

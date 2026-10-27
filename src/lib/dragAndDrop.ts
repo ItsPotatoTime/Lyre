@@ -29,6 +29,9 @@ interface DragSession {
   paths: string[];
   startX: number;
   startY: number;
+  /** Last pointer position, so Shift can update the badge while stationary. */
+  x: number;
+  y: number;
   active: boolean;
   target: DragTarget | null;
   hovered: Element | null;
@@ -95,6 +98,8 @@ export function useDrag(
         paths,
         startX: event.clientX,
         startY: event.clientY,
+        x: event.clientX,
+        y: event.clientY,
         active: false,
         target: EMPTY,
         hovered: null,
@@ -121,6 +126,8 @@ export function useDrag(
       // Holding Shift switches a drag from moving to copying, and the badge
       // says which one will happen before the button is released.
       current.mode = event.shiftKey ? "copy" : "move";
+      current.x = event.clientX;
+      current.y = event.clientY;
 
       if (!current.active) {
         const moved =
@@ -170,10 +177,23 @@ export function useDrag(
     };
 
     const onKey = (event: KeyboardEvent) => {
-      if (event.key === "Escape" && session.current) {
+      const current = session.current;
+      if (!current) return;
+
+      if (event.key === "Escape") {
         event.stopPropagation();
         event.preventDefault();
         cancel();
+        return;
+      }
+
+      // Pausing over a folder and then pressing Shift is a normal way to
+      // decide; nothing moves, so this has to update the badge itself instead
+      // of waiting for the next pointermove.
+      if (event.key === "Shift" && current.active) {
+        current.mode = event.shiftKey ? "copy" : "move";
+        paintBadge(current.x, current.y, current.mode, current.paths.length);
+        document.body.dataset.dragging = current.mode;
       }
     };
 
@@ -181,11 +201,15 @@ export function useDrag(
     window.addEventListener("pointerup", onUp);
     window.addEventListener("pointercancel", cancel);
     window.addEventListener("keydown", onKey, true);
+    // Shift going up has to be seen too, or the badge keeps saying Copy after
+    // the key is released.
+    window.addEventListener("keyup", onKey, true);
     return () => {
       window.removeEventListener("pointermove", onMove);
       window.removeEventListener("pointerup", onUp);
       window.removeEventListener("pointercancel", cancel);
       window.removeEventListener("keydown", onKey, true);
+      window.removeEventListener("keyup", onKey, true);
     };
   }, [cancel, clearHighlight, hideBadge, paintBadge]);
 

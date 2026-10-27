@@ -22,6 +22,7 @@
 //! subsequence matching with a score that rewards contiguous runs and word
 //! boundaries, and the match positions so the interface can highlight them.
 
+use crate::fold::fold_into;
 use crate::scan::{self, Entry};
 use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
 use nucleo_matcher::{Config, Matcher, Utf32Str};
@@ -262,7 +263,12 @@ where
     // Always case-insensitive. Smart case would make "REPORT" mean *only*
     // upper-case names, which is a trap for anyone with caps lock on or who is
     // used to Windows search matching regardless of case.
-    let pattern = Pattern::parse(needle, CaseMatching::Ignore, Normalization::Smart);
+    //
+    // The needle is folded first so that "tari" and "țari" are the same query,
+    // and the haystack is folded the same way before comparison.
+    let mut folded_needle = String::new();
+    fold_into(needle, &mut folded_needle);
+    let pattern = Pattern::parse(&folded_needle, CaseMatching::Ignore, Normalization::Smart);
 
     let roots: Vec<PathBuf> = if request.roots.is_empty() {
         if request.path.is_empty() {
@@ -394,13 +400,15 @@ fn score_local(
             scope.spawn(move || {
                 let mut matcher = Matcher::new(Config::DEFAULT);
                 let mut buf = Vec::new();
+                let mut folded = String::new();
                 let mut mine: Vec<(u32, u32)> = Vec::new();
                 let mut index = worker * CHUNK;
                 while index < entries.len() {
                     let end = (index + CHUNK).min(entries.len());
                     for (offset, entry) in entries[index..end].iter().enumerate() {
+                        fold_into(&entry.name, &mut folded);
                         if let Some(score) =
-                            pattern.score(Utf32Str::new(&entry.name, &mut buf), &mut matcher)
+                            pattern.score(Utf32Str::new(&folded, &mut buf), &mut matcher)
                         {
                             mine.push((score, (index + offset) as u32));
                         }
@@ -477,13 +485,15 @@ fn materialise(
 ) -> Vec<Hit> {
     let mut matcher = Matcher::new(Config::DEFAULT);
     let mut buf = Vec::new();
+    let mut folded = String::new();
     scored
         .iter()
         .filter_map(|&(score, index)| {
             let entry = entries.get(index as usize)?;
             let mut indices = Vec::new();
+            fold_into(&entry.name, &mut folded);
             pattern.indices(
-                Utf32Str::new(&entry.name, &mut buf),
+                Utf32Str::new(&folded, &mut buf),
                 &mut matcher,
                 &mut indices,
             );
@@ -579,6 +589,7 @@ where
             scope.spawn(move || {
                 let mut matcher = Matcher::new(Config::DEFAULT);
                 let mut buf = Vec::new();
+                let mut folded = String::new();
                 loop {
                     if cancel.load(Ordering::Relaxed) {
                         return;
@@ -641,8 +652,9 @@ where
                                 continue;
                             }
 
+                            fold_into(&name, &mut folded);
                             let Some(score) =
-                                pattern.score(Utf32Str::new(&name, &mut buf), &mut matcher)
+                                pattern.score(Utf32Str::new(&folded, &mut buf), &mut matcher)
                             else {
                                 continue;
                             };
@@ -661,7 +673,7 @@ where
                             };
                             let mut indices = Vec::new();
                             pattern.indices(
-                                Utf32Str::new(&entry.name, &mut buf),
+                                Utf32Str::new(&folded, &mut buf),
                                 &mut matcher,
                                 &mut indices,
                             );

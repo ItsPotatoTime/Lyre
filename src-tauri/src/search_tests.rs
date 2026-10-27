@@ -523,3 +523,119 @@ fn bench_real_tree() {
         }
     }
 }
+
+/// Which accented names a plain-letter query finds, through the real engine.
+///
+/// `cargo test --lib bench_diacritics -- --ignored --nocapture`
+#[test]
+#[ignore = "diagnostic: prints what folds"]
+fn bench_diacritics() {
+    let dir = scratch("diacritics-bench");
+    let names = [
+        ("Țări", "tari"),
+        ("Șoseaua", "soseaua"),
+        ("Cărți", "carti"),
+        ("Câmp", "camp"),
+        ("Înalt", "inalt"),
+        ("Łódź", "lodz"),
+        ("Ørsted", "orsted"),
+        ("Tiếng", "tieng"),
+        ("Ёлка", "елка"),
+        ("Йошкар", "иошкар"),
+        ("Άλφα", "αλφα"),
+        ("Müller", "muller"),
+    ];
+    for (name, _) in names {
+        fs::write(dir.join(format!("{name}.txt")), b"x").unwrap();
+    }
+    let index = Index::default();
+    scan_into_index(&index, &dir);
+
+    for (name, needle) in names {
+        let result = run(&index, &dir, needle, false);
+        let found = result.local.iter().any(|hit| hit.starts_with(name));
+        println!("{needle:>9} -> {name:<9} {}", if found { "found" } else { "MISSED" });
+    }
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// Accents must not stop a search, in either direction.
+#[test]
+fn accented_names_are_found_by_plain_letters() {
+    let dir = scratch("accents");
+    for name in [
+        "Țări și orașe.txt",
+        "Șoseaua de centură.txt",
+        "Łódź.txt",
+        "Tiếng Việt.txt",
+        "Ёлка.txt",
+        "Straße.txt",
+        "Müller.txt",
+    ] {
+        fs::write(dir.join(name), b"x").unwrap();
+    }
+    let index = Index::default();
+    scan_into_index(&index, &dir);
+
+    let cases = [
+        ("tari", "Țări și orașe.txt"),
+        ("soseaua", "Șoseaua de centură.txt"),
+        ("lodz", "Łódź.txt"),
+        ("tieng", "Tiếng Việt.txt"),
+        ("елка", "Ёлка.txt"),
+        ("strase", "Straße.txt"),
+        ("muller", "Müller.txt"),
+        // And the accented spelling still works.
+        ("țari", "Țări și orașe.txt"),
+    ];
+
+    for (query, expected) in cases {
+        let result = run(&index, &dir, query, false);
+        assert_eq!(
+            result.local,
+            vec![expected.to_string()],
+            "query {query:?} should find {expected:?}"
+        );
+    }
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// Highlighting must land on the letters the person can see.
+#[test]
+fn accents_do_not_shift_the_highlights() {
+    let dir = scratch("accent-indices");
+    fs::write(dir.join("Țări.txt"), b"x").unwrap();
+    let index = Index::default();
+    scan_into_index(&index, &dir);
+
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut found: Option<(String, Vec<u32>)> = None;
+    search(
+        &index,
+        &SearchRequest {
+            query: "tari".into(),
+            path: dir.to_string_lossy().into_owned(),
+            roots: Vec::new(),
+            recursive: false,
+            show_hidden: false,
+        },
+        &cancel,
+        |event| {
+            if let SearchEvent::Local { items, .. } = event {
+                if let Some(hit) = items.into_iter().next() {
+                    found = Some((hit.entry.name, hit.indices));
+                }
+            }
+            true
+        },
+    );
+
+    let (name, indices) = found.expect("a hit");
+    let chars: Vec<char> = name.chars().collect();
+    let lit: String = indices.iter().filter_map(|i| chars.get(*i as usize)).collect();
+    assert_eq!(lit, "Țări", "the highlighted characters spell the query");
+
+    fs::remove_dir_all(&dir).ok();
+}

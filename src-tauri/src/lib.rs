@@ -7,6 +7,7 @@
 mod defaultmanager;
 mod eject;
 mod fileops;
+mod fold;
 mod graphics;
 mod openwith;
 mod ops;

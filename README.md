@@ -164,6 +164,14 @@ shown are described and sent. Measured on this machine:
 The cost is now the directory walk itself, whatever the number of matches, so a
 query that matches everything costs the same as one that matches nothing.
 
+Accents do not have to be typed. `tari` finds `Țări`, `lodz` finds `Łódź`,
+`tieng` finds `Tiếng`, `елка` finds `Ёлка`, and the accented spelling works too.
+Names and queries are both folded through Unicode decomposition, so this covers
+every script that composes its diacritics rather than a list of languages, plus
+a short table for letters that are a single glyph such as `ł` and `ø`. Folding
+never changes the number of characters, which is what keeps the highlight on the
+letters the person can see.
+
 A walk has exactly one ceiling: five million entries examined. It used to stop
 after three seconds as well, which meant the same query returned different
 answers on different machines, because a slow disk examines fewer entries in a

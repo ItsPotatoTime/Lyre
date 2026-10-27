@@ -1,0 +1,569 @@
+/* ============================================================================
+   The window chrome: tab strip, command bar, address bar, window controls.
+   Explorer's chrome is a single flat material with no dividers between the
+   three rows, which is why nothing here draws a horizontal rule except where
+   the content area begins.
+   ========================================================================= */
+
+.app {
+  display: grid;
+  grid-template-rows: var(--tabbar-h) var(--commandbar-h) var(--addressbar-h) 1fr var(--statusbar-h);
+  height: 100%;
+  background: var(--surface-chrome);
+  /* The window is undecorated, so the 1px frame Windows draws around a
+     window is drawn here instead, inset so it is not clipped away. */
+  box-shadow: inset 0 0 0 1px var(--stroke-divider);
+  overflow: hidden;
+}
+
+/* Edge resize grips. The window is undecorated, so the resize affordance has
+   to exist in the page or the window cannot be resized at all. */
+.grip {
+  position: fixed;
+  z-index: 60;
+}
+
+.grip-n,
+.grip-s {
+  left: var(--resize-grip);
+  right: var(--resize-grip);
+  height: var(--resize-grip);
+  cursor: ns-resize;
+}
+.grip-n {
+  top: 0;
+}
+.grip-s {
+  bottom: 0;
+}
+.grip-e,
+.grip-w {
+  top: var(--resize-grip);
+  bottom: var(--resize-grip);
+  width: var(--resize-grip);
+  cursor: ew-resize;
+}
+.grip-e {
+  right: 0;
+}
+.grip-w {
+  left: 0;
+}
+.grip-ne,
+.grip-nw,
+.grip-se,
+.grip-sw {
+  width: var(--resize-grip);
+  height: var(--resize-grip);
+}
+.grip-ne {
+  top: 0;
+  right: 0;
+  cursor: nesw-resize;
+}
+.grip-nw {
+  top: 0;
+  left: 0;
+  cursor: nwse-resize;
+}
+.grip-se {
+  bottom: 0;
+  right: 0;
+  cursor: nwse-resize;
+}
+.grip-sw {
+  bottom: 0;
+  left: 0;
+  cursor: nesw-resize;
+}
+
+/* Tab strip ---------------------------------------------------------------- */
+.titlebar {
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+  padding-left: 8px;
+  background: var(--surface-chrome);
+  background-image: linear-gradient(
+    var(--surface-chrome-tint),
+    var(--surface-chrome-tint)
+  );
+}
+
+.tabstrip {
+  display: flex;
+  align-items: flex-end;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+  padding-top: 4px;
+}
+
+.tab {
+  --tab-active: color-mix(in srgb, var(--surface-content) 88%, var(--surface-chrome));
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 32px;
+  min-width: 132px;
+  max-width: 208px;
+  flex: 0 1 208px;
+  padding: 0 4px 0 12px;
+  border-radius: var(--radius-surface) var(--radius-surface) 0 0;
+  color: var(--text-secondary);
+  background: transparent;
+  transition:
+    background-color var(--dur-2) var(--ease-standard),
+    color var(--dur-2) var(--ease-standard);
+}
+
+.tab:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.tab[data-active="true"] {
+  background: var(--tab-active);
+  color: var(--text-primary);
+}
+
+.tab-label {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--text-caption);
+  line-height: var(--leading-caption);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: left;
+}
+
+.tab-close {
+  display: grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  border-radius: var(--radius-control);
+  color: var(--text-secondary);
+  opacity: 0;
+  transition:
+    opacity var(--dur-2) var(--ease-standard),
+    background-color var(--dur-1) var(--ease-standard);
+}
+
+.tab:hover .tab-close,
+.tab[data-active="true"] .tab-close,
+.tab-close:focus-visible {
+  opacity: 1;
+}
+
+.tab-close:hover {
+  background: var(--surface-pressed);
+  color: var(--text-primary);
+}
+
+.tab-close:active {
+  transform: scale(0.92);
+}
+
+.tab-new {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  margin: 0 2px 2px;
+  border-radius: var(--radius-control);
+  color: var(--text-secondary);
+}
+
+.tab-new:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+/* Window controls ---------------------------------------------------------- */
+.window-controls {
+  display: flex;
+  align-items: flex-start;
+  height: var(--tabbar-h);
+  flex: none;
+}
+
+.caption-btn {
+  display: grid;
+  place-items: center;
+  width: 46px;
+  height: 32px;
+  color: var(--text-secondary);
+  transition: background-color var(--dur-1) var(--ease-standard);
+}
+
+.caption-btn:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.caption-btn[data-kind="close"]:hover {
+  background: #c42b1c;
+  color: #ffffff;
+}
+
+.caption-btn:active {
+  background: var(--surface-pressed);
+}
+
+.caption-btn[data-kind="close"]:active {
+  background: #b0261a;
+  color: #ffffff;
+}
+
+/* Command bar -------------------------------------------------------------- */
+.cmd-chevron {
+  display: inline-block;
+  vertical-align: -1px;
+  margin-left: 3px;
+  opacity: 0.7;
+}
+
+.cmd-btn[data-active="true"] {
+  background: var(--surface-selected);
+  color: var(--accent);
+}
+
+.commandbar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 8px;
+  min-width: 0;
+  background: var(--surface-chrome);
+  background-image: linear-gradient(
+    var(--surface-chrome-tint),
+    var(--surface-chrome-tint)
+  );
+}
+
+.cmd-group {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  min-width: 0;
+}
+
+.cmd-sep {
+  width: 1px;
+  height: 20px;
+  margin: 0 6px;
+  background: var(--stroke-divider);
+  flex: none;
+}
+
+.cmd-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  min-width: 46px;
+  height: 38px;
+  padding: 0 6px;
+  border-radius: var(--radius-control);
+  color: var(--text-primary);
+  transition:
+    background-color var(--dur-1) var(--ease-standard),
+    transform var(--dur-1) var(--ease-out);
+}
+
+.cmd-btn:hover {
+  background: var(--surface-hover);
+}
+
+.cmd-btn:active {
+  background: var(--surface-pressed);
+  transform: scale(0.97);
+}
+
+.cmd-btn[data-disabled="true"] {
+  color: var(--text-disabled);
+  pointer-events: none;
+}
+
+.cmd-label {
+  font-size: var(--text-caption);
+  line-height: 14px;
+  white-space: nowrap;
+}
+
+.cmd-btn[data-compact="true"] {
+  min-width: 34px;
+  flex-direction: row;
+}
+
+.cmd-spacer {
+  flex: 1;
+  min-width: 8px;
+}
+
+/* Address bar -------------------------------------------------------------- */
+.addressbar {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  padding: 0 8px;
+  min-width: 0;
+  background: var(--surface-chrome);
+  background-image: linear-gradient(
+    var(--surface-chrome-tint),
+    var(--surface-chrome-tint)
+  );
+}
+
+.nav-btn {
+  display: grid;
+  place-items: center;
+  width: 32px;
+  height: 32px;
+  border-radius: var(--radius-control);
+  color: var(--text-secondary);
+  flex: none;
+  transition:
+    background-color var(--dur-1) var(--ease-standard),
+    color var(--dur-1) var(--ease-standard);
+}
+
+.nav-btn:hover:not([data-disabled="true"]) {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.nav-btn:active:not([data-disabled="true"]) {
+  transform: scale(0.95);
+}
+
+.nav-btn[data-disabled="true"] {
+  color: var(--text-disabled);
+  pointer-events: none;
+}
+
+/* The address field is a control surface, not a text input, until it is
+   clicked. Explorer makes the same substitution. */
+.address-field {
+  display: flex;
+  align-items: center;
+  flex: 1;
+  min-width: 0;
+  height: 32px;
+  margin: 0 4px;
+  padding: 0 2px;
+  border: 1px solid var(--stroke-control);
+  border-radius: var(--radius-control);
+  background: var(--surface-raised);
+  transition:
+    border-color var(--dur-2) var(--ease-standard),
+    background-color var(--dur-2) var(--ease-standard);
+}
+
+.address-field:hover {
+  background: color-mix(in srgb, var(--surface-raised) 94%, var(--text-primary));
+}
+
+.address-field[data-editing="true"] {
+  border-color: var(--accent);
+  padding: 0 6px;
+}
+
+.address-input {
+  flex: 1;
+  min-width: 0;
+  height: 100%;
+  font-size: var(--text-caption);
+  color: var(--text-primary);
+}
+
+.crumbs {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  min-width: 0;
+  overflow: hidden;
+  flex: 1;
+}
+
+.crumb-wrap {
+  display: inline-flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.crumb {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 24px;
+  padding: 0 6px;
+  border-radius: var(--radius-control);
+  font-size: var(--text-caption);
+  color: var(--text-primary);
+  white-space: nowrap;
+  max-width: 220px;
+  transition: background-color var(--dur-1) var(--ease-standard);
+}
+
+.crumb:hover {
+  background: var(--surface-hover);
+}
+
+.crumb:active {
+  background: var(--surface-pressed);
+}
+
+.crumb-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.crumb-sep {
+  color: var(--text-tertiary);
+  flex: none;
+}
+
+.crumb-plain {
+  flex: 1;
+  height: 24px;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-caption);
+  color: var(--text-primary);
+  text-align: left;
+  padding: 0 6px;
+  display: flex;
+  align-items: center;
+}
+
+/* Search ------------------------------------------------------------------- */
+.search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 248px;
+  flex: none;
+  height: 32px;
+  padding: 0 8px;
+  border: 1px solid var(--stroke-control);
+  border-radius: var(--radius-control);
+  background: var(--surface-raised);
+  color: var(--text-tertiary);
+  transition: border-color var(--dur-2) var(--ease-standard);
+}
+
+.search:focus-within {
+  border-color: var(--accent);
+}
+
+.search input {
+  flex: 1;
+  min-width: 0;
+  font-size: var(--text-caption);
+  color: var(--text-primary);
+}
+
+.search-clear {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  color: var(--text-secondary);
+}
+
+.search-clear:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+/* Menus -------------------------------------------------------------------- */
+.menu-anchor {
+  position: relative;
+}
+
+.menu {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 50;
+  min-width: 180px;
+  padding: 4px;
+  border-radius: var(--radius-surface);
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-flyout);
+  transform-origin: top left;
+  animation: menu-in var(--dur-2) var(--ease-decel);
+}
+
+.menu[data-align="end"] {
+  left: auto;
+  right: 0;
+  transform-origin: top right;
+}
+
+@keyframes menu-in {
+  from {
+    opacity: 0;
+    transform: scale(0.96) translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.menu-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  height: 32px;
+  padding: 0 8px;
+  border-radius: var(--radius-control);
+  font-size: var(--text-body);
+  color: var(--text-primary);
+  text-align: left;
+}
+
+.menu-item:hover {
+  background: var(--surface-hover);
+}
+
+.menu-item[data-checked="true"] {
+  background: var(--surface-selected);
+}
+
+.menu-item-check {
+  width: 16px;
+  color: var(--accent);
+  flex: none;
+}
+
+.menu-item-label {
+  flex: 1;
+}
+
+.menu-item-hint {
+  color: var(--text-tertiary);
+  font-size: var(--text-caption);
+}
+
+.menu-sep {
+  height: 1px;
+  margin: 4px 8px;
+  background: var(--stroke-divider);
+}
+
+.menu-label {
+  padding: 8px 8px 4px;
+  font-size: var(--text-caption);
+  color: var(--text-tertiary);
+}

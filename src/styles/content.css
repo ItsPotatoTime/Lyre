@@ -1,0 +1,543 @@
+/* ============================================================================
+   The working area: navigation rail, file list, grid, status bar.
+   ========================================================================= */
+
+.body {
+  display: grid;
+  grid-template-columns: var(--nav-w, var(--navrail-w)) 1px 1fr;
+  min-height: 0;
+  border-top: 1px solid var(--stroke-divider);
+  background: var(--surface-content);
+}
+
+.body[data-nav="false"] {
+  grid-template-columns: 1fr;
+}
+
+/* Navigation rail ---------------------------------------------------------- */
+.navrail {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+  padding: 6px 6px 12px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  background: var(--surface-chrome);
+  background-image: linear-gradient(
+    var(--surface-chrome-tint),
+    var(--surface-chrome-tint)
+  );
+  border-right: 1px solid var(--stroke-divider);
+}
+
+.nav-section {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.nav-section + .nav-section {
+  margin-top: 8px;
+}
+
+.nav-heading {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 32px;
+  padding: 0 8px;
+  border-radius: var(--radius-control);
+  font-size: var(--text-caption);
+  font-weight: var(--weight-semi);
+  color: var(--text-secondary);
+  text-align: left;
+}
+
+.nav-heading:hover {
+  background: var(--surface-hover);
+}
+
+.nav-heading-chevron {
+  transition: transform var(--dur-2) var(--ease-standard);
+  color: var(--text-tertiary);
+}
+
+.nav-heading[data-collapsed="true"] .nav-heading-chevron {
+  transform: rotate(-90deg);
+}
+
+.nav-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 32px;
+  padding: 0 8px 0 10px;
+  border-radius: var(--radius-control);
+  font-size: var(--text-row);
+  color: var(--text-primary);
+  text-align: left;
+  min-width: 0;
+  transition: background-color var(--dur-1) var(--ease-standard);
+}
+
+.nav-item:hover {
+  background: var(--surface-hover);
+}
+
+.nav-item:active {
+  background: var(--surface-pressed);
+}
+
+/* Selected is a fill plus Explorer's accent pill, not a whole-row accent. */
+.nav-item[data-active="true"] {
+  background: var(--surface-selected-inactive);
+}
+
+.nav-item[data-active="true"]::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 8px;
+  bottom: 8px;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+.nav-item-icon {
+  flex: none;
+  color: var(--text-secondary);
+}
+
+.nav-item[data-active="true"] .nav-item-icon {
+  color: var(--accent);
+}
+
+.nav-item-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+
+
+.nav-splitter {
+  position: relative;
+  background: transparent;
+  cursor: col-resize;
+}
+
+.nav-splitter::after {
+  content: "";
+  position: absolute;
+  inset: 0 -3px;
+}
+
+.nav-splitter:hover::before,
+.nav-splitter[data-dragging="true"]::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: var(--accent);
+  opacity: 0.6;
+}
+
+/* Content column ----------------------------------------------------------- */
+.content {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--surface-content);
+}
+
+
+
+
+
+/* Column header ------------------------------------------------------------ */
+.columns {
+  display: grid;
+  align-items: center;
+  height: var(--colheader-h);
+  flex: none;
+  padding-right: 12px;
+  border-bottom: 1px solid var(--stroke-divider);
+  background: var(--surface-content);
+}
+
+.col {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  height: 100%;
+  padding: 0 8px;
+  font-size: var(--text-caption);
+  color: var(--text-secondary);
+  text-align: left;
+  min-width: 0;
+  white-space: nowrap;
+  transition: background-color var(--dur-1) var(--ease-standard);
+}
+
+.col:hover {
+  background: var(--surface-hover);
+  color: var(--text-primary);
+}
+
+.col[data-align="end"] {
+  justify-content: flex-end;
+}
+
+.col-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.col-sort {
+  color: var(--text-secondary);
+  flex: none;
+}
+
+
+/* Details list ------------------------------------------------------------- */
+.list {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  outline: none;
+  contain: strict;
+}
+
+.list-spacer {
+  position: relative;
+  width: 100%;
+}
+
+.row {
+  position: absolute;
+  left: 0;
+  right: 0;
+  display: grid;
+  align-items: center;
+  height: var(--row-h);
+  padding-right: 12px;
+  border-radius: 2px;
+  color: var(--text-primary);
+}
+
+.row::after {
+  /* Hairline between rows, drawn only on hover-adjacent rows like Explorer's
+     row separators, which are invisible at rest. */
+  content: "";
+  position: absolute;
+  left: 8px;
+  right: 12px;
+  bottom: 0;
+  height: 1px;
+  background: transparent;
+}
+
+.row:hover {
+  background: var(--surface-hover);
+}
+
+.row[data-selected="true"] {
+  background: var(--surface-selected);
+}
+
+.row[data-selected="true"]:hover {
+  background: var(--surface-selected-hover);
+}
+
+.row[data-focused="true"][data-selected="true"] {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 60%, transparent);
+}
+
+.row[data-focused="true"]:not([data-selected="true"]) {
+  box-shadow: inset 0 0 0 1px var(--stroke-strong);
+}
+
+.cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 0 8px;
+  font-size: var(--text-row);
+  line-height: var(--leading-row);
+  white-space: nowrap;
+  overflow: hidden;
+}
+
+.cell-name {
+  gap: 8px;
+}
+
+.cell[data-align="end"] {
+  justify-content: flex-end;
+}
+
+.cell-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.cell-muted {
+  color: var(--text-secondary);
+  font-size: var(--text-caption);
+}
+
+/* Grid --------------------------------------------------------------------- */
+.grid {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  outline: none;
+  contain: strict;
+}
+
+.grid-spacer {
+  position: relative;
+  width: 100%;
+}
+
+.tile {
+  position: absolute;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 10px 6px 8px;
+  border-radius: var(--radius-control);
+  color: var(--text-primary);
+}
+
+.tile:hover {
+  background: var(--surface-hover);
+}
+
+.tile[data-selected="true"] {
+  background: var(--surface-selected);
+}
+
+.tile[data-selected="true"]:hover {
+  background: var(--surface-selected-hover);
+}
+
+.tile[data-focused="true"][data-selected="true"] {
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 60%, transparent);
+}
+
+.tile-glyph {
+  display: grid;
+  place-items: center;
+  height: 44px;
+}
+
+.tile-label {
+  font-size: var(--text-caption);
+  line-height: 15px;
+  text-align: center;
+  width: 100%;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+}
+
+/* States ------------------------------------------------------------------- */
+.state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  flex: 1;
+  padding: 24px;
+  text-align: center;
+  color: var(--text-secondary);
+}
+
+.state-title {
+  font-size: var(--text-body);
+  color: var(--text-primary);
+  font-weight: var(--weight-semi);
+}
+
+.state-body {
+  font-size: var(--text-caption);
+  max-width: 46ch;
+}
+
+.state-action {
+  margin-top: 4px;
+  height: 32px;
+  padding: 0 16px;
+  border-radius: var(--radius-control);
+  background: var(--accent);
+  color: var(--text-on-accent);
+  font-size: var(--text-caption);
+  transition:
+    background-color var(--dur-1) var(--ease-standard),
+    transform var(--dur-1) var(--ease-out);
+}
+
+.state-action:hover {
+  background: var(--accent-fill-hover);
+}
+
+.state-action:active {
+  transform: scale(0.97);
+}
+
+.skeleton {
+  display: flex;
+  flex-direction: column;
+  padding: 6px 12px;
+  gap: 2px;
+}
+
+.skeleton-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: var(--row-h);
+}
+
+.skeleton-bar {
+  height: 8px;
+  border-radius: 4px;
+  background: var(--surface-hover);
+  animation: skeleton-breathe 1.2s var(--ease-standard) infinite;
+}
+
+@keyframes skeleton-breathe {
+  0%,
+  100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 0.9;
+  }
+}
+
+/* Status bar --------------------------------------------------------------- */
+.statusbar {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  height: var(--statusbar-h);
+  padding: 0 12px;
+  border-top: 1px solid var(--stroke-divider);
+  background: var(--surface-chrome);
+  background-image: linear-gradient(
+    var(--surface-chrome-tint),
+    var(--surface-chrome-tint)
+  );
+  font-size: var(--text-caption);
+  color: var(--text-secondary);
+}
+
+.statusbar strong {
+  color: var(--text-primary);
+  font-weight: var(--weight-regular);
+}
+
+.status-spacer {
+  flex: 1;
+}
+
+.status-scan {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-tertiary);
+}
+
+.status-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--accent);
+  animation: status-pulse 1s var(--ease-standard) infinite;
+}
+
+@keyframes status-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.9);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+
+
+/* Tooltip ------------------------------------------------------------------ */
+
+@keyframes tip-in {
+  from {
+    opacity: 0;
+    transform: translateY(-2px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Scroll fades: Explorer's list gives no hint that more rows exist below, but
+   a two-pixel gradient at the edge reads as depth without adding chrome. */
+
+@media (prefers-reduced-motion: reduce) {
+  .status-dot,
+  .skeleton-bar {
+    animation: none;
+  }
+}
+
+/* Boot: one frame, before the home directory is known. Deliberately empty of
+   content so nothing is promised before the filesystem answers. */
+.boot {
+  display: grid;
+  place-items: center;
+  height: 100%;
+  color: var(--text-disabled);
+  background: var(--surface-chrome);
+}
+
+/* A transient line in the status bar, used to explain an action that this
+   build does not implement yet instead of leaving a dead control. */
+.status-notice {
+  color: var(--text-primary);
+  animation: notice-in var(--dur-2) var(--ease-decel);
+}
+
+@keyframes notice-in {
+  from {
+    opacity: 0;
+    transform: translateY(2px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.statusbar {
+  overflow: hidden;
+  white-space: nowrap;
+}

@@ -1,0 +1,162 @@
+/* Reset, text defaults, and the browser surfaces Explorer themes: selection,
+   caret, focus ring, scrollbars, and numerals. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+html {
+  /* The window is undecorated, so the document itself is the window body. */
+  background: var(--surface-chrome);
+  overscroll-behavior: none;
+}
+
+body {
+  font-family: var(--font-ui);
+  font-size: var(--text-body);
+  line-height: var(--leading-body);
+  color: var(--text-primary);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  font-synthesis: none;
+  overflow: hidden;
+  /* Text is a control surface here, not a document: dragging a selection
+     across the file list is a range-select gesture, not a text selection. */
+  user-select: none;
+  cursor: default;
+}
+
+button,
+input {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+}
+
+button {
+  cursor: default;
+}
+
+input {
+  user-select: text;
+}
+
+svg {
+  display: block;
+  flex: none;
+}
+
+::selection {
+  background: color-mix(in srgb, var(--accent) 34%, transparent);
+  color: var(--text-primary);
+}
+
+:focus {
+  outline: none;
+}
+
+:focus-visible {
+  outline: 2px solid var(--stroke-focus);
+  outline-offset: 1px;
+  border-radius: var(--radius-control);
+}
+
+/* Explorer's scrollbars are thin until hovered, and they are part of the
+   material rather than an OS artifact. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--scrollbar-thumb) transparent;
+}
+
+::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border: 4px solid transparent;
+  background-clip: content-box;
+  border-radius: 8px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scrollbar-thumb-hover);
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+input::placeholder {
+  color: var(--text-tertiary);
+}
+
+input[type="text"]::-webkit-search-cancel-button {
+  display: none;
+}
+
+/* Numerals line up in the Size and Date columns. */
+.tabular {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum" 1;
+}
+
+/* One shared ability: a row or control that is being pointed at gets a faint
+   pointer-following wash. This is Explorer's reveal highlight, reduced to the
+   part that costs one composited background instead of a stroke mask. */
+[data-reveal] {
+  position: relative;
+  isolation: isolate;
+}
+
+[data-reveal]::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  opacity: 0;
+  background: radial-gradient(
+    120px circle at var(--mx, 50%) var(--my, 50%),
+    color-mix(in srgb, var(--text-primary) 10%, transparent),
+    transparent 70%
+  );
+  transition: opacity var(--dur-2) var(--ease-standard);
+  z-index: -1;
+}
+
+[data-reveal]:hover::before {
+  opacity: 1;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 1ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 1ms !important;
+    scroll-behavior: auto !important;
+  }
+}

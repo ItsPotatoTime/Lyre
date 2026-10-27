@@ -1,0 +1,189 @@
+/* ============================================================================
+   Lyre design tokens.
+   Fluent (Windows 11) values, measured from real Explorer captures rather than
+   remembered: the light toolbar carries the wallpaper tint while the list area
+   is pure white, and dark chrome sits two steps below dark content.
+   ========================================================================= */
+
+:root {
+  color-scheme: light dark;
+
+  /* Type ------------------------------------------------------------------ */
+  /* Segoe UI Variable is the pinned voice. Selawik is Microsoft's
+     metric-compatible open face, so Linux and macOS land on the same rhythm
+     when it is present in the system font directory. */
+  --font-ui:
+    "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI", Selawik,
+    -apple-system, BlinkMacSystemFont, "SF Pro Text", "Inter", "Noto Sans",
+    system-ui, sans-serif;
+  --font-display:
+    "Segoe UI Variable Display", "Segoe UI Variable", "Segoe UI", Selawik,
+    -apple-system, BlinkMacSystemFont, "SF Pro Display", "Inter", system-ui,
+    sans-serif;
+  --font-mono:
+    "Cascadia Mono", "Cascadia Code", ui-monospace, "SF Mono", "JetBrains Mono",
+    "Fira Code", monospace;
+
+  --text-caption: 12px;
+  --leading-caption: 16px;
+  --text-row: 13px;
+  --leading-row: 18px;
+  --text-body: 14px;
+  --leading-body: 20px;
+  --text-subtitle: 20px;
+  --leading-subtitle: 28px;
+  --text-title: 28px;
+  --leading-title: 36px;
+
+  --weight-regular: 400;
+  --weight-semi: 600;
+
+  /* Space, 4px grid ------------------------------------------------------- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  /* Radii ----------------------------------------------------------------- */
+  --radius-control: 4px;
+  --radius-chip: 6px;
+  --radius-surface: 8px;
+  --radius-window: 8px;
+
+  /* Metrics --------------------------------------------------------------- */
+  --tabbar-h: 40px;
+  --commandbar-h: 44px;
+  --addressbar-h: 44px;
+  --navrail-w: 240px;
+  --colheader-h: 32px;
+  --row-h: 30px;
+  --statusbar-h: 26px;
+  --tile-w: 104px;
+  --tile-h: 112px;
+  --resize-grip: 5px;
+
+  /* Motion ---------------------------------------------------------------- */
+  --dur-1: 83ms;
+  --dur-2: 167ms;
+  --dur-3: 250ms;
+  --dur-4: 333ms;
+  --ease-standard: cubic-bezier(0.8, 0, 0.2, 1);
+  --ease-decel: cubic-bezier(0.1, 0.9, 0.2, 1);
+  --ease-accel: cubic-bezier(0.7, 0, 1, 0.5);
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+}
+
+/* Light -------------------------------------------------------------------- */
+:root,
+[data-theme="light"] {
+  --accent: #005fb8;
+  --accent-strong: #003e92;
+  --accent-on: #ffffff;
+  --accent-fill-hover: color-mix(in srgb, var(--accent) 88%, #000000);
+  --accent-fill-pressed: color-mix(in srgb, var(--accent) 76%, #000000);
+
+  /* Explorer's chrome is wallpaper-tinted and the list area is white. The
+     tint is faked with a low-alpha accent wash so the material reads the same
+     on Linux and macOS, where the window manager hands us nothing. */
+  --surface-chrome: #f3f3f3;
+  --surface-chrome-tint: color-mix(in srgb, var(--accent) 3%, transparent);
+  --surface-content: #ffffff;
+  --surface-raised: #ffffff;
+  --surface-sunken: #f7f7f7;
+
+  --surface-hover: rgba(0, 0, 0, 0.042);
+  --surface-pressed: rgba(0, 0, 0, 0.024);
+  --surface-selected: color-mix(in srgb, var(--accent) 11%, transparent);
+  --surface-selected-hover: color-mix(in srgb, var(--accent) 16%, transparent);
+  --surface-selected-inactive: rgba(0, 0, 0, 0.055);
+
+  --text-primary: #191a1a;
+  --text-secondary: #565758;
+  --text-tertiary: #767778;
+  --text-disabled: #9a9b9c;
+  --text-on-accent: #ffffff;
+
+  --stroke-control: rgba(0, 0, 0, 0.058);
+  --stroke-divider: rgba(0, 0, 0, 0.08);
+  --stroke-strong: rgba(0, 0, 0, 0.14);
+  --stroke-focus: #191a1a;
+
+  --shadow-flyout:
+    0 8px 24px rgba(0, 0, 0, 0.14), 0 0 2px rgba(0, 0, 0, 0.08);
+  --shadow-window: 0 0 0 1px rgba(0, 0, 0, 0.1);
+
+  --scrollbar-thumb: rgba(0, 0, 0, 0.28);
+  --scrollbar-thumb-hover: rgba(0, 0, 0, 0.42);
+}
+
+/* Dark --------------------------------------------------------------------- */
+[data-theme="dark"] {
+  --accent: #60cdff;
+  --accent-strong: #99ebff;
+  --accent-on: #000000;
+  --accent-fill-hover: color-mix(in srgb, var(--accent) 92%, #ffffff);
+  --accent-fill-pressed: color-mix(in srgb, var(--accent) 78%, #ffffff);
+
+  --surface-chrome: #202020;
+  --surface-chrome-tint: color-mix(in srgb, var(--accent) 2%, transparent);
+  --surface-content: #272727;
+  --surface-raised: #2c2c2c;
+  --surface-sunken: #1c1c1c;
+
+  --surface-hover: rgba(255, 255, 255, 0.055);
+  --surface-pressed: rgba(255, 255, 255, 0.03);
+  --surface-selected: color-mix(in srgb, var(--accent) 18%, transparent);
+  --surface-selected-hover: color-mix(in srgb, var(--accent) 24%, transparent);
+  --surface-selected-inactive: rgba(255, 255, 255, 0.075);
+
+  --text-primary: #ffffff;
+  --text-secondary: #c4c5c6;
+  --text-tertiary: #9a9b9c;
+  --text-disabled: #6d6e6f;
+  --text-on-accent: #000000;
+
+  --stroke-control: rgba(255, 255, 255, 0.07);
+  --stroke-divider: rgba(255, 255, 255, 0.084);
+  --stroke-strong: rgba(255, 255, 255, 0.16);
+  --stroke-focus: #ffffff;
+
+  --shadow-flyout: 0 8px 24px rgba(0, 0, 0, 0.44), 0 0 2px rgba(0, 0, 0, 0.4);
+  --shadow-window: 0 0 0 1px rgba(255, 255, 255, 0.09);
+
+  --scrollbar-thumb: rgba(255, 255, 255, 0.32);
+  --scrollbar-thumb-hover: rgba(255, 255, 255, 0.48);
+}
+
+/* File-type colours. Explorer ships full-colour icons; these are the hues the
+   glyphs are filled with so a folder of mixed files is scannable at a glance. */
+:root {
+  --glyph-folder: #f0b429;
+  --glyph-folder-edge: #d99b0b;
+  --glyph-file: #8f9296;
+  --glyph-image: #1f9e6e;
+  --glyph-video: #8b5cf6;
+  --glyph-audio: #e0518c;
+  --glyph-archive: #c2861f;
+  --glyph-pdf: #d94848;
+  --glyph-document: #2f6fd0;
+  --glyph-spreadsheet: #1f8f4e;
+  --glyph-presentation: #e0642a;
+  --glyph-text: #6b7280;
+  --glyph-code: #4f6ef7;
+  --glyph-executable: #5b6b7c;
+  --glyph-font: #0f8fa8;
+  --glyph-database: #a3562b;
+  --glyph-binary: #7c7f86;
+  --glyph-shortcut: #4f8ae8;
+}
+
+/* The document paints before the first React commit, so its initial background
+   has to follow the system theme or a light-theme user sees a dark frame. */
+@media (prefers-color-scheme: light) {
+  html {
+    background: #f3f3f3;
+  }
+}

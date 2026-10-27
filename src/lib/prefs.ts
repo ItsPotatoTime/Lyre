@@ -19,6 +19,8 @@ export interface Prefs {
   navOpen: boolean;
   navWidth: number;
   columns: ColumnWidths;
+  /** Whether the default-file-manager offer may appear at startup. */
+  promptDefaultManager: boolean;
 }
 
 const KEY = "lyre.prefs.v1";
@@ -32,6 +34,7 @@ export const DEFAULT_PREFS: Prefs = {
   navOpen: true,
   navWidth: 160,
   columns: DEFAULT_COLUMNS,
+  promptDefaultManager: true,
 };
 
 const SORT_KEYS = new Set(["name", "modified", "type", "size"]);
@@ -83,6 +86,10 @@ export function loadPrefs(): Prefs {
         ? saved.navWidth
         : DEFAULT_PREFS.navWidth,
     columns: columnsValid ? (columns as ColumnWidths) : DEFAULT_COLUMNS,
+    promptDefaultManager:
+      typeof saved.promptDefaultManager === "boolean"
+        ? saved.promptDefaultManager
+        : true,
   };
 }
 

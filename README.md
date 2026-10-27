@@ -17,6 +17,9 @@ Working now:
   the folder itself; move by default, copy while Shift is held, with the
   pending action shown at the pointer
 - Drops from the operating system, copied into wherever they land
+- Rubber-band selection: drag from empty space to select everything the
+  rectangle touches, with Shift or Ctrl to add
+- An offer, once at startup, to become the desktop's folder handler
 - Right-click menus: Open, Open with, Cut, Copy, Copy path, Rename, Delete and
   Properties on an item; New folder, Paste, Sort by, View, Refresh and Select
   all on the background
@@ -105,6 +108,33 @@ bun run dev:web    # http://127.0.0.1:1420, synthetic filesystem
 
 In that mode `src/lib/mock.ts` supplies a deterministic filesystem, including a
 4,200 entry photo library for exercising the virtualiser.
+
+## Being the default file manager
+
+On Linux, Lyre can register as the handler for `inode/directory`: a `.desktop`
+entry in `~/.local/share/applications` declaring that type, set with
+`xdg-mime default`. Folders then open here whether they come from the desktop or
+from another application. The entry uses `%U`, so the folder arrives as an
+argument and the first tab opens it rather than Home.
+
+The window offers this once at startup. "Never show this again" is stored as a
+preference, and the More menu can turn the offer back on or act on it directly.
+
+Windows and macOS have no equivalent: Explorer and Finder are the shell rather
+than an association, and neither offers a supported way to replace them. The
+prompt says so instead of pretending.
+
+## Frame rate
+
+A file manager does not animate continuously, so "it feels like 60 Hz" is
+usually about scrolling rather than idle frames. **More → Measure frame rate**
+samples the paint loop for 1.2 seconds and reports the median interval, which is
+the only honest way to tell a capped webview from a misperception.
+
+On WebKitGTK, a compositor falling back to software is the usual cause of a
+locked rate. `WEBKIT_DISABLE_DMABUF_RENDERER=1` is the first thing to try with
+NVIDIA drivers; `vblank_mode=0` or `__GL_SYNC_TO_VBLANK=0` affect whether the
+compositor is allowed to exceed the monitor rate.
 
 ## Drag and drop
 

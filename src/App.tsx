@@ -27,6 +27,10 @@ import {
   openWithApp,
   setDefaultApp,
   chooseAppWithSystem,
+  becomeFileManager,
+  fileManagerState,
+  startupFolder,
+  type ManagerState,
   type OpenWith,
   type PathProperties,
 } from "@/lib/ipc";
@@ -36,6 +40,7 @@ import { useReveal } from "@/lib/hooks";
 import { useTheme } from "@/lib/theme";
 import { loadPrefs, savePrefs, type Prefs } from "@/lib/prefs";
 import { targetAt, useDrag, type DragTarget, type DropMode } from "@/lib/dragAndDrop";
+import { measureFrameRate } from "@/lib/frameRate";
 import {
   clearDropHighlight,
   setDropHighlight,
@@ -62,6 +67,7 @@ import { StatusBar } from "@/components/StatusBar";
 import { ContextMenu, type ContextItem } from "@/components/ContextMenu";
 import { PropertiesDialog } from "@/components/PropertiesDialog";
 import { OpenWithDialog } from "@/components/OpenWithDialog";
+import { DefaultManagerPrompt } from "@/components/DefaultManagerPrompt";
 import { Icon } from "@/components/Icons";
 
 let tabSeq = 0;
@@ -156,6 +162,15 @@ function Browser({
   const [tabs, setTabs] = useState<Tab[]>(() => [
     makeTab(homeLocation(home), prefs),
   ]);
+  // A desktop that opens a folder with us passes it as an argument; the first
+  // tab starts there instead of on Home.
+  useEffect(() => {
+    void startupFolder().then((start) => {
+      if (start) navigate(folder(start));
+    });
+    // Once, at startup.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   const [activeId, setActiveId] = useState<string>(tabs[0]!.id);
   const [query, setQuery] = useState("");
   const [navOpen, setNavOpen] = useState(prefs.navOpen);
@@ -170,6 +185,11 @@ function Browser({
   const [driveSelected, setDriveSelected] = useState<string | null>(null);
   const [windowFocused, setWindowFocused] = useState(true);
   const [renaming, setRenaming] = useState<string | null>(null);
+  const [promptDefault, setPromptDefault] = useState(prefs.promptDefaultManager);
+  const [manager, setManager] = useState<ManagerState | null>(null);
+  const [showManagerPrompt, setShowManagerPrompt] = useState(false);
+  const [managerBusy, setManagerBusy] = useState(false);
+  const [managerError, setManagerError] = useState<string | null>(null);
   const [clipboard, setClipboard] = useState<{
     mode: "copy" | "cut";
     paths: string[];
@@ -326,6 +346,7 @@ function Browser({
       navOpen,
       navWidth,
       columns,
+      promptDefaultManager: promptDefault,
     });
   }, [
     active.sort,
@@ -336,7 +357,30 @@ function Browser({
     navOpen,
     navWidth,
     columns,
+    promptDefault,
   ]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fileManagerState()
+      .then((state) => {
+        if (cancelled) return;
+        setManager(state);
+        // Only offer when there is something to offer, and only if the person
+        // has not asked not to be asked.
+        if (!state.isDefault && promptDefault) {
+          setShowManagerPrompt(true);
+        }
+      })
+      .catch(() => {
+        // No answer means no prompt; this must never block the window.
+      });
+    return () => {
+      cancelled = true;
+    };
+    // Read once at startup on purpose.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     const onFocus = () => setWindowFocused(true);
@@ -581,6 +625,36 @@ function Browser({
       clearDropHighlight();
     };
   }, [handleDrop]);
+
+  const acceptManager = useCallback(() => {
+    setManagerBusy(true);
+    setManagerError(null);
+    void becomeFileManager()
+      .then((state) => {
+        setManager(state);
+        setShowManagerPrompt(false);
+        setManagerBusy(false);
+        flash("Folders now open in Lyre");
+      })
+      .catch((error: unknown) => {
+        setManagerBusy(false);
+        setManagerError(
+          error instanceof Error ? error.message : "Could not change the handler.",
+        );
+      });
+  }, [flash]);
+
+  /** Dismissing without accepting still hides it for this run only. */
+  const dismissManager = useCallback(() => setShowManagerPrompt(false), []);
+
+  /** "Never" is a stored preference, so it can be turned back on in the menu. */
+  const neverManager = useCallback(() => {
+    setShowManagerPrompt(false);
+    // The persisted preference is written by the effect that saves the rest of
+    // the view state, so this only has to change the flag.
+    setPromptDefault(false);
+    flash("You can turn this offer back on from the More menu");
+  }, [flash]);
 
   const newFolder = useCallback(() => {
     if (!showsFiles) {
@@ -1270,6 +1344,21 @@ function Browser({
         onRefresh={refresh}
         theme={theme.pref}
         onTheme={theme.setPref}
+        isDefaultManager={manager?.isDefault === true}
+        managerUnsupported={Boolean(manager?.unsupported)}
+        promptDefaultManager={promptDefault}
+        onSetDefaultManager={() => {
+          setManagerError(null);
+          setShowManagerPrompt(true);
+        }}
+        onTogglePromptManager={() => setPromptDefault((value) => !value)}
+        onMeasureFrameRate={() => {
+          void measureFrameRate().then((report) => {
+            flash(
+              `${report.hz} Hz · ${report.frames} frames · median ${report.interval.toFixed(1)} ms · fastest ${report.fastest.toFixed(1)} ms`,
+            );
+          });
+        }}
         notice={flash}
       />
 
@@ -1358,6 +1447,17 @@ function Browser({
           )}
         </main>
       </div>
+
+      {showManagerPrompt && manager ? (
+        <DefaultManagerPrompt
+          state={manager}
+          busy={managerBusy}
+          error={managerError}
+          onAccept={acceptManager}
+          onDismiss={dismissManager}
+          onNever={neverManager}
+        />
+      ) : null}
 
       <div className="drag-badge" hidden ref={drag.badge}>
         <span className="drag-badge-icon" aria-hidden="true" />

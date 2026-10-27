@@ -316,6 +316,40 @@ export async function deleteToTrash(paths: string[]): Promise<number> {
   return invoke<number>("delete_to_trash", { paths });
 }
 
+export interface ManagerState {
+  current: string | null;
+  isDefault: boolean;
+  /** Set when this platform cannot be asked to change the folder handler. */
+  unsupported: string | null;
+  desktopFile: string | null;
+}
+
+export async function fileManagerState(): Promise<ManagerState> {
+  if (!isTauri) {
+    return {
+      current: null,
+      isDefault: false,
+      unsupported: "Making Lyre the folder handler needs the desktop app.",
+      desktopFile: null,
+    };
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<ManagerState>("file_manager_state");
+}
+
+export async function becomeFileManager(): Promise<ManagerState> {
+  if (!isTauri) throw new Error("Needs the desktop app.");
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<ManagerState>("become_file_manager");
+}
+
+/** The folder this process was launched with, when a desktop opened one. */
+export async function startupFolder(): Promise<string | null> {
+  if (!isTauri) return null;
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<string | null>("startup_folder");
+}
+
 export interface OpenWith {
   mime: string;
   defaultApp: string | null;

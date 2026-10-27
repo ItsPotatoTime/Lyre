@@ -149,6 +149,17 @@ export function FileList({
   }, [display, collapsed]);
 
   const [gridColumns, setGridColumns] = useState(1);
+
+  // Rubber-band selection. Started from the empty space, it selects whatever
+  // the rectangle touches; Shift or Ctrl adds to what is already selected.
+  const spacer = useRef<HTMLDivElement>(null);
+  const band = useRef<{ x: number; y: number; base: Set<string> } | null>(null);
+  const [marquee, setMarquee] = useState<{
+    x0: number;
+    y0: number;
+    x1: number;
+    y1: number;
+  } | null>(null);
   const rowCount = rows
     ? rows.length
     : view === "grid"
@@ -288,6 +299,50 @@ export function FileList({
       element.scrollTop = top + rowHeight - element.clientHeight;
     }
   }, [focusedIndex, rowHeight, view, gridColumns, scrolling]);
+
+  useEffect(() => {
+    if (!marquee) return;
+
+    const onMove = (event: PointerEvent) => {
+      const start = band.current;
+      if (!start) return;
+      setMarquee({ x0: start.x, y0: start.y, x1: event.clientX, y1: event.clientY });
+
+      const left = Math.min(start.x, event.clientX);
+      const right = Math.max(start.x, event.clientX);
+      const top = Math.min(start.y, event.clientY);
+      const bottom = Math.max(start.y, event.clientY);
+
+      // Rows are the only thing a band selects; comparing client rectangles
+      // means the list can be scrolled and the maths stays right.
+      const hit = new Set(start.base);
+      const container = scrolling.current;
+      if (container) {
+        for (const row of container.querySelectorAll<HTMLElement>(".row[data-path]")) {
+          const rect = row.getBoundingClientRect();
+          if (rect.right > left && rect.left < right && rect.bottom > top && rect.top < bottom) {
+            const path = row.dataset.path;
+            if (path) hit.add(path);
+          }
+        }
+      }
+      onSelection({ selected: hit, focused: null, anchor: null });
+    };
+
+    const onUp = () => {
+      band.current = null;
+      setMarquee(null);
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", onUp);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", onUp);
+    };
+  }, [marquee, onSelection, scrolling]);
 
   const typeahead = useRef({ buffer: "", at: 0 });
 
@@ -573,18 +628,49 @@ export function FileList({
             }
           }}
           onPointerDown={(event) => {
-            if (event.target === event.currentTarget) {
+            const target = event.target as HTMLElement;
+            if (target.closest(".row, .group, .tile")) return;
+            if (event.button !== 0) return;
+
+            const additive = event.shiftKey || event.ctrlKey || event.metaKey;
+            const base = additive ? new Set(selection.selected) : new Set<string>();
+            if (!additive) {
               onSelection({ selected: new Set(), focused: null, anchor: null });
             }
+            band.current = { x: event.clientX, y: event.clientY, base };
+            setMarquee({
+              x0: event.clientX,
+              y0: event.clientY,
+              x1: event.clientX,
+              y1: event.clientY,
+            });
           }}
         >
           <div
             className={view === "grid" ? "grid-spacer" : "list-spacer"}
+            ref={spacer}
             style={{
               height: rowCount * rowHeight,
               width: view === "grid" ? undefined : tableWidth + 14,
             }}
           >
+            {marquee
+              ? (() => {
+                  const inner = spacer.current?.getBoundingClientRect();
+                  if (!inner) return null;
+                  return (
+                    <div
+                      className="marquee"
+                      style={{
+                        left: Math.min(marquee.x0, marquee.x1) - inner.left,
+                        top: Math.min(marquee.y0, marquee.y1) - inner.top,
+                        width: Math.abs(marquee.x1 - marquee.x0),
+                        height: Math.abs(marquee.y1 - marquee.y0),
+                      }}
+                    />
+                  );
+                })()
+              : null}
             {view === "grid"
               ? entries.slice(firstIndex, lastIndex).map((entry, offset) => {
                   const index = firstIndex + offset;

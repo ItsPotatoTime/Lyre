@@ -38,6 +38,12 @@ export function CommandBar({
   onRefresh,
   theme,
   onTheme,
+  isDefaultManager,
+  managerUnsupported,
+  promptDefaultManager,
+  onSetDefaultManager,
+  onTogglePromptManager,
+  onMeasureFrameRate,
   notice,
 }: {
   view: ViewMode;
@@ -60,6 +66,12 @@ export function CommandBar({
   onRefresh: () => void;
   theme: ThemePref;
   onTheme: (next: ThemePref) => void;
+  isDefaultManager: boolean;
+  managerUnsupported: boolean;
+  promptDefaultManager: boolean;
+  onSetDefaultManager: () => void;
+  onTogglePromptManager: () => void;
+  onMeasureFrameRate: () => void;
   notice: (text: string) => void;
 }) {
   const hasSelection = selectedCount > 0;
@@ -146,6 +158,29 @@ export function CommandBar({
       label: "Copy path",
       disabled: !hasSelection,
       onSelect: onCopyPath,
+    },
+    { kind: "sep" },
+    {
+      kind: "item",
+      id: "default-manager",
+      label: isDefaultManager
+        ? "Lyre is the default file manager"
+        : "Make Lyre the default file manager…",
+      disabled: isDefaultManager || managerUnsupported,
+      onSelect: onSetDefaultManager,
+    },
+    {
+      kind: "item",
+      id: "prompt-manager",
+      label: "Offer to be the default at startup",
+      checked: promptDefaultManager,
+      onSelect: onTogglePromptManager,
+    },
+    {
+      kind: "item",
+      id: "frame-rate",
+      label: "Measure frame rate",
+      onSelect: onMeasureFrameRate,
     },
     { kind: "sep" },
     { kind: "label", text: "Theme" },

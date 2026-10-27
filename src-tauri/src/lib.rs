@@ -4,6 +4,7 @@
 //! ever receives rows it is about to paint. Scans are cancellable, streamed,
 //! and never block the thread the window is waiting on.
 
+mod defaultmanager;
 mod fileops;
 mod openwith;
 mod ops;
@@ -239,6 +240,25 @@ fn apps_for_file(path: String) -> openwith::OpenWith {
     openwith::open_with(&path)
 }
 
+/// Whether this application is the desktop's folder handler, and if not, what
+/// is. Called when the window opens to decide whether to offer the switch.
+#[tauri::command]
+fn file_manager_state() -> defaultmanager::ManagerState {
+    defaultmanager::state()
+}
+
+/// Register as the handler for folders.
+#[tauri::command]
+fn become_file_manager() -> Result<defaultmanager::ManagerState, String> {
+    defaultmanager::make_default()
+}
+
+/// The folder this process was launched with, if it was launched with one.
+#[tauri::command]
+fn startup_folder() -> Option<String> {
+    defaultmanager::startup_path()
+}
+
 /// Show the platform's own application picker, for platforms that protect the
 /// list and the default.
 #[tauri::command]
@@ -362,6 +382,9 @@ pub fn run() {
             delete_to_trash,
             apps_for_file,
             choose_app_with_system,
+            file_manager_state,
+            become_file_manager,
+            startup_folder,
             open_with_app,
             set_default_app
         ])

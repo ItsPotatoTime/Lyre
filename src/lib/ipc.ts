@@ -356,6 +356,8 @@ export interface ManagerState {
   /** Set when this platform cannot be asked to change the folder handler. */
   unsupported: string | null;
   desktopFile: string | null;
+  /** Whether the change can be undone from here. */
+  restoreSupported: boolean;
 }
 
 export async function fileManagerState(): Promise<ManagerState> {
@@ -365,10 +367,17 @@ export async function fileManagerState(): Promise<ManagerState> {
       isDefault: false,
       unsupported: "Making Lyre the folder handler needs the desktop app.",
       desktopFile: null,
+      restoreSupported: false,
     };
   }
   const { invoke } = await import("@tauri-apps/api/core");
   return invoke<ManagerState>("file_manager_state");
+}
+
+export async function restoreFileManager(): Promise<ManagerState> {
+  if (!isTauri) throw new Error("Needs the desktop app.");
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<ManagerState>("restore_file_manager");
 }
 
 export async function becomeFileManager(): Promise<ManagerState> {

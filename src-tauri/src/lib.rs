@@ -321,6 +321,12 @@ fn become_file_manager() -> Result<defaultmanager::ManagerState, String> {
     defaultmanager::make_default()
 }
 
+/// Undo the folder handler change, putting the platform's own back.
+#[tauri::command]
+fn restore_file_manager() -> Result<defaultmanager::ManagerState, String> {
+    defaultmanager::restore()
+}
+
 /// The folder this process was launched with, if it was launched with one.
 #[tauri::command]
 fn startup_folder() -> Option<String> {
@@ -464,6 +470,7 @@ pub fn run() {
             choose_app_with_system,
             file_manager_state,
             become_file_manager,
+            restore_file_manager,
             startup_folder,
             eject_volume,
             drag_icon,

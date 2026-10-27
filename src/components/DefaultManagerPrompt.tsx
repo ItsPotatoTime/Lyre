@@ -23,6 +23,8 @@ export function DefaultManagerPrompt({
   error: string | null;
 }) {
   const unsupported = state.unsupported;
+  // The registry route is real but unusual enough to explain rather than hide.
+  const windows = state.desktopFile === null && !unsupported;
 
   return (
     <div className="prompt" role="dialog" aria-label="Default file manager">
@@ -45,7 +47,9 @@ export function DefaultManagerPrompt({
 
       <p className="prompt-body">
         {unsupported ??
-          "Making Lyre the default means folders open here instead of the previous file manager, whether you double-click one on the desktop or another application asks to browse a folder."}
+          (windows
+            ? "Windows has no setting for this: Explorer is the shell, and folders are part of it rather than a file type that can be associated. The way every third-party file manager does it is to register a folder handler of its own, so double-clicking a folder opens here instead. It changes nothing else, and it can be undone from the More menu."
+            : "Making Lyre the default means folders open here instead of the previous file manager, whether you double-click one on the desktop or another application asks to browse a folder.")}
       </p>
 
       {error ? <p className="prompt-error">{error}</p> : null}
@@ -68,7 +72,7 @@ export function DefaultManagerPrompt({
             onClick={onAccept}
             disabled={busy}
           >
-            {busy ? "Setting…" : "Make Lyre the default"}
+            {busy ? "Setting…" : windows ? "Open folders with Lyre" : "Make Lyre the default"}
           </button>
         )}
         <button type="button" className="prompt-button" onClick={onDismiss} disabled={busy}>

@@ -31,6 +31,7 @@ import {
   chooseAppWithSystem,
   ejectVolume,
   becomeFileManager,
+  restoreFileManager,
   fileManagerState,
   startupFolder,
   type ManagerState,
@@ -756,6 +757,22 @@ function Browser({
   const dismissManager = useCallback(() => setShowManagerPrompt(false), []);
 
   /** "Never" is a stored preference, so it can be turned back on in the menu. */
+  const restoreManager = useCallback(() => {
+    setManagerBusy(true);
+    void restoreFileManager()
+      .then((state) => {
+        setManager(state);
+        setManagerBusy(false);
+        flash("Folders open in the previous file manager again");
+      })
+      .catch((error: unknown) => {
+        setManagerBusy(false);
+        flash(
+          error instanceof Error ? error.message : "Could not undo the change.",
+        );
+      });
+  }, [flash]);
+
   const neverManager = useCallback(() => {
     setShowManagerPrompt(false);
     // The persisted preference is written by the effect that saves the rest of
@@ -1648,6 +1665,10 @@ function Browser({
           setShowManagerPrompt(true);
         }}
         onTogglePromptManager={() => setPromptDefault((value) => !value)}
+        canRestoreFileManager={
+          manager?.isDefault === true && manager?.restoreSupported === true
+        }
+        onRestoreFileManager={restoreManager}
         canRestorePins={
           library.hiddenPins.length > 0 || library.extraPins.length > 0
         }

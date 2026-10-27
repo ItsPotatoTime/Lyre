@@ -44,6 +44,8 @@ export function CommandBar({
   onSetDefaultManager,
   onTogglePromptManager,
   onMeasureFrameRate,
+  canRestoreFileManager,
+  onRestoreFileManager,
   canRestorePins,
   onRestorePins,
   notice,
@@ -74,6 +76,8 @@ export function CommandBar({
   onSetDefaultManager: () => void;
   onTogglePromptManager: () => void;
   onMeasureFrameRate: () => void;
+  canRestoreFileManager: boolean;
+  onRestoreFileManager: () => void;
   canRestorePins: boolean;
   onRestorePins: () => void;
   notice: (text: string) => void;
@@ -168,11 +172,21 @@ export function CommandBar({
       kind: "item",
       id: "default-manager",
       label: isDefaultManager
-        ? "Lyre is the default file manager"
-        : "Set as default file manager…",
+        ? "Folders open with Lyre"
+        : "Open folders with Lyre…",
       disabled: isDefaultManager || managerUnsupported,
       onSelect: onSetDefaultManager,
     },
+    ...(canRestoreFileManager
+      ? ([
+          {
+            kind: "item" as const,
+            id: "restore-manager",
+            label: "Stop opening folders with Lyre",
+            onSelect: onRestoreFileManager,
+          },
+        ])
+      : []),
     {
       kind: "item",
       id: "prompt-manager",

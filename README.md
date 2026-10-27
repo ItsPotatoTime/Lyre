@@ -130,9 +130,21 @@ argument and the first tab opens it rather than Home.
 The window offers this once at startup. "Never show this again" is stored as a
 preference, and the More menu can turn the offer back on or act on it directly.
 
-Windows and macOS have no equivalent: Explorer and Finder are the shell rather
-than an association, and neither offers a supported way to replace them. The
-prompt says so instead of pretending.
+Windows has no equivalent *setting*: Explorer is the shell, and folders are part
+of it rather than a file type that can be associated. What third-party file
+managers do instead, and what Lyre now does, is override the shell's default verb
+for directories and drives. It is a per-user registry change under
+`HKCU\Software\Classes`, so it needs no administrator rights, the stock `open`
+verb is left untouched, and "Stop opening folders with Lyre" in the More menu
+puts it back.
+
+The honest caveats: this is a registry override rather than a supported API, so
+anything that launches Explorer directly still gets Explorer, and a Windows
+update can reset it. Restarting Explorer, or signing out, may be needed before
+the change takes effect.
+
+macOS is the one with no route at all: Finder is the shell and offers nothing
+equivalent.
 
 ## Frame rate
 

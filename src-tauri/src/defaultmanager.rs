@@ -24,6 +24,8 @@ pub struct ManagerState {
     pub unsupported: Option<String>,
     /// Where the desktop entry was, or would be, written.
     pub desktop_file: Option<String>,
+    /// Whether the change can be undone from here.
+    pub restore_supported: bool,
 }
 
 #[cfg(unix)]
@@ -85,7 +87,22 @@ mod linux {
             current,
             unsupported: None,
             desktop_file: desktop_file.map(|path| path.to_string_lossy().into_owned()),
+            restore_supported: true,
         }
+    }
+
+    /// Hand folders back to whatever handled them before: the desktop's own
+    /// default is restored by clearing this application's registration.
+    pub fn restore() -> Result<ManagerState, String> {
+        if let Some(path) = desktop_file() {
+            let _ = std::fs::remove_file(path);
+        }
+        // `xdg-mime` has no "unset"; an empty handler is the documented way to
+        // say that nothing in particular is preferred.
+        let _ = Command::new("xdg-mime")
+            .args(["default", "", "inode/directory"])
+            .status();
+        Ok(state())
     }
 
     pub fn make_default() -> Result<ManagerState, String> {
@@ -136,25 +153,108 @@ mod linux {
 #[cfg(windows)]
 mod platform {
     use super::*;
+    use std::os::windows::process::CommandExt;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    /// The verb this application registers for folders.
+    const VERB: &str = "Lyre.Open";
+
+    /// Windows has no association for folders: Explorer *is* the shell, and
+    /// there is no `inode/directory` equivalent to hand to another program.
+    ///
+    /// What is possible, and what third-party file managers do, is to override
+    /// the *default verb* the shell uses for directories and drives. Double
+    /// clicking a folder then runs the command named there instead. It is done
+    /// per user under HKCU so it needs no administrator rights, and the stock
+    /// `open` verb is left in place so restoring is a matter of pointing the
+    /// default back at it.
+    fn reg(args: &[&str]) -> Result<String, String> {
+        let output = std::process::Command::new("reg")
+            .args(args)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|err| format!("Could not run reg: {err}"))?;
+        let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if output.status.success() {
+            Ok(text)
+        } else {
+            Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+        }
+    }
+
+    fn default_verb(key: &str) -> Option<String> {
+        let text = reg(&["query", key, "/ve"]).ok()?;
+        text.lines().find_map(|line| {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with("(Default)") {
+                return None;
+            }
+            trimmed
+                .split("REG_SZ")
+                .nth(1)
+                .map(|value| value.trim().to_string())
+        })
+    }
 
     pub fn state() -> ManagerState {
+        let current = default_verb(r"HKCU\Software\Classes\Directory\shell");
         ManagerState {
-            current: None,
-            is_default: false,
-            unsupported: Some(
-                "Windows opens folders with Explorer, which is part of the shell rather than an \
-                 application you can replace. File types can be associated with Lyre, but the \
-                 folder handler cannot."
-                    .into(),
-            ),
+            is_default: current.as_deref() == Some(VERB),
+            current,
+            unsupported: None,
             desktop_file: None,
+            restore_supported: true,
         }
     }
 
     pub fn make_default() -> Result<ManagerState, String> {
-        Err(state()
-            .unsupported
-            .unwrap_or_else(|| "Not supported on this platform.".into()))
+        let exe = std::env::current_exe()
+            .map_err(|err| format!("Could not locate this application: {err}"))?;
+        let command = format!("\"{}\" \"%1\"", exe.display());
+
+        reg(&[
+            "add",
+            &format!(r"HKCU\Software\Classes\{VERB}\command"),
+            "/ve",
+            "/d",
+            &command,
+            "/f",
+        ])?;
+
+        // Directories and drives are separate verbs in the shell.
+        for kind in ["Directory", "Drive"] {
+            reg(&[
+                "add",
+                &format!(r"HKCU\Software\Classes\{kind}\shell"),
+                "/ve",
+                "/d",
+                VERB,
+                "/f",
+            ])?;
+        }
+
+        Ok(state())
+    }
+
+    pub fn restore() -> Result<ManagerState, String> {
+        // Point the default back at the shell's own verb, then remove ours.
+        for kind in ["Directory", "Drive"] {
+            reg(&[
+                "add",
+                &format!(r"HKCU\Software\Classes\{kind}\shell"),
+                "/ve",
+                "/d",
+                "open",
+                "/f",
+            ])?;
+        }
+        let _ = reg(&[
+            "delete",
+            &format!(r"HKCU\Software\Classes\{VERB}"),
+            "/f",
+        ]);
+        Ok(state())
     }
 }
 
@@ -209,10 +309,10 @@ pub fn startup_path() -> Option<String> {
 }
 
 #[cfg(target_os = "linux")]
-pub use linux::{make_default, state};
+pub use linux::{make_default, restore, state};
 
 #[cfg(not(target_os = "linux"))]
-pub use platform::{make_default, state};
+pub use platform::{make_default, restore, state};
 
 
 /// Test-only access to the Exec quoting, which is otherwise private to the

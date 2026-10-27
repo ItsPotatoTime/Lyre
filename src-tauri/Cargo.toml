@@ -15,8 +15,10 @@ tauri-build = { version = "2", features = [] }
 
 [features]
 # Production builds embed the frontend instead of loading a development URL.
-# `tauri dev` passes --no-default-features, so development is unaffected.
-default = ["custom-protocol"]
+# Deliberately not a default: `tauri dev` builds without default features, so
+# putting it here made development and `cargo build` two different builds of the
+# same crate sharing one target directory. The release build passes it
+# explicitly, and build.rs refuses to produce one without it.
 custom-protocol = ["tauri/custom-protocol"]
 
 [dependencies]

@@ -276,6 +276,11 @@ if (platform === "windows") {
     "build",
     ...(bundles ? ["--bundles", bundles] : ["--no-bundle"]),
     ...(debug ? ["--debug"] : []),
+    // Embed the frontend. Without it the binary starts and then looks for a
+    // development server, which is a broken app rather than a broken build.
+    "--",
+    "--features",
+    "custom-protocol",
   ];
   const scriptPath = join(localRoot, "lyre-build.cmd");
   const script = [

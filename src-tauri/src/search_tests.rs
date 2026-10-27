@@ -3,7 +3,7 @@
 //! folder answers in milliseconds.
 
 use crate::scan::{self, Entry};
-use crate::search::{search, Index, SearchEvent, SearchRequest};
+use crate::search::{search, CompactEntry, Index, SearchEvent, SearchRequest};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -26,7 +26,10 @@ fn scan_into_index(index: &Index, path: &Path) -> Vec<Entry> {
         }
         true
     });
-    index.store(path, Arc::new(entries.clone()));
+    index.store(
+        path,
+        Arc::new(entries.iter().map(CompactEntry::from).collect()),
+    );
     entries
 }
 

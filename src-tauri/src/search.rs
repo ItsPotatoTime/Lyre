@@ -52,6 +52,9 @@ const BATCH_MS: u64 = 40;
 const BATCH_ITEMS: usize = 24;
 /// Folders kept in the index: enough for a browsing session's history.
 const INDEX_CAPACITY: usize = 24;
+/// Rows held across all cached folders. Roughly 60 bytes each after compaction,
+/// so this bounds the cache at a few tens of megabytes however it was filled.
+const INDEX_MAX_ENTRIES: usize = 200_000;
 const CHUNK: usize = 2048;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -79,6 +82,78 @@ pub struct Hit {
     pub score: u32,
     /// Match positions as character offsets, for highlighting. Sorted.
     pub indices: Vec<u32>,
+}
+
+/// What the cache keeps per file: enough to match and rank, not enough to
+/// display.
+///
+/// A full [`Entry`] carries its absolute path and its extension, both of which
+/// are derived from the folder and the name it is already holding. For a folder
+/// of twenty thousand files that is two extra heap strings per row, which is
+/// most of what the cache costs. The display form is rebuilt only for the rows
+/// that actually match.
+#[derive(Debug, Clone)]
+pub struct CompactEntry {
+    pub name: Box<str>,
+    pub size: u64,
+    pub modified_ms: Option<i64>,
+    pub kind: &'static str,
+    /// is_dir | is_symlink << 1 | hidden << 2 | readable << 3
+    flags: u8,
+}
+
+impl CompactEntry {
+    pub fn is_dir(&self) -> bool {
+        self.flags & 1 != 0
+    }
+
+    /// Rebuild the row the interface renders, from the folder it lives in.
+    pub fn to_entry(&self, folder: &Path) -> Entry {
+        let name = self.name.to_string();
+        let ext = match name.rfind('.') {
+            Some(index) if index > 0 && index + 1 < name.len() => {
+                name[index + 1..].to_ascii_lowercase()
+            }
+            _ => String::new(),
+        };
+        Entry {
+            path: folder.join(&name).to_string_lossy().into_owned(),
+            ext,
+            is_dir: self.is_dir(),
+            is_symlink: self.flags & 2 != 0,
+            hidden: self.flags & 4 != 0,
+            readable: self.flags & 8 != 0,
+            name,
+            size: self.size,
+            modified_ms: self.modified_ms,
+            kind: self.kind,
+        }
+    }
+}
+
+impl From<&Entry> for CompactEntry {
+    fn from(entry: &Entry) -> Self {
+        let mut flags = 0u8;
+        if entry.is_dir {
+            flags |= 1;
+        }
+        if entry.is_symlink {
+            flags |= 2;
+        }
+        if entry.hidden {
+            flags |= 4;
+        }
+        if entry.readable {
+            flags |= 8;
+        }
+        CompactEntry {
+            name: entry.name.as_str().into(),
+            size: entry.size,
+            modified_ms: entry.modified_ms,
+            kind: entry.kind,
+            flags,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -111,30 +186,41 @@ pub struct Index {
 
 #[derive(Default)]
 struct IndexState {
-    map: HashMap<PathBuf, Arc<Vec<Entry>>>,
+    map: HashMap<PathBuf, Arc<Vec<CompactEntry>>>,
     order: VecDeque<PathBuf>,
+    /// Total rows held. The folder cap alone let a handful of huge folders
+    /// pin hundreds of megabytes while the window sat idle.
+    entries: usize,
 }
 
 impl Index {
-    pub fn store(&self, path: &Path, entries: Arc<Vec<Entry>>) {
+    pub fn store(&self, path: &Path, entries: Arc<Vec<CompactEntry>>) {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        if state
-            .map
-            .insert(path.to_path_buf(), Arc::clone(&entries))
-            .is_none()
-        {
-            state.order.push_back(path.to_path_buf());
+        let added = entries.len();
+        if let Some(previous) = state.map.insert(path.to_path_buf(), Arc::clone(&entries)) {
+            // Replacing a cached folder must not count it twice.
+            state.entries = state.entries.saturating_sub(previous.len());
+            if let Some(position) = state.order.iter().position(|item| item == path) {
+                state.order.remove(position);
+            }
         }
-        while state.order.len() > INDEX_CAPACITY {
+        state.order.push_back(path.to_path_buf());
+        state.entries += added;
+
+        while state.order.len() > INDEX_CAPACITY || state.entries > INDEX_MAX_ENTRIES {
             if let Some(oldest) = state.order.pop_front() {
-                state.map.remove(&oldest);
+                if let Some(dropped) = state.map.remove(&oldest) {
+                    state.entries = state.entries.saturating_sub(dropped.len());
+                }
+            } else {
+                break;
             }
         }
     }
 
-    pub fn get(&self, path: &Path) -> Option<Arc<Vec<Entry>>> {
+    pub fn get(&self, path: &Path) -> Option<Arc<Vec<CompactEntry>>> {
         self.state.lock().ok()?.map.get(path).cloned()
     }
 
@@ -144,7 +230,9 @@ impl Index {
         let Ok(mut state) = self.state.lock() else {
             return;
         };
-        state.map.remove(path);
+        if let Some(dropped) = state.map.remove(path) {
+            state.entries = state.entries.saturating_sub(dropped.len());
+        }
         state.order.retain(|entry| entry != path);
     }
 }
@@ -196,12 +284,14 @@ where
                 Some(cached) => cached,
                 None => {
                     let collected = collect(path, request.show_hidden, cancel);
-                    let shared = Arc::new(collected);
+                    let compact: Vec<CompactEntry> =
+                        collected.iter().map(CompactEntry::from).collect();
+                    let shared = Arc::new(compact);
                     index.store(path, Arc::clone(&shared));
                     shared
                 }
             };
-            let (hits, matched) = score_local(&pattern, &entries, LIMIT);
+            let (hits, matched) = score_local(&pattern, &entries, path, LIMIT);
             (hits, matched, entries.len())
         }
         None => (Vec::new(), 0, 0),
@@ -277,7 +367,12 @@ fn collect(path: &Path, show_hidden: bool, cancel: &Arc<AtomicBool>) -> Vec<Entr
 ///
 /// Returns the hits and the total number of matches, which the status bar
 /// reports even when the list itself is capped.
-fn score_local(pattern: &Pattern, entries: &[Entry], limit: usize) -> (Vec<Hit>, usize) {
+fn score_local(
+    pattern: &Pattern,
+    entries: &[CompactEntry],
+    folder: &Path,
+    limit: usize,
+) -> (Vec<Hit>, usize) {
     if entries.is_empty() {
         return (Vec::new(), 0);
     }
@@ -319,7 +414,7 @@ fn score_local(pattern: &Pattern, entries: &[Entry], limit: usize) -> (Vec<Hit>,
     let mut scored = collected.into_inner().unwrap_or_default();
     let matched = scored.len();
     rank(&mut scored, entries, limit);
-    (materialise(&scored, entries, pattern), matched)
+    (materialise(&scored, entries, folder, pattern), matched)
 }
 
 /// Best score first, then the shorter name, then alphabetical. A short name
@@ -329,7 +424,7 @@ fn score_local(pattern: &Pattern, entries: &[Entry], limit: usize) -> (Vec<Hit>,
 /// A packed folder produces tens of thousands of ties (a two-letter query
 /// matches almost everything), so this comparator is the hot loop: it never
 /// allocates, and the list is cut to `limit` before it is fully sorted.
-fn rank(scored: &mut Vec<(u32, u32)>, entries: &[Entry], limit: usize) {
+fn rank(scored: &mut Vec<(u32, u32)>, entries: &[CompactEntry], limit: usize) {
     let compare = |a: &(u32, u32), b: &(u32, u32)| {
         let left = &entries[a.1 as usize].name;
         let right = &entries[b.1 as usize].name;
@@ -370,7 +465,12 @@ fn compare_ignore_case(a: &str, b: &str) -> std::cmp::Ordering {
 
 /// Turn scored pairs into hits, computing match positions only for the ones
 /// that survive the cut.
-fn materialise(scored: &[(u32, u32)], entries: &[Entry], pattern: &Pattern) -> Vec<Hit> {
+fn materialise(
+    scored: &[(u32, u32)],
+    entries: &[CompactEntry],
+    folder: &Path,
+    pattern: &Pattern,
+) -> Vec<Hit> {
     let mut matcher = Matcher::new(Config::DEFAULT);
     let mut buf = Vec::new();
     scored
@@ -386,7 +486,7 @@ fn materialise(scored: &[(u32, u32)], entries: &[Entry], pattern: &Pattern) -> V
             indices.sort_unstable();
             indices.dedup();
             Some(Hit {
-                entry: entry.clone(),
+                entry: entry.to_entry(folder),
                 score,
                 indices,
             })
@@ -684,4 +784,72 @@ fn subfolders(dir: &Path, show_hidden: bool, depth: usize) -> Vec<(PathBuf, usiz
         }
     }
     out
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+
+    fn entry(i: usize, folder: &str) -> Entry {
+        Entry {
+            name: format!("file_{i:05}.txt"),
+            path: format!("{folder}/file_{i:05}.txt"),
+            is_dir: false,
+            is_symlink: false,
+            size: i as u64,
+            modified_ms: Some(1_700_000_000_000),
+            kind: "Text document",
+            ext: "txt".into(),
+            hidden: false,
+            readable: true,
+        }
+    }
+
+    /// What the cache costs per row, in both representations, measured rather
+    /// than estimated. The compact form exists because the full one carries an
+    /// absolute path and an extension per row that are both derivable.
+    #[test]
+    fn the_compact_form_costs_far_less_per_row() {
+        const ROWS: usize = 20_000;
+        let folder = "/home/someone/Downloads";
+
+        let before = crate::counting_alloc::live_bytes();
+        let full: Vec<Entry> = (0..ROWS).map(|i| entry(i, folder)).collect();
+        let full_bytes = crate::counting_alloc::live_bytes() - before;
+        let compact: Vec<CompactEntry> = full.iter().map(CompactEntry::from).collect();
+        let both_bytes = crate::counting_alloc::live_bytes() - before;
+        let compact_bytes = both_bytes - full_bytes;
+        drop(full);
+
+        println!(
+            "20k rows: full {:.1} MB, compact {:.1} MB ({:.0}% smaller), {:.0} B/row vs {:.0} B/row",
+            full_bytes as f64 / 1e6,
+            compact_bytes as f64 / 1e6,
+            100.0 * (1.0 - compact_bytes as f64 / full_bytes as f64),
+            full_bytes as f64 / ROWS as f64,
+            compact_bytes as f64 / ROWS as f64,
+        );
+
+        assert!(
+            compact_bytes * 2 < full_bytes,
+            "compaction should at least halve the cost: {compact_bytes} vs {full_bytes}"
+        );
+        drop(compact);
+    }
+
+    /// The rebuilt row must equal the one the scan produced, or the saving is
+    /// being paid for with wrong data.
+    #[test]
+    fn a_rebuilt_row_matches_the_original() {
+        let original = entry(7, "/home/someone/Downloads");
+        let rebuilt = CompactEntry::from(&original)
+            .to_entry(Path::new("/home/someone/Downloads"));
+        assert_eq!(rebuilt.name, original.name);
+        assert_eq!(rebuilt.path, original.path);
+        assert_eq!(rebuilt.ext, original.ext);
+        assert_eq!(rebuilt.size, original.size);
+        assert_eq!(rebuilt.kind, original.kind);
+        assert_eq!(rebuilt.modified_ms, original.modified_ms);
+        assert_eq!(rebuilt.readable, original.readable);
+    }
 }

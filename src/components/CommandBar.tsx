@@ -46,6 +46,8 @@ export function CommandBar({
   onMeasureFrameRate,
   canRestoreFileManager,
   onRestoreFileManager,
+  reducedMemory,
+  onToggleReducedMemory,
   canRestorePins,
   onRestorePins,
   notice,
@@ -78,6 +80,8 @@ export function CommandBar({
   onMeasureFrameRate: () => void;
   canRestoreFileManager: boolean;
   onRestoreFileManager: () => void;
+  reducedMemory: boolean;
+  onToggleReducedMemory: () => void;
   canRestorePins: boolean;
   onRestorePins: () => void;
   notice: (text: string) => void;
@@ -193,6 +197,13 @@ export function CommandBar({
       label: "Offer this at startup",
       checked: promptDefaultManager,
       onSelect: onTogglePromptManager,
+    },
+    {
+      kind: "item",
+      id: "reduced-memory",
+      label: "Reduce graphics memory (restart)",
+      checked: reducedMemory,
+      onSelect: onToggleReducedMemory,
     },
     {
       kind: "item",

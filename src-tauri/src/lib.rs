@@ -7,11 +7,49 @@
 mod defaultmanager;
 mod eject;
 mod fileops;
+mod graphics;
 mod openwith;
 mod ops;
 mod places;
 mod scan;
 mod search;
+
+/// Counts live heap bytes in tests, so a memory claim can be measured instead
+/// of estimated. Compiled only for the test harness.
+#[cfg(test)]
+mod counting_alloc {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicIsize, Ordering};
+
+    static LIVE: AtomicIsize = AtomicIsize::new(0);
+
+    pub struct Counting;
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            LIVE.fetch_add(layout.size() as isize, Ordering::Relaxed);
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            LIVE.fetch_sub(layout.size() as isize, Ordering::Relaxed);
+            unsafe { System.dealloc(ptr, layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            LIVE.fetch_add(new_size as isize - layout.size() as isize, Ordering::Relaxed);
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    pub fn live_bytes() -> isize {
+        LIVE.load(Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+#[global_allocator]
+static TEST_ALLOCATOR: counting_alloc::Counting = counting_alloc::Counting;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -77,7 +115,9 @@ fn scan_dir(
     std::thread::Builder::new()
         .name("lyre-scan".into())
         .spawn(move || {
-            let mut collected: Vec<scan::Entry> = Vec::new();
+            // Collected in the compact form the cache keeps, so a scan does
+            // not clone every row's path and extension just to index it.
+            let mut collected: Vec<search::CompactEntry> = Vec::new();
             let mut complete = false;
             scan::scan(&path, request.show_hidden, &cancel, |event| {
                 if trace {
@@ -86,7 +126,9 @@ fn scan_dir(
                     }
                 }
                 match &event {
-                    scan::ScanEvent::Batch { entries, .. } => collected.extend(entries.iter().cloned()),
+                    scan::ScanEvent::Batch { entries, .. } => {
+                        collected.extend(entries.iter().map(search::CompactEntry::from))
+                    }
                     scan::ScanEvent::Done { .. } => complete = true,
                     scan::ScanEvent::Failed { .. } => {}
                 }
@@ -262,6 +304,18 @@ fn drag_icon() -> Result<String, String> {
             .map_err(|err| format!("Could not prepare the drag preview: {err}"))?;
     }
     Ok(path.to_string_lossy().into_owned())
+}
+
+/// Whether the reduced-memory graphics path is set, and whether it is active.
+#[tauri::command]
+fn graphics_settings() -> graphics::GraphicsSettings {
+    graphics::state()
+}
+
+/// Turn the reduced-memory graphics path on or off. Needs a restart.
+#[tauri::command]
+fn set_graphics_settings(reduced_memory: bool) -> Result<graphics::GraphicsSettings, String> {
+    graphics::set(reduced_memory)
 }
 
 /// A line of diagnostics from the interface, printed when LYRE_TRACE is set.
@@ -441,6 +495,8 @@ fn dir_stamp(path: String) -> Option<i64> {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Before the webview exists: WebKit reads this once, at initialisation.
+    graphics::apply_at_startup();
     tauri::Builder::default()
         // Lets a drag that reaches the window edge become a real operating
         // system drag, so files can be dropped into other applications.
@@ -475,6 +531,8 @@ pub fn run() {
             eject_volume,
             drag_icon,
             trace,
+            graphics_settings,
+            set_graphics_settings,
             open_with_app,
             set_default_app
         ])

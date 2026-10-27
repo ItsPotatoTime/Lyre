@@ -33,6 +33,8 @@ import {
   becomeFileManager,
   restoreFileManager,
   fileManagerState,
+  graphicsSettings,
+  setGraphicsSettings,
   startupFolder,
   type ManagerState,
   type OpenWith,
@@ -230,6 +232,7 @@ function Browser({
   const [promptDefault, setPromptDefault] = useState(prefs.promptDefaultManager);
   const [library, setLibrary] = useState<Library>(() => loadLibrary());
   const [ejecting, setEjecting] = useState<string | null>(null);
+  const [reducedMemory, setReducedMemory] = useState(false);
   const [pendingPaste, setPendingPaste] = useState<{
     destination: string;
     sources: string[];
@@ -418,6 +421,12 @@ function Browser({
     columns,
     promptDefault,
   ]);
+
+  useEffect(() => {
+    void graphicsSettings()
+      .then((settings) => setReducedMemory(settings.reducedMemory))
+      .catch(() => {});
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -1669,6 +1678,22 @@ function Browser({
           manager?.isDefault === true && manager?.restoreSupported === true
         }
         onRestoreFileManager={restoreManager}
+        reducedMemory={reducedMemory}
+        onToggleReducedMemory={() => {
+          const next = !reducedMemory;
+          void setGraphicsSettings(next)
+            .then((settings) => {
+              setReducedMemory(settings.reducedMemory);
+              flash(
+                settings.needsRestart
+                  ? "Saved. Restart Lyre to apply it."
+                  : "Saved.",
+              );
+            })
+            .catch((error: unknown) =>
+              flash(error instanceof Error ? error.message : "Could not save."),
+            );
+        }}
         canRestorePins={
           library.hiddenPins.length > 0 || library.extraPins.length > 0
         }

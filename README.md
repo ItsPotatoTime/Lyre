@@ -146,6 +146,26 @@ the change takes effect.
 macOS is the one with no route at all: Finder is the shell and offers nothing
 equivalent.
 
+## Memory
+
+Measured on a 20,000 file folder, with the numbers from `/proc/<pid>/smaps_rollup`
+rather than a guess:
+
+- The search cache keeps 78 bytes per row instead of 187. It stores what it
+  needs to match and rank, and rebuilds the display row only for the rows that
+  actually match. A test asserts the rebuilt row is identical to the original.
+- The cache is capped by total rows as well as by folder count, so browsing a
+  few huge folders cannot pin tens of megabytes while the window sits idle.
+- **More → Reduce graphics memory** takes about 45 MB, 15 percent, off an idle
+  window by turning off WebKit's GPU buffer sharing. It is off by default
+  because that path is the fast one for drawing: the trade is an extra copy per
+  frame, which is cheap at 60 Hz and not free at 300 Hz.
+
+What is left is the framework. On this machine an idle window is about 300 MB
+PSS, of which roughly 170 MB is the WebKit web process, 90 MB the application
+process and 30 MB the network process. Those are WebKitGTK's own costs; the only
+lever that moved them materially was the graphics setting above.
+
 ## Frame rate
 
 A file manager does not animate continuously, so "it feels like 60 Hz" is

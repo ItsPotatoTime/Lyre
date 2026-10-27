@@ -331,6 +331,26 @@ export async function deleteToTrash(paths: string[]): Promise<number> {
   return invoke<number>("delete_to_trash", { paths });
 }
 
+export interface GraphicsSettings {
+  reducedMemory: boolean;
+  active: boolean;
+  needsRestart: boolean;
+}
+
+export async function graphicsSettings(): Promise<GraphicsSettings> {
+  if (!isTauri) return { reducedMemory: false, active: false, needsRestart: false };
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<GraphicsSettings>("graphics_settings");
+}
+
+export async function setGraphicsSettings(
+  reducedMemory: boolean,
+): Promise<GraphicsSettings> {
+  if (!isTauri) throw new Error("Needs the desktop app.");
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<GraphicsSettings>("set_graphics_settings", { reducedMemory });
+}
+
 export interface EjectOutcome {
   ejected: boolean;
   steps: string[];

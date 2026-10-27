@@ -1,0 +1,193 @@
+import { useCallback, useEffect, useRef } from "react";
+
+/**
+ * Dragging, driven by pointer events rather than HTML5 drag and drop.
+ *
+ * That is not a stylistic choice. Tauri's native drag handler is the only way
+ * to receive real filesystem paths for a drop coming from the OS, and it
+ * *replaces* WebView2's HTML5 drag/drop handler on Windows, which would leave
+ * internal dragging working on Linux and macOS and dead on Windows. Pointer
+ * events are ours on every platform, and they let us draw the move/copy badge
+ * and the drop highlight exactly.
+ *
+ * What is not covered, because it needs an operating-system drag source that
+ * Tauri does not provide: dragging an item *out* of Lyre, into Explorer, the
+ * desktop, or another Lyre window.
+ */
+
+export type DragTarget =
+  | { kind: "folder"; path: string }
+  | { kind: "tab"; id: string; path: string }
+  | { kind: "background"; path: string };
+
+export type DropMode = "move" | "copy";
+
+/** Movement before a press becomes a drag. Below this a press is a click. */
+const THRESHOLD = 4;
+
+interface DragSession {
+  paths: string[];
+  startX: number;
+  startY: number;
+  active: boolean;
+  target: DragTarget | null;
+  hovered: Element | null;
+  mode: DropMode;
+}
+
+const EMPTY: DragTarget | null = null;
+
+/**
+ * Decide what a point is over, from the `data-drop` attributes the interface
+ * puts on its drop zones. One mechanism covers rows, breadcrumbs, tabs, the
+ * navigation rail and the empty area behind them.
+ */
+export function targetAt(x: number, y: number): DragTarget | null {
+  const element = document.elementFromPoint(x, y);
+  const zone = element?.closest("[data-drop]") as HTMLElement | null;
+  if (!zone) return null;
+
+  const kind = zone.dataset.drop;
+  const path = zone.dataset.path ?? "";
+  if (kind === "folder" && path) return { kind: "folder", path };
+  if (kind === "tab" && path) {
+    return { kind: "tab", id: zone.dataset.tab ?? "", path };
+  }
+  if (kind === "background" && path) return { kind: "background", path };
+  return null;
+}
+
+export function useDrag(
+  onDrop: (target: DragTarget, mode: DropMode, paths: string[]) => void,
+) {
+  const session = useRef<DragSession | null>(null);
+  const badge = useRef<HTMLDivElement>(null);
+  const callback = useRef(onDrop);
+  callback.current = onDrop;
+
+  const paintBadge = useCallback((x: number, y: number, mode: DropMode, count: number) => {
+    const element = badge.current;
+    if (!element) return;
+    element.hidden = false;
+    element.dataset.mode = mode;
+    element.style.transform = `translate(${x + 14}px, ${y + 16}px)`;
+    const label = element.querySelector("[data-role='label']");
+    if (label) {
+      label.textContent = `${mode === "move" ? "Move" : "Copy"} ${count} item${count === 1 ? "" : "s"}`;
+    }
+  }, []);
+
+  const hideBadge = useCallback(() => {
+    if (badge.current) badge.current.hidden = true;
+  }, []);
+
+  const clearHighlight = useCallback(() => {
+    const current = session.current;
+    if (current?.hovered) current.hovered.removeAttribute("data-drop-hover");
+    if (current) current.hovered = null;
+  }, []);
+
+  /** Begin a drag from a press that has already selected its items. */
+  const begin = useCallback(
+    (paths: string[], event: React.PointerEvent) => {
+      if (paths.length === 0) return;
+      session.current = {
+        paths,
+        startX: event.clientX,
+        startY: event.clientY,
+        active: false,
+        target: EMPTY,
+        hovered: null,
+        mode: event.shiftKey ? "copy" : "move",
+      };
+    },
+    [],
+  );
+
+  const cancel = useCallback(() => {
+    clearHighlight();
+    hideBadge();
+    // The body flag drives the cursor for the whole window; leaving it set
+    // would keep the drag cursor after a cancelled drag.
+    delete document.body.dataset.dragging;
+    session.current = null;
+  }, [clearHighlight, hideBadge]);
+
+  useEffect(() => {
+    const onMove = (event: PointerEvent) => {
+      const current = session.current;
+      if (!current) return;
+
+      // Holding Shift switches a drag from moving to copying, and the badge
+      // says which one will happen before the button is released.
+      current.mode = event.shiftKey ? "copy" : "move";
+
+      if (!current.active) {
+        const moved =
+          Math.abs(event.clientX - current.startX) + Math.abs(event.clientY - current.startY);
+        if (moved < THRESHOLD) return;
+        current.active = true;
+      }
+
+      const target = targetAt(event.clientX, event.clientY);
+      // A folder cannot be dropped into itself or into its own subtree.
+      const usable =
+        target && current.paths.some((path) => target.path.startsWith(path))
+          ? null
+          : target;
+
+      current.target = usable;
+
+      const zone = usable ? document.elementFromPoint(event.clientX, event.clientY) : null;
+      const zoneElement = (zone?.closest("[data-drop]") as Element | null) ?? null;
+      if (zoneElement !== current.hovered) {
+        current.hovered?.removeAttribute("data-drop-hover");
+        zoneElement?.setAttribute("data-drop-hover", "");
+        current.hovered = zoneElement;
+      }
+
+      paintBadge(event.clientX, event.clientY, current.mode, current.paths.length);
+      document.body.dataset.dragging = current.mode;
+    };
+
+    const onUp = (event: PointerEvent) => {
+      const current = session.current;
+      if (!current) return;
+      // Clear the highlight while the session still knows which element it
+      // marked; clearing after the reset would leave a ring on screen.
+      clearHighlight();
+      session.current = null;
+      delete document.body.dataset.dragging;
+      hideBadge();
+      if (!current.active) return;
+
+      // Re-run the hit test at the release point: the last pointermove may have
+      // been a few pixels away from where the button actually came up.
+      const target = targetAt(event.clientX, event.clientY);
+      if (!target) return;
+      if (current.paths.some((path) => target.path.startsWith(path))) return;
+      callback.current(target, current.mode, current.paths);
+    };
+
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && session.current) {
+        event.stopPropagation();
+        event.preventDefault();
+        cancel();
+      }
+    };
+
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+    window.addEventListener("pointercancel", cancel);
+    window.addEventListener("keydown", onKey, true);
+    return () => {
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+      window.removeEventListener("pointercancel", cancel);
+      window.removeEventListener("keydown", onKey, true);
+    };
+  }, [cancel, clearHighlight, hideBadge, paintBadge]);
+
+  return { begin, cancel, badge };
+}

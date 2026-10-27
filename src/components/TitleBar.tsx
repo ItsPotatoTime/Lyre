@@ -40,6 +40,12 @@ export function TitleBar({
               key={tab.id}
               className="tab"
               data-active={tab.id === activeId ? "true" : "false"}
+              // A tab whose location is a real folder can receive a drop.
+              data-drop={tab.location.kind === "folder" ? "tab" : undefined}
+              data-tab={tab.location.kind === "folder" ? tab.id : undefined}
+              data-path={
+                tab.location.kind === "folder" ? tab.location.path : undefined
+              }
               onPointerDown={(event) => {
                 if (event.button === 1) {
                   event.preventDefault();

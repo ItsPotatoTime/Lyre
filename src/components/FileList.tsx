@@ -85,6 +85,7 @@ export function FileList({
   onRename,
   onCancelRename,
   onContextMenu,
+  onDragBegin,
   onRetry,
 }: {
   entries: Entry[];
@@ -112,6 +113,8 @@ export function FileList({
   onRename?: (path: string, name: string) => void;
   onCancelRename?: () => void;
   onContextMenu?: (event: React.MouseEvent, entry: Entry | null) => void;
+  /** Called on the press that may become a drag, with the rows to carry. */
+  onDragBegin?: (paths: string[], event: React.PointerEvent) => void;
   onRetry: () => void;
 }) {
   const metrics = metricsFor(density);
@@ -247,11 +250,17 @@ export function FileList({
     (event: React.PointerEvent<HTMLDivElement>, index: number) => {
       if (event.button !== 0) return;
       const entry = entries[index]!;
+      const alreadySelected = selection.selected.has(entry.path);
       if (event.shiftKey && anchorIndex >= 0) selectRange(index, anchorIndex);
       else if (event.ctrlKey || event.metaKey) toggle(entry);
-      else selectSingle(entry);
+      else if (!alreadySelected) selectSingle(entry);
+
+      // Dragging carries the whole selection when the row is part of it, which
+      // is what a person expects after selecting several files.
+      const carried = alreadySelected ? [...selection.selected] : [entry.path];
+      onDragBegin?.(carried, event);
     },
-    [anchorIndex, entries, selectRange, selectSingle, toggle],
+    [anchorIndex, entries, onDragBegin, selectRange, selectSingle, selection.selected, toggle],
   );
 
   const focusIndex = useCallback(
@@ -544,6 +553,8 @@ export function FileList({
         <div
           className={view === "grid" ? "grid" : "list"}
           ref={scrolling}
+          data-drop="background"
+          data-path={path}
           role="listbox"
           aria-label="Folder contents"
           aria-multiselectable="true"
@@ -724,6 +735,7 @@ function DetailRow({
       className="row"
       role="option"
       data-path={entry.path}
+      data-drop={entry.isDir ? "folder" : undefined}
       aria-selected={selected}
       data-selected={selected ? "true" : "false"}
       data-focused={focused ? "true" : "false"}

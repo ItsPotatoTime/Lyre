@@ -65,6 +65,8 @@ export function HomeView({
               key={place.path}
               type="button"
               className="place"
+              data-drop="folder"
+              data-path={place.path}
               onClick={() => onNavigate(place.path)}
             >
               <span className="place-glyph">

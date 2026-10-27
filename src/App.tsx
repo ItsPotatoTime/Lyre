@@ -35,6 +35,12 @@ import { matchIndex, useSearch } from "@/lib/useSearch";
 import { useReveal } from "@/lib/hooks";
 import { useTheme } from "@/lib/theme";
 import { loadPrefs, savePrefs, type Prefs } from "@/lib/prefs";
+import { targetAt, useDrag, type DragTarget, type DropMode } from "@/lib/dragAndDrop";
+import {
+  clearDropHighlight,
+  setDropHighlight,
+  watchExternalDrops,
+} from "@/lib/externalDrag";
 import { windowChrome } from "@/lib/window";
 import { type Mode } from "@/lib/modes";
 import {
@@ -436,6 +442,8 @@ function Browser({
     [patchTab],
   );
 
+  
+
   const copyPath = useCallback(async () => {
     const paths = [...selection.selected];
     if (paths.length === 0) return;
@@ -486,6 +494,93 @@ function Browser({
     },
     [],
   );
+
+  /**
+   * Carry a dropped selection to wherever it landed.
+   *
+   * Every target resolves to a folder path, so one operation covers rows,
+   * breadcrumbs, tabs, the rail and the empty area. Moving into the folder the
+   * item already lives in is filtered out here as well as in Rust, so the
+   * feedback says "nothing to do" instead of reporting a misleading success.
+   */
+  const handleDrop = useCallback(
+    (target: DragTarget, mode: DropMode, paths: string[]) => {
+      const destination = target.path;
+      const sources = paths.filter(
+        (path) =>
+          path !== destination &&
+          !destination.startsWith(`${path}/`) &&
+          !destination.startsWith(`${path}\\`) &&
+          !(mode === "move" && path.slice(0, path.lastIndexOf("/")) === destination),
+      );
+
+      if (sources.length === 0) {
+        flash(
+          mode === "move"
+            ? "Those items are already in that folder."
+            : "Nothing to copy.",
+        );
+        return;
+      }
+
+      void pasteInto(destination, sources, mode === "move" ? "cut" : "copy", {
+        onProgress: (done, total, name) => {
+          if (total > 1) flash(`${mode === "move" ? "Moving" : "Copying"} ${name} (${done + 1} of ${total})`);
+        },
+        onDone: (pasted, skipped) => {
+          refreshAfterChange();
+          flash(
+            skipped.length > 0
+              ? `${mode === "move" ? "Moved" : "Copied"} ${pasted}, ${skipped.length} skipped`
+              : `${mode === "move" ? "Moved" : "Copied"} ${pasted} item${pasted === 1 ? "" : "s"}`,
+          );
+        },
+        onFailed: (message) => flash(message),
+      }).catch((error: unknown) =>
+        flash(error instanceof Error ? error.message : "Could not finish the drop."),
+      );
+
+      // Dropping onto a tab is also a request to look at that tab.
+      if (target.kind === "tab" && target.id) setActiveId(target.id);
+    },
+    [flash, refreshAfterChange],
+  );
+
+  const drag = useDrag(handleDrop);
+
+  /**
+   * Drops from outside the window arrive through Tauri with real paths. They
+   * are always copies: the source may be on another volume or another machine,
+   * and guessing that a drag between two windows means "move" is how people
+   * lose files.
+   */
+  useEffect(() => {
+    let dispose: (() => void) | null = null;
+    let cancelled = false;
+
+    void watchExternalDrops({
+      onOver: (x, y) => setDropHighlight(x, y),
+      onLeave: () => clearDropHighlight(),
+      onDrop: (x, y, paths) => {
+        const target = targetAt(x, y);
+        if (!target || paths.length === 0) return;
+        handleDrop(target, "copy", paths);
+      },
+    })
+      .then((disposeFn) => {
+        if (cancelled) disposeFn();
+        else dispose = disposeFn;
+      })
+      .catch(() => {
+        // No native drop support on this platform; internal dragging still works.
+      });
+
+    return () => {
+      cancelled = true;
+      dispose?.();
+      clearDropHighlight();
+    };
+  }, [handleDrop]);
 
   const newFolder = useCallback(() => {
     if (!showsFiles) {
@@ -1242,6 +1337,7 @@ function Browser({
               editing={renaming}
               onRename={commitRename}
               onCancelRename={() => setRenaming(null)}
+              onDragBegin={drag.begin}
               onContextMenu={(event, entry) => {
                 event.preventDefault();
                 event.stopPropagation();
@@ -1261,6 +1357,11 @@ function Browser({
             />
           )}
         </main>
+      </div>
+
+      <div className="drag-badge" hidden ref={drag.badge}>
+        <span className="drag-badge-icon" aria-hidden="true" />
+        <span data-role="label">Move</span>
       </div>
 
       {context ? (

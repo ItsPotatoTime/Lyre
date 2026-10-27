@@ -13,6 +13,10 @@ through the Rust core and paints whatever it finds.
 
 Working now:
 
+- Drag and drop: onto a folder, a breadcrumb, a tab, the navigation rail, or
+  the folder itself; move by default, copy while Shift is held, with the
+  pending action shown at the pointer
+- Drops from the operating system, copied into wherever they land
 - Right-click menus: Open, Open with, Cut, Copy, Copy path, Rename, Delete and
   Properties on an item; New folder, Paste, Sort by, View, Refresh and Select
   all on the background
@@ -101,6 +105,27 @@ bun run dev:web    # http://127.0.0.1:1420, synthetic filesystem
 
 In that mode `src/lib/mock.ts` supplies a deterministic filesystem, including a
 4,200 entry photo library for exercising the virtualiser.
+
+## Drag and drop
+
+Dragging works onto a folder row, the empty space in a folder, any breadcrumb,
+any tab, and the navigation rail. The pointer carries a badge saying **Move** or
+**Copy**, and holding Shift switches from one to the other; the zone under the
+pointer is outlined in the accent colour.
+
+Moving an item into the folder it already lives in, or a folder into itself, is
+refused rather than quietly turning into a rename.
+
+Internal dragging is driven by pointer events, not HTML5 drag and drop, and that
+is deliberate. Tauri's native drag handler is the only way to receive real
+filesystem paths for a drop arriving from the operating system, and it replaces
+WebView2's HTML5 handler on Windows, which would leave internal dragging working
+everywhere except Windows.
+
+**Not supported: dragging out of Lyre.** Into Explorer, the desktop, or a second
+Lyre window. That needs an operating-system drag source, which Tauri does not
+provide without a plugin. Drops *from* the OS work and are always copies, since
+the source may be on another volume or another machine.
 
 ## Keyboard
 

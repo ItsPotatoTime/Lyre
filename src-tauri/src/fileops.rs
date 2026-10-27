@@ -143,6 +143,17 @@ pub fn paste<F>(
             skipped.push(source.clone());
             continue;
         }
+        // Moving an item into the folder it already lives in would rename it
+        // rather than move it, and moving a folder into itself would destroy
+        // it. Both are refused rather than silently turned into something else.
+        if from.parent() == Some(destination) && mode == Mode::Cut {
+            skipped.push(format!("{} is already here", from.display()));
+            continue;
+        }
+        if destination.starts_with(from) {
+            skipped.push(format!("{} cannot go inside itself", from.display()));
+            continue;
+        }
         let name = from
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -413,6 +424,41 @@ mod tests {
             "the original keeps its name"
         );
         assert_eq!(fs::read(dir.join("keep (2).txt")).unwrap(), b"keep");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn moving_an_item_into_its_own_folder_is_refused() {
+        // A drag that lands on the folder it came from must do nothing, not
+        // quietly rename the file to "keep (2).txt".
+        let dir = scratch("move-self");
+        let source = dir.join("keep.txt");
+        fs::write(&source, b"keep").unwrap();
+
+        let (pasted, skipped) = run_paste(&dir, &[source.to_string_lossy().into_owned()], Mode::Cut);
+        assert_eq!(pasted, 0, "nothing should move");
+        assert_eq!(skipped.len(), 1);
+        assert!(source.exists());
+        assert!(!dir.join("keep (2).txt").exists(), "no renamed duplicate");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_folder_cannot_be_moved_inside_itself() {
+        let dir = scratch("move-into-self");
+        let outer = dir.join("outer");
+        let inner = outer.join("inner");
+        fs::create_dir_all(&inner).unwrap();
+        fs::write(inner.join("file.txt"), b"x").unwrap();
+
+        // Dropping "outer" onto "outer/inner" must be refused.
+        let (pasted, skipped) = run_paste(&inner, &[outer.to_string_lossy().into_owned()], Mode::Cut);
+        assert_eq!(pasted, 0);
+        assert_eq!(skipped.len(), 1);
+        assert!(inner.join("file.txt").exists(), "the tree is untouched");
+        assert!(!inner.join("outer").exists(), "no copy was made inside itself");
 
         fs::remove_dir_all(&dir).ok();
     }

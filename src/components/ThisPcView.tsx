@@ -56,6 +56,8 @@ export function ThisPcView({
                 key={volume.path}
                 type="button"
                 className="drive-card"
+                data-drop="folder"
+                data-path={volume.path}
                 data-selected={selected === volume.path ? "true" : "false"}
                 onClick={() => onSelect(volume.path)}
                 onDoubleClick={() => onOpen(volume.path)}

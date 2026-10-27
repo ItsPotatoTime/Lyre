@@ -186,6 +186,8 @@ export function AddressBar({
                       type="button"
                       className="crumb"
                       title={segment.path}
+                      data-drop="folder"
+                      data-path={segment.path}
                       onClick={() =>
                         onNavigate({ kind: "folder", path: segment.path })
                       }

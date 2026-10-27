@@ -85,6 +85,7 @@ export function NavRail({
                 location.kind === "folder" && location.path === place.path
               }
               pinned
+              dropPath={place.path}
               onClick={() => onNavigate(folder(place.path))}
             />
           ))}
@@ -111,6 +112,7 @@ export function NavRail({
                   active={
                     location.kind === "folder" && location.path === volume.path
                   }
+                  dropPath={volume.path}
                   onClick={() => onNavigate(folder(volume.path))}
                 />
               ))
@@ -146,6 +148,7 @@ function NavRow({
   child = false,
   twisty,
   onTwisty,
+  dropPath,
   onClick,
 }: {
   glyph: React.ReactNode;
@@ -155,6 +158,8 @@ function NavRow({
   child?: boolean;
   twisty?: boolean;
   onTwisty?: () => void;
+  /** Set when this row names a real folder that can receive a drop. */
+  dropPath?: string;
   onClick: () => void;
 }) {
   return (
@@ -182,6 +187,8 @@ function NavRow({
       <button
         type="button"
         onClick={onClick}
+        data-drop={dropPath ? "folder" : undefined}
+        data-path={dropPath ?? undefined}
         style={{
           display: "flex",
           alignItems: "center",

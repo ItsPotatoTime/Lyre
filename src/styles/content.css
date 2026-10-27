@@ -988,3 +988,68 @@
   opacity: 0.5;
   pointer-events: none;
 }
+
+/* Drag and drop ------------------------------------------------------------ */
+
+/* While a drag runs, nothing inside the window is a drop target for text, and
+   the pointer keeps the arrow rather than turning into an I-beam. */
+body[data-dragging] {
+  cursor: default;
+}
+
+body[data-dragging] * {
+  cursor: inherit;
+}
+
+/* The zone the drop would land on. Drawn as a ring, not a fill, so the row's
+   own selection colour stays readable underneath. */
+[data-drop-hover] {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+  border-radius: var(--radius-control);
+}
+
+.row[data-drop-hover]::before,
+[data-drop-hover].place,
+[data-drop-hover].nav-item {
+  background: color-mix(in srgb, var(--accent) 14%, transparent);
+}
+
+.drag-badge {
+  position: fixed;
+  top: 0;
+  left: 0;
+  z-index: 100;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 10px 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: var(--bg-raised);
+  box-shadow: var(--shadow-popup);
+  font-size: var(--text-caption);
+  color: var(--text-primary);
+  pointer-events: none;
+  white-space: nowrap;
+}
+
+.drag-badge[hidden] {
+  display: none;
+}
+
+.drag-badge-icon {
+  width: 12px;
+  height: 12px;
+  border-radius: 2px;
+  background: currentColor;
+  opacity: 0.75;
+}
+
+/* A move is one sheet; a copy is a plus, so the two read differently at a
+   glance and not only by the word. */
+.drag-badge[data-mode="copy"] .drag-badge-icon {
+  background: transparent;
+  border: 1.5px solid currentColor;
+  box-shadow: 3px -3px 0 -1px var(--bg-raised), 3px -3px 0 0 currentColor;
+}

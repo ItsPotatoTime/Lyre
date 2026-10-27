@@ -517,7 +517,10 @@ export function FileList({
           ))}
         </div>
       ) : showEmpty ? (
-        <div className="state">
+        <div
+          className="state"
+          onContextMenu={(event) => onContextMenu?.(event, null)}
+        >
           <Icon name="folder" size={36} strokeWidth={1} />
           {filtering ? (
             <>
@@ -551,7 +554,10 @@ export function FileList({
               : ({ ["--row-h" as string]: `${rowHeight}px` } as React.CSSProperties)
           }
           onContextMenu={(event) => {
-            if (event.target === event.currentTarget) {
+            // The empty space under the rows is the spacer, not the scroller,
+            // so anything that is not part of a row counts as background.
+            const target = event.target as HTMLElement | null;
+            if (!target?.closest(".row, .group, .tile")) {
               onContextMenu?.(event, null);
             }
           }}

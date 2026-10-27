@@ -13,8 +13,11 @@ through the Rust core and paints whatever it finds.
 
 Working now:
 
-- Right-click menus: Open, Open in new tab, Copy path, Rename, Properties on an
-  item; New folder, Sort by, View, Refresh, Select all on the background
+- Right-click menus: Open, Open with, Cut, Copy, Copy path, Rename, Delete and
+  Properties on an item; New folder, Paste, Sort by, View, Refresh and Select
+  all on the background
+- Copy, cut, paste and delete to the system trash
+- Open a file with any application that declares support, and make it the default
 - Creating a folder (Ctrl+Shift+N) and renaming in place (F2)
 - Properties dialog (Alt+Enter)
 - Directory listing with a parallel, streamed Rust scanner
@@ -33,9 +36,13 @@ Working now:
   subfolder streaming in behind them, ranked by relevance with the matched
   letters emphasised
 
-Not implemented yet, and honest about it in the interface: copy, cut, paste,
-rename, delete, share, new folder, drag and drop, file contents search,
-thumbnails, context menus and the preview pane.
+Not implemented yet, and honest about it in the interface: share, drag and drop,
+file contents search, thumbnails and the preview pane.
+
+Copy, move and delete never overwrite. A paste onto an existing name becomes
+"name (2)", and delete moves to the freedesktop trash, which the desktop can put
+back. Choosing an application is implemented on Linux, through the desktop's own
+MIME database; elsewhere the dialog says so rather than guessing.
 
 ## Running it
 
@@ -85,6 +92,8 @@ Explorer's shortcuts, as far as this build can honestly honour them.
 | `Ctrl+Shift+N` | New folder |
 | `Alt+Enter` | Properties |
 | `Ctrl+Shift+C` | Copy path |
+| `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy, cut, paste |
+| `Delete` | Move to the trash |
 | `Shift+F10` | Context menu at the selection |
 | `Ctrl+Shift+2` / `Ctrl+Shift+6` | Large icons, details |
 | `Ctrl+A`, `Shift+arrows`, `Ctrl+click`, `Shift+click` | Selection |
@@ -93,12 +102,10 @@ Explorer's shortcuts, as far as this build can honestly honour them.
 | `Escape` | Clear selection, close a menu |
 | typing | Jump to a name |
 
-Deliberately absent, because the feature behind them does not exist yet: `Ctrl+C`
-/ `Ctrl+X` / `Ctrl+V`, `Delete`, `Ctrl+Z` / `Ctrl+Y`, `Ctrl+N` (a second window),
-`Ctrl+D` / `Alt+Z` (pinning), `Alt+P` (preview pane), `F6`, and the view sizes we
-do not render (`Ctrl+Shift+1/3/4/5/7/8`). The context menu shows cut, copy and
-delete greyed out with the reason, rather than looking functional and doing
-nothing.
+Deliberately absent, because the feature behind them does not exist yet:
+`Ctrl+Z` / `Ctrl+Y` (no undo history), `Ctrl+N` (a second window), `Ctrl+D` /
+`Alt+Z` (pinning), `Alt+P` (preview pane), `F6`, and the view sizes we do not
+render (`Ctrl+Shift+1/3/4/5/7/8`).
 
 ## How it is fast
 

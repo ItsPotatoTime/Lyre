@@ -4,6 +4,8 @@
 //! ever receives rows it is about to paint. Scans are cancellable, streamed,
 //! and never block the thread the window is waiting on.
 
+mod fileops;
+mod openwith;
 mod ops;
 mod places;
 mod scan;
@@ -185,6 +187,70 @@ fn rename_path(
     Ok(renamed)
 }
 
+/// Paste copied or cut entries into a folder, streaming progress.
+#[tauri::command]
+fn paste_into(
+    state: State<'_, AppState>,
+    destination: String,
+    sources: Vec<String>,
+    mode: fileops::Mode,
+    on_event: Channel<fileops::PasteEvent>,
+) -> Result<u64, String> {
+    let (id, cancel) = state.begin();
+    let index = Arc::clone(&state.index);
+    let destination_for_cache = destination.clone();
+    let sources_for_cache = sources.clone();
+
+    std::thread::Builder::new()
+        .name("lyre-paste".into())
+        .spawn(move || {
+            fileops::paste(&destination, &sources, mode, &cancel, |event| {
+                on_event.send(event).is_ok()
+            });
+            // Both ends changed: the destination gained rows and, when moving,
+            // the source folders lost them.
+            index.forget(std::path::Path::new(&destination_for_cache));
+            for source in sources_for_cache {
+                if let Some(parent) = std::path::Path::new(&source).parent() {
+                    index.forget(parent);
+                }
+            }
+        })
+        .map_err(|err| format!("Could not start the paste: {err}"))?;
+
+    Ok(id)
+}
+
+/// Move entries to the trash and report how many went.
+#[tauri::command]
+fn delete_to_trash(state: State<'_, AppState>, paths: Vec<String>) -> Result<usize, String> {
+    let moved = fileops::delete_to_trash(&paths)?;
+    for path in &paths {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            state.index.forget(parent);
+        }
+    }
+    Ok(moved)
+}
+
+/// Which applications can open this file, and which one currently does.
+#[tauri::command]
+fn apps_for_file(path: String) -> openwith::OpenWith {
+    openwith::open_with(&path)
+}
+
+/// Open this file with a specific application.
+#[tauri::command]
+fn open_with_app(path: String, app_id: String) -> Result<(), String> {
+    openwith::open_with_app(&path, &app_id)
+}
+
+/// Make an application the default for this file's type.
+#[tauri::command]
+fn set_default_app(path: String, app_id: String) -> Result<String, String> {
+    openwith::set_default_app(&path, &app_id)
+}
+
 /// Everything the properties dialog shows for one item.
 #[tauri::command]
 fn path_properties(path: String) -> Result<ops::Properties, String> {
@@ -284,7 +350,12 @@ pub fn run() {
             open_path,
             create_folder,
             rename_path,
-            path_properties
+            path_properties,
+            paste_into,
+            delete_to_trash,
+            apps_for_file,
+            open_with_app,
+            set_default_app
         ])
         .run(tauri::generate_context!())
         .expect("error while running Lyre");

@@ -244,6 +244,106 @@ export async function pathProperties(path: string): Promise<PathProperties> {
   return invoke<PathProperties>("path_properties", { path });
 }
 
+export interface PasteHandlers {
+  onProgress: (done: number, total: number, name: string) => void;
+  onDone: (pasted: number, skipped: string[]) => void;
+  onFailed: (message: string) => void;
+}
+
+/**
+ * Paste copied or cut entries into a folder.
+ *
+ * The paste never overwrites: a name that already exists gets a numbered
+ * sibling. Progress arrives per item, so a large folder shows movement.
+ */
+export async function pasteInto(
+  destination: string,
+  sources: string[],
+  mode: "copy" | "cut",
+  handlers: PasteHandlers,
+): Promise<ScanHandle> {
+  if (!isTauri) {
+    throw new Error("Clipboard operations need the desktop app, not the browser preview.");
+  }
+  const { Channel, invoke } = await import("@tauri-apps/api/core");
+  const channel = new Channel<
+    | { type: "progress"; done: number; total: number; name: string }
+    | { type: "done"; pasted: number; skipped: string[] }
+    | { type: "failed"; message: string }
+  >();
+  let jobId: number | null = null;
+  let cancelled = false;
+
+  channel.onmessage = (event) => {
+    if (cancelled) return;
+    if (event.type === "progress") {
+      handlers.onProgress(event.done, event.total, event.name);
+    } else if (event.type === "done") {
+      handlers.onDone(event.pasted, event.skipped);
+    } else {
+      handlers.onFailed(event.message);
+    }
+  };
+
+  try {
+    jobId = await invoke<number>("paste_into", {
+      destination,
+      sources,
+      mode,
+      onEvent: channel,
+    });
+  } catch (error) {
+    handlers.onFailed(describe(error));
+  }
+
+  return {
+    cancel: () => {
+      cancelled = true;
+      if (jobId !== null) {
+        void invoke("cancel_job", { id: jobId });
+        void invoke("release_job", { id: jobId });
+      }
+    },
+  };
+}
+
+/** Move entries to the operating system's trash. Returns how many went. */
+export async function deleteToTrash(paths: string[]): Promise<number> {
+  if (!isTauri) {
+    throw new Error("Deleting needs the desktop app, not the browser preview.");
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<number>("delete_to_trash", { paths });
+}
+
+export interface OpenWith {
+  mime: string;
+  defaultApp: string | null;
+  apps: { id: string; name: string }[];
+  /** Set when this platform cannot answer, with the reason. */
+  unsupported: string | null;
+}
+
+export async function appsForFile(path: string): Promise<OpenWith> {
+  if (!isTauri) {
+    throw new Error("Choosing an application needs the desktop app, not the browser preview.");
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<OpenWith>("apps_for_file", { path });
+}
+
+export async function openWithApp(path: string, appId: string): Promise<void> {
+  if (!isTauri) throw new Error("Needs the desktop app.");
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("open_with_app", { path, appId });
+}
+
+export async function setDefaultApp(path: string, appId: string): Promise<string> {
+  if (!isTauri) throw new Error("Needs the desktop app.");
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<string>("set_default_app", { path, appId });
+}
+
 function describe(error: unknown): string {
   if (typeof error === "string") return error;
   if (error instanceof Error) return error.message;

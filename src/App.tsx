@@ -15,12 +15,18 @@ import type {
 import {
   isTauri,
   createFolder,
+  deleteToTrash,
+  pasteInto,
   getHomeDir,
   getPathInfo,
   getPlaces,
   openPath,
   pathProperties,
   renamePath,
+  appsForFile,
+  openWithApp,
+  setDefaultApp,
+  type OpenWith,
   type PathProperties,
 } from "@/lib/ipc";
 import { useDirectory } from "@/lib/useDirectory";
@@ -47,6 +53,7 @@ import { ThisPcView } from "@/components/ThisPcView";
 import { StatusBar } from "@/components/StatusBar";
 import { ContextMenu, type ContextItem } from "@/components/ContextMenu";
 import { PropertiesDialog } from "@/components/PropertiesDialog";
+import { OpenWithDialog } from "@/components/OpenWithDialog";
 import { Icon } from "@/components/Icons";
 
 let tabSeq = 0;
@@ -153,7 +160,19 @@ function Browser({
   const [driveSelected, setDriveSelected] = useState<string | null>(null);
   const [windowFocused, setWindowFocused] = useState(true);
   const [renaming, setRenaming] = useState<string | null>(null);
+  const [clipboard, setClipboard] = useState<{
+    mode: "copy" | "cut";
+    paths: string[];
+  } | null>(null);
   const [properties, setProperties] = useState<PathProperties | null>(null);
+  const [openWith, setOpenWith] = useState<{
+    path: string;
+    name: string;
+    isDir: boolean;
+    data: OpenWith | null;
+    busy: boolean;
+    error: string | null;
+  } | null>(null);
   const [context, setContext] = useState<{
     x: number;
     y: number;
@@ -448,6 +467,132 @@ function Browser({
       );
   }, [flash, location.path, refreshAfterChange, showsFiles]);
 
+  const selectionPaths = useCallback(
+    () => [...selection.selected],
+    [selection.selected],
+  );
+
+  const copySelection = useCallback(
+    (mode: "copy" | "cut") => {
+      const paths = selectionPaths();
+      if (paths.length === 0) {
+        flash("Select something to " + (mode === "copy" ? "copy." : "cut."));
+        return;
+      }
+      setClipboard({ mode, paths });
+      flash(
+        `${mode === "copy" ? "Copied" : "Cut"} ${paths.length} item${paths.length === 1 ? "" : "s"}`,
+      );
+    },
+    [flash, selectionPaths],
+  );
+
+  const pasteHere = useCallback(() => {
+    if (!clipboard) {
+      flash("Nothing to paste.");
+      return;
+    }
+    if (!showsFiles) {
+      flash("Open a folder to paste into.");
+      return;
+    }
+    void pasteInto(location.path, clipboard.paths, clipboard.mode, {
+      onProgress: (done, total, name) => {
+        if (total > 1) flash(`Pasting ${name} (${done + 1} of ${total})`);
+      },
+      onDone: (pasted, skipped) => {
+        refreshAfterChange();
+        if (clipboard.mode === "cut") setClipboard(null);
+        flash(
+          skipped.length > 0
+            ? `Pasted ${pasted}, ${skipped.length} could not be copied`
+            : `Pasted ${pasted} item${pasted === 1 ? "" : "s"}`,
+        );
+      },
+      onFailed: (message) => flash(message),
+    }).catch((error: unknown) =>
+      flash(error instanceof Error ? error.message : "Could not paste."),
+    );
+  }, [clipboard, flash, location.path, refreshAfterChange, showsFiles]);
+
+  const beginOpenWith = useCallback(
+    (entry: Entry) => {
+      setOpenWith({
+        path: entry.path,
+        name: entry.name,
+        isDir: entry.isDir,
+        data: null,
+        busy: false,
+        error: null,
+      });
+      void appsForFile(entry.path)
+        .then((data) =>
+          setOpenWith((prev) => (prev ? { ...prev, data } : prev)),
+        )
+        .catch((error: unknown) =>
+          setOpenWith((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  error:
+                    error instanceof Error
+                      ? error.message
+                      : "Could not read the applications.",
+                }
+              : prev,
+          ),
+        );
+    },
+    [],
+  );
+
+  const launchWith = useCallback(
+    (appId: string, remember: boolean) => {
+      if (!openWith) return;
+      const { path } = openWith;
+      setOpenWith((prev) => (prev ? { ...prev, busy: true, error: null } : prev));
+      const run = remember ? setDefaultApp(path, appId) : Promise.resolve(null);
+      void run
+        .then(() => openWithApp(path, appId))
+        .then(() => {
+          setOpenWith(null);
+          flash(
+            remember ? "Opened, and remembered as the default" : "Opened",
+          );
+        })
+        .catch((error: unknown) => {
+          setOpenWith((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  busy: false,
+                  error:
+                    error instanceof Error ? error.message : "Could not open.",
+                }
+              : prev,
+          );
+        });
+    },
+    [flash, openWith],
+  );
+
+  const deleteSelection = useCallback(() => {
+    const paths = selectionPaths();
+    if (paths.length === 0) {
+      flash("Select something to delete.");
+      return;
+    }
+    void deleteToTrash(paths)
+      .then((moved) => {
+        resetSelection();
+        refreshAfterChange();
+        flash(`Moved ${moved} item${moved === 1 ? "" : "s"} to the trash`);
+      })
+      .catch((error: unknown) =>
+        flash(error instanceof Error ? error.message : "Could not delete."),
+      );
+  }, [flash, refreshAfterChange, resetSelection, selectionPaths]);
+
   const beginRename = useCallback(() => {
     const target = selection.focused;
     if (!target || selection.selected.size !== 1) {
@@ -505,18 +650,15 @@ function Browser({
 
   const contextItems = useCallback(
     (entry: Entry | null): ContextItem[] => {
-      const disabledOps = (): ContextItem[] => [
+      const editOps = (): ContextItem[] => [
         { kind: "sep" },
-        { kind: "label", text: "Needs file operations" },
         {
           kind: "item",
           id: "cut",
           label: "Cut",
           icon: "cut",
           shortcut: "Ctrl+X",
-          disabled: true,
-          note: "Arrives with file operations.",
-          onSelect: () => {},
+          onSelect: () => copySelection("cut"),
         },
         {
           kind: "item",
@@ -524,9 +666,7 @@ function Browser({
           label: "Copy",
           icon: "copy",
           shortcut: "Ctrl+C",
-          disabled: true,
-          note: "Arrives with file operations.",
-          onSelect: () => {},
+          onSelect: () => copySelection("copy"),
         },
         {
           kind: "item",
@@ -534,9 +674,7 @@ function Browser({
           label: "Delete",
           icon: "trash",
           shortcut: "Delete",
-          disabled: true,
-          note: "Arrives with file operations, and needs a trash to be safe.",
-          onSelect: () => {},
+          onSelect: deleteSelection,
         },
       ];
 
@@ -549,6 +687,16 @@ function Browser({
             icon: "folderPlus",
             shortcut: "Ctrl+Shift+N",
             onSelect: newFolder,
+          },
+          {
+            kind: "item",
+            id: "paste",
+            label: "Paste",
+            icon: "paste",
+            shortcut: "Ctrl+V",
+            disabled: !clipboard,
+            note: "Copy or cut something first.",
+            onSelect: pasteHere,
           },
           { kind: "sep" },
           { kind: "label", text: "Sort by" },
@@ -616,13 +764,28 @@ function Browser({
           shortcut: "Enter",
           onSelect: () => onOpen(entry),
         },
-        {
-          kind: "item",
-          id: "open-tab",
-          label: "Open in new tab",
-          onSelect: () =>
-            openInNewTab(entry.isDir ? folder(entry.path) : location),
-        },
+        // Only folders can be opened in a tab; a file has no listing to show.
+        ...(entry.isDir
+          ? [
+              {
+                kind: "item" as const,
+                id: "open-tab",
+                label: "Open in new tab",
+                onSelect: () => openInNewTab(folder(entry.path)),
+              },
+            ]
+          : []),
+        // Only files have an application to choose; a folder opens itself.
+        ...(entry.isDir
+          ? []
+          : [
+              {
+                kind: "item" as const,
+                id: "open-with",
+                label: "Open with…",
+                onSelect: () => beginOpenWith(entry),
+              },
+            ]),
         { kind: "sep" },
         {
           kind: "item",
@@ -639,7 +802,7 @@ function Browser({
           shortcut: "F2",
           onSelect: beginRename,
         },
-        ...disabledOps(),
+        ...editOps(),
         { kind: "sep" },
         {
           kind: "item",
@@ -654,9 +817,14 @@ function Browser({
       active.sort.dir,
       active.sort.key,
       active.view,
+      beginOpenWith,
       beginRename,
+      clipboard,
       copyPath,
+      copySelection,
+      deleteSelection,
       location.path,
+      pasteHere,
       newFolder,
       onOpen,
       openInNewTab,
@@ -768,6 +936,18 @@ function Browser({
             event.preventDefault();
             focusSearch();
             return;
+          case "c":
+            event.preventDefault();
+            copySelection("copy");
+            return;
+          case "x":
+            event.preventDefault();
+            copySelection("cut");
+            return;
+          case "v":
+            event.preventDefault();
+            pasteHere();
+            return;
           case "tab":
             event.preventDefault();
             cycleTab(1);
@@ -808,6 +988,11 @@ function Browser({
         return;
       }
 
+      if (event.key === "Delete" && !typing && selection.selected.size > 0) {
+        event.preventDefault();
+        deleteSelection();
+        return;
+      }
       if (event.key === "F2" && !typing) {
         event.preventDefault();
         beginRename();
@@ -842,7 +1027,11 @@ function Browser({
     beginRename,
     closeTab,
     copyPath,
+    copySelection,
     cycleTab,
+    deleteSelection,
+    pasteHere,
+    selection.selected.size,
     focusSearch,
     goBack,
     goForward,
@@ -1061,6 +1250,18 @@ function Browser({
           y={context.y}
           items={contextItems(context.entry)}
           onClose={() => setContext(null)}
+        />
+      ) : null}
+
+      {openWith ? (
+        <OpenWithDialog
+          fileName={openWith.name}
+          isDir={openWith.isDir}
+          data={openWith.data}
+          busy={openWith.busy}
+          error={openWith.error}
+          onOpen={launchWith}
+          onCancel={() => setOpenWith(null)}
         />
       ) : null}
 

@@ -316,6 +316,25 @@ export async function deleteToTrash(paths: string[]): Promise<number> {
   return invoke<number>("delete_to_trash", { paths });
 }
 
+export interface EjectOutcome {
+  ejected: boolean;
+  steps: string[];
+  error: string | null;
+}
+
+/** Unmount a removable volume and power the device down. */
+export async function ejectVolume(path: string): Promise<EjectOutcome> {
+  if (!isTauri) {
+    return {
+      ejected: false,
+      steps: [],
+      error: "Ejecting needs the desktop app, not the browser preview.",
+    };
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<EjectOutcome>("eject_volume", { path });
+}
+
 export interface ManagerState {
   current: string | null;
   isDefault: boolean;

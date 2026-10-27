@@ -44,6 +44,8 @@ export function CommandBar({
   onSetDefaultManager,
   onTogglePromptManager,
   onMeasureFrameRate,
+  canRestorePins,
+  onRestorePins,
   notice,
 }: {
   view: ViewMode;
@@ -72,6 +74,8 @@ export function CommandBar({
   onSetDefaultManager: () => void;
   onTogglePromptManager: () => void;
   onMeasureFrameRate: () => void;
+  canRestorePins: boolean;
+  onRestorePins: () => void;
   notice: (text: string) => void;
 }) {
   const hasSelection = selectedCount > 0;
@@ -182,6 +186,16 @@ export function CommandBar({
       label: "Measure frame rate",
       onSelect: onMeasureFrameRate,
     },
+    ...(canRestorePins
+      ? ([
+          {
+            kind: "item" as const,
+            id: "restore-pins",
+            label: "Restore sidebar folders",
+            onSelect: onRestorePins,
+          },
+        ])
+      : []),
     { kind: "sep" },
     { kind: "label", text: "Theme" },
     {

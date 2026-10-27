@@ -11,6 +11,13 @@ const GLYPHS = {
   chevronDown: <path d="M5.5 8.5 10 13l4.5-4.5" />,
   chevronRight: <path d="M8.5 5.5 13 10l-4.5 4.5" />,
   chevronUp: <path d="M5.5 11.5 10 7l4.5 4.5" />,
+  // A triangle over a bar: the eject glyph every desktop uses.
+  eject: (
+    <>
+      <path d="M10 3.6 15.4 10H4.6L10 3.6Z" />
+      <path d="M4.6 13.2h10.8v2.6H4.6z" />
+    </>
+  ),
   chevronLeft: <path d="M11.5 5.5 7 10l4.5 4.5" />,
   arrowLeft: <path d="M4 10h12M9 5l-5 5 5 5" />,
   arrowRight: <path d="M16 10H4M11 5l5 5-5 5" />,

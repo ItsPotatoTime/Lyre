@@ -30,12 +30,17 @@ function FavoritesArt() {
  */
 export function HomeView({
   places,
+  favorites,
   onNavigate,
   onUnavailable,
+  onContextMenu,
 }: {
   places: Place[];
+  /** Folders the person added to this page. */
+  favorites: Place[];
   onNavigate: (path: string) => void;
   onUnavailable: (message: string) => void;
+  onContextMenu?: (event: React.MouseEvent, place: Place | null, from: "places" | "favorites") => void;
 }) {
   const [open, setOpen] = useState(true);
   const folders = places.filter((place) => place.kind === "folder");
@@ -68,6 +73,7 @@ export function HomeView({
               data-drop="folder"
               data-path={place.path}
               onClick={() => onNavigate(place.path)}
+              onContextMenu={(event) => onContextMenu?.(event, place, "places")}
             >
               <span className="place-glyph">
                 <PlaceGlyph icon={place.icon} size={32} />
@@ -83,17 +89,37 @@ export function HomeView({
       <button
         type="button"
         className="pill"
-        title="Add a file to Favorites"
+        title="Folders you add to Favorites appear here"
         onClick={() =>
-          onUnavailable(
-            "Favourites arrive with file operations: select a file, then add it.",
-          )
+          onUnavailable("Right-click a folder and choose Add to favorites.")
         }
       >
         <Icon name="star" size={14} />
         Favorites
       </button>
 
+      {favorites.length > 0 ? (
+        <div className="places">
+          {favorites.map((place) => (
+            <button
+              key={place.path}
+              type="button"
+              className="place"
+              data-drop="folder"
+              data-path={place.path}
+              onClick={() => onNavigate(place.path)}
+              onContextMenu={(event) => onContextMenu?.(event, place, "favorites")}
+            >
+              <span className="place-glyph">
+                <PlaceGlyph icon="folder" size={32} />
+              </span>
+              <span className="place-text">
+                <span className="place-name">{place.name}</span>
+              </span>
+            </button>
+          ))}
+        </div>
+      ) : (
       <div className="favorites-empty">
         <span className="favorites-art">
           <FavoritesArt />
@@ -103,6 +129,7 @@ export function HomeView({
           Select a file, then select Add to Favorites to access it here.
         </span>
       </div>
+      )}
     </div>
   );
 }

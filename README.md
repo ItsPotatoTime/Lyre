@@ -22,6 +22,8 @@ Working now:
 - An offer, once at startup, to become the desktop's folder handler
 - The landing page is "Quick access" on every platform, and "Home" always
   means the home directory
+- Safe eject for removable volumes, and favorites and sidebar pins that can be
+  added and removed from the context menus
 - This PC lists volumes, not mounts: one card per device, labelled by its
   volume label with the device shown underneath
 - Right-click menus: Open, Open with, Cut, Copy, Copy path, Rename, Delete and

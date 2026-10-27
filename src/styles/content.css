@@ -1201,3 +1201,34 @@ body[data-dragging] * {
 .prompt-link:hover {
   color: var(--text-primary);
 }
+
+/* The eject control is a sibling of the card button, not a child: a button
+   inside a button is invalid HTML and puts the two click targets in the same
+   tree position. */
+.drive-wrap {
+  position: relative;
+}
+
+.drive-eject {
+  position: absolute;
+  right: 8px;
+  bottom: 8px;
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius-control);
+  color: var(--text-secondary);
+  background: none;
+  border: none;
+}
+
+.drive-eject:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--text-primary);
+}
+
+.drive-eject:disabled {
+  opacity: 0.45;
+}
+

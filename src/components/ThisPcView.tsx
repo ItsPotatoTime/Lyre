@@ -24,11 +24,18 @@ export function ThisPcView({
   selected,
   onSelect,
   onOpen,
+  onEject,
+  ejecting,
+  onContextMenu,
 }: {
   places: Place[];
   selected: string | null;
   onSelect: (path: string) => void;
   onOpen: (path: string) => void;
+  /** Safely remove a removable volume. */
+  onEject?: (place: Place) => void;
+  ejecting?: string | null;
+  onContextMenu?: (event: React.MouseEvent, place: Place) => void;
 }) {
   const [open, setOpen] = useState(true);
   const volumes = places.filter((place) => place.kind !== "folder");
@@ -57,8 +64,8 @@ export function ThisPcView({
             const used = Math.max(0, volume.total - volume.free);
             const ratio = volume.total > 0 ? used / volume.total : 0;
             return (
+              <div className="drive-wrap" key={volume.path}>
               <button
-                key={volume.path}
                 type="button"
                 className="drive-card"
                 data-drop="folder"
@@ -66,6 +73,7 @@ export function ThisPcView({
                 data-selected={selected === volume.path ? "true" : "false"}
                 onClick={() => onSelect(volume.path)}
                 onDoubleClick={() => onOpen(volume.path)}
+                onContextMenu={(event) => onContextMenu?.(event, volume)}
               >
                 <span className="drive-glyph">
                   <PlaceGlyph icon="drive" size={32} />
@@ -88,6 +96,22 @@ export function ThisPcView({
                   {gigabytes(volume.free)} free of {gigabytes(volume.total)}
                 </span>
               </button>
+              {volume.kind === "removable" && volume.detail ? (
+                <button
+                  type="button"
+                  className="drive-eject"
+                  title={`Safely remove ${volume.name}`}
+                  aria-label={`Safely remove ${volume.name}`}
+                  disabled={ejecting === volume.path}
+                  onClick={(event) => {
+                    event.stopPropagation();
+                    onEject?.(volume);
+                  }}
+                >
+                  <Icon name="eject" size={14} strokeWidth={1.5} />
+                </button>
+              ) : null}
+              </div>
             );
           })}
         </div>

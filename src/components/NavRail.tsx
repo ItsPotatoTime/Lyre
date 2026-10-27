@@ -15,25 +15,31 @@ const MAX_WIDTH = 360;
  */
 export function NavRail({
   places,
+  pins,
   location,
   pictures,
   onNavigate,
   width,
   onWidth,
   onUnavailable,
+  onContextMenu,
 }: {
   places: Place[];
+  /** The rail's folder rows, already filtered and extended by the caller. */
+  pins: Place[];
   location: Location;
   pictures: string;
   onNavigate: (location: Location) => void;
   width: number;
   onWidth: (next: number) => void;
   onUnavailable: (message: string) => void;
+  onContextMenu?: (event: React.MouseEvent, place: Place, builtIn: boolean) => void;
 }) {
   const [thisPcOpen, setThisPcOpen] = useState(false);
   const [networkOpen, setNetworkOpen] = useState(false);
 
   const folders = places.filter((place) => place.kind === "folder");
+  const builtInPaths = new Set(folders.map((place) => place.path));
   const volumes = places.filter((place) => place.kind !== "folder");
 
   const startResize = (event: React.PointerEvent<HTMLDivElement>) => {
@@ -89,7 +95,7 @@ export function NavRail({
         <div className="nav-sep" />
 
         <div className="nav-section">
-          {folders.slice(1).map((place) => (
+          {pins.map((place) => (
             <NavRow
               key={place.path}
               glyph={<PlaceGlyph icon={place.icon} size={16} />}
@@ -100,6 +106,9 @@ export function NavRail({
               pinned
               dropPath={place.path}
               onClick={() => onNavigate(folder(place.path))}
+              onContextMenu={(event) =>
+                onContextMenu?.(event, place, builtInPaths.has(place.path))
+              }
             />
           ))}
         </div>
@@ -127,6 +136,7 @@ export function NavRail({
                   }
                   dropPath={volume.path}
                   onClick={() => onNavigate(folder(volume.path))}
+                  onContextMenu={(event) => onContextMenu?.(event, volume, false)}
                 />
               ))
             : null}
@@ -162,6 +172,7 @@ function NavRow({
   twisty,
   onTwisty,
   dropPath,
+  onContextMenu,
   onClick,
 }: {
   glyph: React.ReactNode;
@@ -173,6 +184,7 @@ function NavRow({
   onTwisty?: () => void;
   /** Set when this row names a real folder that can receive a drop. */
   dropPath?: string;
+  onContextMenu?: (event: React.MouseEvent) => void;
   onClick: () => void;
 }) {
   return (
@@ -200,6 +212,7 @@ function NavRow({
       <button
         type="button"
         onClick={onClick}
+        onContextMenu={onContextMenu}
         data-drop={dropPath ? "folder" : undefined}
         data-path={dropPath ?? undefined}
         style={{

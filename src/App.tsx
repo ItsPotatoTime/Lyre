@@ -27,6 +27,7 @@ import {
   openWithApp,
   setDefaultApp,
   chooseAppWithSystem,
+  ejectVolume,
   becomeFileManager,
   fileManagerState,
   startupFolder,
@@ -40,6 +41,12 @@ import { useReveal } from "@/lib/hooks";
 import { useTheme } from "@/lib/theme";
 import { loadPrefs, savePrefs, type Prefs } from "@/lib/prefs";
 import { setHomePath } from "@/lib/platform";
+import {
+  loadLibrary,
+  placeForPath,
+  saveLibrary,
+  type Library,
+} from "@/lib/library";
 import { targetAt, useDrag, type DragTarget, type DropMode } from "@/lib/dragAndDrop";
 import { measureFrameRate } from "@/lib/frameRate";
 import {
@@ -190,6 +197,8 @@ function Browser({
   const [windowFocused, setWindowFocused] = useState(true);
   const [renaming, setRenaming] = useState<string | null>(null);
   const [promptDefault, setPromptDefault] = useState(prefs.promptDefaultManager);
+  const [library, setLibrary] = useState<Library>(() => loadLibrary());
+  const [ejecting, setEjecting] = useState<string | null>(null);
   const [manager, setManager] = useState<ManagerState | null>(null);
   const [showManagerPrompt, setShowManagerPrompt] = useState(false);
   const [managerBusy, setManagerBusy] = useState(false);
@@ -210,7 +219,12 @@ function Browser({
   const [context, setContext] = useState<{
     x: number;
     y: number;
+    /** A file-list row, when the menu is about one. */
     entry: Entry | null;
+    /** A place from a tile, a drive card or the rail. */
+    place?: Place;
+    from?: "places" | "favorites" | "rail";
+    builtIn?: boolean;
   } | null>(null);
   const [selection, setSelection] = useState<Selection>({
     selected: new Set(),
@@ -340,6 +354,10 @@ function Browser({
 
   // Persist the view as it changes. Cheap enough to write on each change and
   // far simpler than tracking dirty fields.
+  useEffect(() => {
+    saveLibrary(library);
+  }, [library]);
+
   useEffect(() => {
     savePrefs({
       sort: active.sort,
@@ -857,6 +875,174 @@ function Browser({
     [flash, selection.focused],
   );
 
+  const favorites = useMemo(
+    () => library.favorites.map(placeForPath),
+    [library.favorites],
+  );
+
+  const railPins = useMemo(() => {
+    const known = places.filter((place) => place.kind === "folder").slice(1);
+    const visible = known.filter(
+      (place) => !library.hiddenPins.includes(place.path),
+    );
+    const extra = library.extraPins
+      .filter(
+        (path) =>
+          !known.some((place) => place.path === path) &&
+          !library.hiddenPins.includes(path),
+      )
+      .map(placeForPath);
+    return [...visible, ...extra];
+  }, [library.extraPins, library.hiddenPins, places]);
+
+  const rememberFavorite = useCallback((path: string) => {
+    setLibrary((prev) =>
+      prev.favorites.includes(path)
+        ? prev
+        : { ...prev, favorites: [...prev.favorites, path] },
+    );
+  }, []);
+
+  const forgetFavorite = useCallback((path: string) => {
+    setLibrary((prev) => ({
+      ...prev,
+      favorites: prev.favorites.filter((item) => item !== path),
+    }));
+  }, []);
+
+  const pinToRail = useCallback((path: string) => {
+    setLibrary((prev) => {
+      if (prev.hiddenPins.includes(path)) {
+        return {
+          ...prev,
+          hiddenPins: prev.hiddenPins.filter((item) => item !== path),
+        };
+      }
+      return prev.extraPins.includes(path)
+        ? prev
+        : { ...prev, extraPins: [...prev.extraPins, path] };
+    });
+  }, []);
+
+  const unpinFromRail = useCallback((path: string, builtIn: boolean) => {
+    setLibrary((prev) => ({
+      ...prev,
+      extraPins: prev.extraPins.filter((item) => item !== path),
+      hiddenPins: builtIn
+        ? [...new Set([...prev.hiddenPins, path])]
+        : prev.hiddenPins,
+    }));
+  }, []);
+
+  const restorePins = useCallback(() => {
+    setLibrary((prev) => ({ ...prev, hiddenPins: [], extraPins: [] }));
+    flash("Sidebar folders restored");
+  }, [flash]);
+
+  const eject = useCallback(
+    (volume: Place) => {
+      setEjecting(volume.path);
+      void ejectVolume(volume.path).then((outcome) => {
+        setEjecting(null);
+        if (outcome.ejected) {
+          flash(`${volume.name} can be removed safely`);
+          onRefreshPlaces();
+        } else {
+          flash(outcome.error ?? `Could not eject ${volume.name}`);
+        }
+      });
+    },
+    [flash],
+  );
+
+  /** Menu for a place: a rail row, a tile, or a drive card. */
+  const placeItems = useCallback(
+    (
+      place: Place,
+      from: "places" | "favorites" | "rail" | undefined,
+      knownBuiltIn: boolean | undefined,
+    ): ContextItem[] => {
+      const builtIn =
+        knownBuiltIn ?? places.some((item) => item.path === place.path);
+      const isFavorite = library.favorites.includes(place.path);
+      const isPinned = library.extraPins.includes(place.path);
+      const isHidden = library.hiddenPins.includes(place.path);
+      const isFolder = place.kind === "folder";
+
+      return [
+        {
+          kind: "item",
+          id: "place-open",
+          label: "Open",
+          onSelect: () => navigate(folder(place.path)),
+        },
+        ...(isFolder
+          ? ([
+              { kind: "sep" },
+              {
+                kind: "item",
+                id: "place-favorite",
+                label: isFavorite ? "Remove from favorites" : "Add to favorites",
+                checked: isFavorite,
+                onSelect: () =>
+                  isFavorite
+                    ? forgetFavorite(place.path)
+                    : rememberFavorite(place.path),
+              },
+              {
+                kind: "item",
+                id: "place-pin",
+                label:
+                  from === "rail" || isPinned
+                    ? "Remove from sidebar"
+                    : isHidden
+                      ? "Pin to sidebar"
+                      : "Pin to sidebar",
+                onSelect: () => {
+                  if (from === "rail" || isPinned) {
+                    unpinFromRail(place.path, builtIn);
+                  } else if (isHidden) {
+                    pinToRail(place.path);
+                  } else {
+                    unpinFromRail(place.path, true);
+                    setLibrary((prev) => ({
+                      ...prev,
+                      extraPins: prev.extraPins.includes(place.path)
+                        ? prev.extraPins
+                        : [...prev.extraPins, place.path],
+                    }));
+                  }
+                },
+              },
+            ] as ContextItem[])
+          : []),
+        ...(place.kind === "removable"
+          ? ([
+              { kind: "sep" },
+              {
+                kind: "item",
+                id: "place-eject",
+                label: `Eject ${place.name}`,
+                icon: "eject",
+                onSelect: () => eject(place),
+              },
+            ] as ContextItem[])
+          : []),
+        { kind: "sep" },
+        {
+          kind: "item",
+          id: "place-copy",
+          label: "Copy path",
+          onSelect: () => {
+            void navigator.clipboard?.writeText(place.path);
+            flash("Path copied");
+          },
+        },
+      ];
+    },
+    [eject, flash, forgetFavorite, library, navigate, pinToRail, places, rememberFavorite, unpinFromRail],
+  );
+
   const contextItems = useCallback(
     (entry: Entry | null): ContextItem[] => {
       const editOps = (): ContextItem[] => [
@@ -996,6 +1182,35 @@ function Browser({
               },
             ]),
         { kind: "sep" },
+        ...(entry.isDir
+          ? [
+              {
+                kind: "item" as const,
+                id: "favorite",
+                label: library.favorites.includes(entry.path)
+                  ? "Remove from favorites"
+                  : "Add to favorites",
+                checked: library.favorites.includes(entry.path),
+                onSelect: () =>
+                  library.favorites.includes(entry.path)
+                    ? forgetFavorite(entry.path)
+                    : rememberFavorite(entry.path),
+              },
+              {
+                kind: "item" as const,
+                id: "pin",
+                label: library.hiddenPins.includes(entry.path)
+                  ? "Pin to sidebar"
+                  : library.extraPins.includes(entry.path)
+                    ? "Remove from sidebar"
+                    : "Pin to sidebar",
+                onSelect: () =>
+                  library.extraPins.includes(entry.path)
+                    ? unpinFromRail(entry.path, false)
+                    : pinToRail(entry.path),
+              },
+            ]
+          : []),
         {
           kind: "item",
           id: "copy-path",
@@ -1032,7 +1247,14 @@ function Browser({
       copyPath,
       copySelection,
       deleteSelection,
+      forgetFavorite,
+      library.favorites,
+      library.extraPins,
+      library.hiddenPins,
       location.path,
+      pinToRail,
+      rememberFavorite,
+      unpinFromRail,
       pasteHere,
       newFolder,
       onOpen,
@@ -1356,6 +1578,10 @@ function Browser({
           setShowManagerPrompt(true);
         }}
         onTogglePromptManager={() => setPromptDefault((value) => !value)}
+        canRestorePins={
+          library.hiddenPins.length > 0 || library.extraPins.length > 0
+        }
+        onRestorePins={restorePins}
         onMeasureFrameRate={() => {
           void measureFrameRate().then((report) => {
             flash(
@@ -1378,20 +1604,46 @@ function Browser({
         {navOpen ? (
           <NavRail
             places={places}
+            pins={railPins}
             location={location}
             pictures={pictures}
             onNavigate={navigate}
             width={navWidth}
             onWidth={setNavWidth}
             onUnavailable={flash}
+            onContextMenu={(event, place, builtIn) => {
+              event.preventDefault();
+              event.stopPropagation();
+              setContext({
+                x: event.clientX,
+                y: event.clientY,
+                entry: null,
+                place,
+                from: "rail",
+                builtIn,
+              });
+            }}
           />
         ) : null}
         <main className="content">
           {location.kind === "home" && !searching ? (
             <HomeView
               places={quickAccess}
+              favorites={favorites}
               onNavigate={(path) => navigate(folder(path))}
               onUnavailable={flash}
+              onContextMenu={(event, place, from) => {
+                if (!place) return;
+                event.preventDefault();
+                event.stopPropagation();
+                setContext({
+                  x: event.clientX,
+                  y: event.clientY,
+                  entry: null,
+                  place,
+                  from,
+                });
+              }}
             />
           ) : location.kind === "thisPc" && !searching ? (
             <ThisPcView
@@ -1399,6 +1651,19 @@ function Browser({
               selected={driveSelected}
               onSelect={setDriveSelected}
               onOpen={(path) => navigate(folder(path))}
+              onEject={eject}
+              ejecting={ejecting}
+              onContextMenu={(event, place) => {
+                event.preventDefault();
+                event.stopPropagation();
+                setContext({
+                  x: event.clientX,
+                  y: event.clientY,
+                  entry: null,
+                  place,
+                  from: "places",
+                });
+              }}
             />
           ) : (
             <FileList
@@ -1472,7 +1737,11 @@ function Browser({
         <ContextMenu
           x={context.x}
           y={context.y}
-          items={contextItems(context.entry)}
+          items={
+            context.place
+              ? placeItems(context.place, context.from, context.builtIn)
+              : contextItems(context.entry)
+          }
           onClose={() => setContext(null)}
         />
       ) : null}

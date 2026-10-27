@@ -5,6 +5,7 @@
 //! and never block the thread the window is waiting on.
 
 mod defaultmanager;
+mod eject;
 mod fileops;
 mod openwith;
 mod ops;
@@ -240,6 +241,12 @@ fn apps_for_file(path: String) -> openwith::OpenWith {
     openwith::open_with(&path)
 }
 
+/// Unmount a removable volume and power the device down.
+#[tauri::command]
+fn eject_volume(path: String) -> eject::EjectOutcome {
+    eject::eject(&path)
+}
+
 /// Whether this application is the desktop's folder handler, and if not, what
 /// is. Called when the window opens to decide whether to offer the switch.
 #[tauri::command]
@@ -389,6 +396,7 @@ pub fn run() {
             file_manager_state,
             become_file_manager,
             startup_folder,
+            eject_volume,
             open_with_app,
             set_default_app
         ])

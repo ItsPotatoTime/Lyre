@@ -444,6 +444,7 @@ function mulberry32(seed: number): () => number {
  */
 export async function mockSearch(
   path: string,
+  roots: string[],
   query: string,
   recursive: boolean,
   showHidden: boolean,
@@ -451,8 +452,10 @@ export async function mockSearch(
 ): Promise<ScanHandle> {
   const started = performance.now();
   let cancelled = false;
+  // A place with no folder of its own (This PC) starts straight at its roots.
+  const start = path === "" ? (roots[0] ?? "/") : path;
 
-  const local = listing(path)
+  const local = path === "" ? [] : listing(path)
     .filter((entry) => showHidden || !entry.hidden)
     .map((entry) => toHit(entry, query))
     .filter((hit): hit is Hit => hit !== null)
@@ -468,18 +471,26 @@ export async function mockSearch(
 
     // Walk the synthetic tree's known folders, a few results per tick, so the
     // interface sees the same two-wave arrival as the real engine.
-    const prefix = path.endsWith("/") ? path : `${path}/`;
+    const base = start.endsWith("/") ? start : `${start}/`;
+    const prefix = base;
     const deeper: Hit[] = [];
+    // Phase one already reported this folder's own entries; repeating them
+    // here would give two rows the same key.
+    const seen = new Set(local.map((hit) => hit.path));
+    const push = (hit: Hit | null) => {
+      if (!hit || seen.has(hit.path)) return;
+      seen.add(hit.path);
+      deeper.push(hit);
+    };
     for (const key of Object.keys(CHILDREN)) {
       if (!key.startsWith(prefix) || key === path) continue;
       const dirName = key.split("/").filter(Boolean).pop() ?? "";
       const dirEntry = makeEntry(key.slice(0, key.lastIndexOf("/")) || "/", dirName, "folder", mulberry32(hash(key)), Date.now());
       const dirHit = toHit({ ...dirEntry, path: key }, query);
-      if (dirHit) deeper.push(dirHit);
+      push(dirHit);
       for (const [name, kind] of CHILDREN[key]!) {
         const entry = makeEntry(key, name, kind, mulberry32(hash(key + name)), Date.now());
-        const hit = toHit(entry, query);
-        if (hit) deeper.push(hit);
+        push(toHit(entry, query));
       }
     }
 

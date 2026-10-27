@@ -176,8 +176,23 @@ function Browser({
     nonce,
   );
 
-  const searching = showsFiles && query.trim().length > 0;
-  const search = useSearch(location.path, query, showHidden, searching);
+  // Search works from any place. A folder searches itself; Home searches the
+  // home directory; This PC searches every volume. A place with no directory
+  // of its own has no local phase, so the walk carries the answer.
+  const searchPath =
+    location.kind === "thisPc"
+      ? ""
+      : location.kind === "home"
+        ? home
+        : location.path;
+  const roots = useMemo(() => {
+    if (location.kind === "thisPc") return volumes.map((volume) => volume.path);
+    if (location.kind === "home") return [home];
+    return [] as string[];
+  }, [location.kind, home, volumes]);
+
+  const searching = query.trim().length > 0;
+  const search = useSearch(searchPath, roots, query, showHidden, searching);
   const highlights = useMemo(() => matchIndex(search.items), [search.items]);
 
   const patchTab = useCallback((patch: (tab: Tab) => Tab) => {
@@ -554,7 +569,30 @@ function Browser({
           />
         ) : null}
         <main className="content">
-          {location.kind === "home" ? (
+          {searching ? (
+            <FileList
+              entries={visible}
+              version={dir.version}
+              view={active.view}
+              density={mode}
+              sort={active.sort}
+              onSort={setSort}
+              selection={selection}
+              onSelection={setSelection}
+              onOpen={onOpen}
+              onUp={goUp}
+              status={search.phase === "done" || search.items.length > 0 ? "ready" : "loading"}
+              error={search.error}
+              path={searchPath || location.kind}
+              filtering
+              columns={columns}
+              onColumns={setColumns}
+              grouped={false}
+              matched={highlights}
+              sortable={false}
+              onRetry={refresh}
+            />
+          ) : location.kind === "home" ? (
             <HomeView
               places={quickAccess}
               onNavigate={(path) => navigate(folder(path))}

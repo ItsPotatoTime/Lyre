@@ -52,7 +52,13 @@ const CHUNK: usize = 2048;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SearchRequest {
+    /// The folder on screen. Empty for a place that is not a directory, such
+    /// as This PC; the search then begins straight at the roots.
     pub path: String,
+    /// Where to walk. Home supplies the home folder, This PC supplies every
+    /// volume. Empty means "just `path`", which is the ordinary folder case.
+    #[serde(default)]
+    pub roots: Vec<String>,
     pub query: String,
     #[serde(default)]
     pub recursive: bool,
@@ -150,20 +156,41 @@ where
     // upper-case names, which is a trap for anyone with caps lock on or who is
     // used to Windows search matching regardless of case.
     let pattern = Pattern::parse(needle, CaseMatching::Ignore, Normalization::Smart);
-    let root = PathBuf::from(&request.path);
 
-    // Phase one: the folder the user is looking at, straight out of memory.
-    let entries = match index.get(&root) {
-        Some(cached) => cached,
-        None => {
-            let collected = collect(&root, request.show_hidden, cancel);
-            let shared = Arc::new(collected);
-            index.store(&root, Arc::clone(&shared));
-            shared
+    let roots: Vec<PathBuf> = if request.roots.is_empty() {
+        if request.path.is_empty() {
+            Vec::new()
+        } else {
+            vec![PathBuf::from(&request.path)]
         }
+    } else {
+        request.roots.iter().map(PathBuf::from).collect()
+    };
+    let local_path: Option<PathBuf> = if request.path.is_empty() {
+        None
+    } else {
+        Some(PathBuf::from(&request.path))
     };
 
-    let (local, matched_local) = score_local(&pattern, &entries, LIMIT);
+    // Phase one: the folder the user is looking at, straight out of memory.
+    // A place like This PC has no listing of its own, so this phase is simply
+    // empty and the walk carries the whole answer.
+    let (local, matched_local, laid_out) = match &local_path {
+        Some(path) => {
+            let entries = match index.get(path) {
+                Some(cached) => cached,
+                None => {
+                    let collected = collect(path, request.show_hidden, cancel);
+                    let shared = Arc::new(collected);
+                    index.store(path, Arc::clone(&shared));
+                    shared
+                }
+            };
+            let (hits, matched) = score_local(&pattern, &entries, LIMIT);
+            (hits, matched, entries.len())
+        }
+        None => (Vec::new(), 0, 0),
+    };
     let alive = emit(SearchEvent::Local {
         items: local,
         matched: matched_local,
@@ -178,7 +205,7 @@ where
     if !request.recursive || needle.chars().count() < 2 {
         let _ = emit(SearchEvent::Done {
             matched: matched_local,
-            scanned: entries.len(),
+            scanned: laid_out,
             elapsed_ms: started.elapsed().as_millis() as u64,
             truncated: matched_local > LIMIT,
         });
@@ -190,7 +217,7 @@ where
     if matched_local >= LIMIT {
         let _ = emit(SearchEvent::Done {
             matched: matched_local,
-            scanned: entries.len(),
+            scanned: laid_out,
             elapsed_ms: started.elapsed().as_millis() as u64,
             truncated: true,
         });
@@ -198,12 +225,15 @@ where
     }
 
     let outcome = walk(
-        &root,
-        &pattern,
-        request.show_hidden,
-        cancel,
-        matched_local,
-        entries.len(),
+        Walk {
+            roots: &roots,
+            covered: local_path.as_deref(),
+            pattern: &pattern,
+            show_hidden: request.show_hidden,
+            cancel,
+            matched_so_far: matched_local,
+            scanned_so_far: laid_out,
+        },
         &mut emit,
     );
 
@@ -355,26 +385,47 @@ struct Outcome {
     truncated: bool,
 }
 
+/// Everything a walk needs, in one place so the call site reads as a sentence.
+struct Walk<'a> {
+    roots: &'a [PathBuf],
+    /// The folder phase one already listed; its own entries are not re-matched.
+    covered: Option<&'a Path>,
+    pattern: &'a Pattern,
+    show_hidden: bool,
+    cancel: &'a Arc<AtomicBool>,
+    matched_so_far: usize,
+    scanned_so_far: usize,
+}
+
 /// Walk the tree below `root`, matching names as they are read.
 ///
 /// Workers share one stack of pending folders and one channel, so a wide tree
 /// divides rather than being walked in sequence. The receiving side only
 /// assembles batches; it never touches the disk.
-fn walk<F>(
-    root: &Path,
-    pattern: &Pattern,
-    show_hidden: bool,
-    cancel: &Arc<AtomicBool>,
-    matched_so_far: usize,
-    scanned_so_far: usize,
-    emit: &mut F,
-) -> Outcome
+fn walk<F>(walk: Walk<'_>, emit: &mut F) -> Outcome
 where
     F: FnMut(SearchEvent) -> bool,
 {
-    // Seed with the root's subfolders: the root's own entries belong to phase
-    // one and must not be read twice.
-    let stack: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(subfolders(root, show_hidden, 0));
+    let Walk {
+        roots,
+        covered,
+        pattern,
+        show_hidden,
+        cancel,
+        matched_so_far,
+        scanned_so_far,
+    } = walk;
+
+    // Every root is queued at depth zero. A root that phase one already listed
+    // is walked for its subfolders only, so its own entries are not read, and
+    // counted, twice.
+    let mut queue: Vec<(PathBuf, usize)> = Vec::new();
+    for root in roots {
+        if !is_virtual_filesystem(root) {
+            queue.push((root.clone(), 0));
+        }
+    }
+    let stack: Mutex<Vec<(PathBuf, usize)>> = Mutex::new(queue);
     let examined = AtomicUsize::new(scanned_so_far);
     let (tx, rx) = mpsc::channel::<Hit>();
     let workers = thread::available_parallelism()
@@ -418,6 +469,18 @@ where
                     }
 
                     for (dir, depth) in next {
+                        // Phase one already answered for this folder's own
+                        // entries; only its children are still unexamined.
+                        if covered.is_some_and(|path| path == dir) {
+                            let children = subfolders(&dir, show_hidden, depth);
+                            if !children.is_empty() {
+                                if let Ok(mut stack) = stack.lock() {
+                                    stack.extend(children);
+                                }
+                            }
+                            continue;
+                        }
+
                         let Ok(read) = fs::read_dir(&dir) else {
                             continue;
                         };
@@ -536,7 +599,24 @@ where
     }
 }
 
-/// Immediate children of the root that are folders, for the walk to start on.
+/// Filesystems that are not real storage. Walking them is slow and their
+/// contents are kernel state, not the user's files.
+fn is_virtual_filesystem(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(
+            path.to_str(),
+            Some("/proc") | Some("/sys") | Some("/dev") | Some("/run")
+        )
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// Immediate children of a folder that are folders, for the walk to start on.
 fn subfolders(dir: &Path, show_hidden: bool, depth: usize) -> Vec<(PathBuf, usize)> {
     let mut out = Vec::new();
     if depth >= MAX_DEPTH {

@@ -90,6 +90,7 @@ export interface SearchHandlers {
  */
 export async function searchDir(
   path: string,
+  roots: string[],
   query: string,
   recursive: boolean,
   showHidden: boolean,
@@ -97,7 +98,7 @@ export async function searchDir(
 ): Promise<ScanHandle> {
   if (!isTauri) {
     const { mockSearch } = await import("./mock");
-    return mockSearch(path, query, recursive, showHidden, handlers);
+    return mockSearch(path, roots, query, recursive, showHidden, handlers);
   }
 
   const { Channel, invoke } = await import("@tauri-apps/api/core");
@@ -130,7 +131,7 @@ export async function searchDir(
 
   try {
     jobId = await invoke<number>("search_dir", {
-      request: { path, query, recursive, showHidden },
+      request: { path, roots, query, recursive, showHidden },
       onEvent: channel,
     });
   } catch (error) {

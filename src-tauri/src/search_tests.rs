@@ -53,6 +53,7 @@ fn run(index: &Index, path: &Path, query: &str, recursive: bool) -> Collected {
         index,
         &SearchRequest {
             path: path.to_string_lossy().into_owned(),
+            roots: Vec::new(),
             query: query.to_string(),
             recursive,
             show_hidden: false,
@@ -80,6 +81,49 @@ fn run(index: &Index, path: &Path, query: &str, recursive: bool) -> Collected {
                     out.scanned = scanned;
                     out.elapsed_ms = elapsed_ms;
                     out.truncated = truncated;
+                }
+                SearchEvent::Failed { message } => panic!("search failed: {message}"),
+            }
+            true
+        },
+    );
+    out
+}
+
+/// A request with no folder of its own and several roots: how This PC searches.
+fn run_roots(index: &Index, roots: &[PathBuf], query: &str) -> Collected {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut out = Collected {
+        local: Vec::new(),
+        batches: Vec::new(),
+        matched: 0,
+        scanned: 0,
+        elapsed_ms: 0,
+        truncated: false,
+    };
+    search(
+        index,
+        &SearchRequest {
+            path: String::new(),
+            roots: roots.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+            query: query.to_string(),
+            recursive: true,
+            show_hidden: false,
+        },
+        &cancel,
+        |event| {
+            match event {
+                SearchEvent::Local { items, .. } => {
+                    out.local = items.into_iter().map(|hit| hit.entry.name).collect();
+                }
+                SearchEvent::Batch { items, scanned } => {
+                    out.batches
+                        .extend(items.into_iter().map(|hit| hit.entry.name));
+                    out.scanned = scanned;
+                }
+                SearchEvent::Done { matched, scanned, .. } => {
+                    out.matched = matched;
+                    out.scanned = scanned;
                 }
                 SearchEvent::Failed { message } => panic!("search failed: {message}"),
             }
@@ -222,12 +266,74 @@ fn a_single_character_does_not_walk_the_tree() {
 }
 
 #[test]
+fn searching_with_no_current_folder_covers_every_root() {
+    // This PC has no listing of its own: both volumes must be searched, and
+    // files sitting directly at a root must be found, not only those in
+    // subfolders.
+    let first = scratch("volume-one");
+    let second = scratch("volume-two");
+    fs::create_dir_all(first.join("nested")).unwrap();
+    fs::write(first.join("at-the-root-report.txt"), b"x").unwrap();
+    fs::write(first.join("nested/deep-report.txt"), b"x").unwrap();
+    fs::write(second.join("second-volume-report.txt"), b"x").unwrap();
+
+    let index = Index::default();
+    let result = run_roots(&index, &[first.clone(), second.clone()], "report");
+
+    let mut all = result.local;
+    all.extend(result.batches);
+    assert!(
+        all.iter().any(|name| name == "at-the-root-report.txt"),
+        "a file at the root itself must be found: {all:?}"
+    );
+    assert!(
+        all.iter().any(|name| name == "deep-report.txt"),
+        "a subfolder match must be found: {all:?}"
+    );
+    assert!(
+        all.iter().any(|name| name == "second-volume-report.txt"),
+        "the second volume must be searched: {all:?}"
+    );
+    assert_eq!(result.matched, 3);
+
+    fs::remove_dir_all(&first).ok();
+    fs::remove_dir_all(&second).ok();
+}
+
+#[test]
+fn a_folder_search_does_not_read_its_own_entries_twice() {
+    // Phase one lists the folder; the walk must only descend from it, or a
+    // match in the current folder would be reported twice.
+    let dir = scratch("no-double");
+    fs::create_dir_all(dir.join("child")).unwrap();
+    fs::write(dir.join("here-report.txt"), b"x").unwrap();
+    fs::write(dir.join("child/there-report.txt"), b"x").unwrap();
+
+    let index = Index::default();
+    scan_into_index(&index, &dir);
+    let result = run(&index, &dir, "report", true);
+
+    let local_hits = result.local.iter().filter(|n| *n == "here-report.txt").count();
+    let walked_hits = result
+        .batches
+        .iter()
+        .filter(|n| *n == "here-report.txt")
+        .count();
+    assert_eq!(local_hits, 1, "the current folder's match appears once");
+    assert_eq!(walked_hits, 0, "the walk must not repeat it");
+    assert_eq!(result.matched, 2, "exactly two matches in the tree");
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn the_request_decodes_from_exactly_what_the_interface_sends() {
     // `src/lib/ipc.ts` posts { path, query, recursive, showHidden }. If the
     // serde rename ever drifts, this is the test that catches it rather than a
     // search box that silently does nothing.
     let wire = serde_json::json!({
         "path": "/tmp/example",
+        "roots": ["/tmp/example"],
         "query": "report",
         "recursive": true,
         "showHidden": false
@@ -236,6 +342,7 @@ fn the_request_decodes_from_exactly_what_the_interface_sends() {
         serde_json::from_value(wire).expect("the interface's payload must decode");
     assert_eq!(request.path, "/tmp/example");
     assert_eq!(request.query, "report");
+    assert_eq!(request.roots, vec!["/tmp/example".to_string()]);
     assert!(request.recursive);
     assert!(!request.show_hidden);
 }

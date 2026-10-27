@@ -370,8 +370,12 @@ export async function previewInfo(path: string): Promise<PreviewInfo> {
 export async function previewThumbnail(path: string): Promise<string | null> {
   if (!isTauri) return null;
   const { invoke } = await import("@tauri-apps/api/core");
-  const bytes = await invoke<ArrayBuffer>("preview_thumbnail", { path });
-  if (!bytes || bytes.byteLength === 0) return null;
+  const raw = await invoke<ArrayBuffer | number[]>("preview_thumbnail", { path });
+  // Binary IPC normally arrives as an ArrayBuffer; a plain array is accepted
+  // too so this cannot silently turn into a Blob of comma-separated digits.
+  const bytes =
+    raw instanceof ArrayBuffer ? new Uint8Array(raw) : new Uint8Array(raw);
+  if (bytes.byteLength === 0) return null;
   return URL.createObjectURL(new Blob([bytes], { type: "image/png" }));
 }
 

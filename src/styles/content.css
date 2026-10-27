@@ -1388,3 +1388,12 @@ body[data-dragging] * {
 .dialog-foot {
   gap: 8px;
 }
+
+/* A row's own picture, where a generic glyph would otherwise be. Clipped to a
+   small rounded square so a portrait photo does not become a tall sliver. */
+.entry-thumb {
+  object-fit: cover;
+  border-radius: 2px;
+  flex: 0 0 auto;
+  background: color-mix(in srgb, var(--text-primary) 8%, transparent);
+}

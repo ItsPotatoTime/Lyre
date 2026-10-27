@@ -11,6 +11,7 @@ import type { DirStatus } from "@/lib/useDirectory";
 import { MIN_COLUMN, metricsFor, type Mode } from "@/lib/modes";
 import { formatDate, formatSize, typeLabel } from "@/lib/format";
 import { useDelayed, useVirtual } from "@/lib/hooks";
+import { previewable, useThumbnail } from "@/lib/thumbnails";
 import { FileGlyph } from "./FileGlyph";
 import { Icon } from "./Icons";
 
@@ -59,6 +60,30 @@ function buildGroups(entries: Entry[]): Row[] {
     rows.push({ kind: "entry", entry, index: i });
   }
   return rows;
+}
+
+/** A row or tile's icon, replaced by the file's own thumbnail when there is one. */
+function EntryIcon({
+  entry,
+  size,
+}: {
+  entry: Entry;
+  size: number;
+}) {
+  const wanted = previewable(entry.name);
+  const thumbnail = useThumbnail(entry.path, wanted);
+  if (thumbnail) {
+    return (
+      <img
+        className="entry-thumb"
+        src={thumbnail}
+        alt=""
+        style={{ width: size, height: size }}
+        loading="lazy"
+      />
+    );
+  }
+  return <FileGlyph kind={entry.kind} size={size} isSymlink={entry.isSymlink} />;
 }
 
 export function FileList({
@@ -169,6 +194,12 @@ export function FileList({
   const { ref, bounds } = useVirtual(rowCount, rowHeight, view === "grid" ? 1 : 6);
   const scrolling = ref as React.RefObject<HTMLDivElement | null>;
 
+  // While a folder is still scanning there are no rows, so the grid element is
+  // not in the document at all. Without this the measuring effect ran once,
+  // found nothing, and never ran again, leaving the whole folder in a single
+  // column until something else forced a re-render.
+  const gridMounted = view === "grid" && entries.length > 0;
+
   useEffect(() => {
     if (view !== "grid") {
       setGridColumns(1);
@@ -176,18 +207,25 @@ export function FileList({
     }
     const element = scrolling.current;
     if (!element) return;
-    const update = () =>
-      setGridColumns(
-        Math.max(
-          1,
-          Math.floor((element.clientWidth - 12) / metrics.tileWidth),
-        ),
-      );
+    const update = () => {
+      const width = element.getBoundingClientRect().width;
+      // Reading before layout settles can report zero. Committing a single
+      // column from that reading is what left a whole folder in one vertical
+      // strip, so nothing is decided until there is a real width to divide.
+      if (width < metrics.tileWidth) return;
+      setGridColumns(Math.max(1, Math.floor((width - 12) / metrics.tileWidth)));
+    };
     update();
+    const frame = requestAnimationFrame(update);
     const observer = new ResizeObserver(update);
     observer.observe(element);
-    return () => observer.disconnect();
-  }, [view, metrics.tileWidth, scrolling]);
+    window.addEventListener("resize", update);
+    return () => {
+      cancelAnimationFrame(frame);
+      observer.disconnect();
+      window.removeEventListener("resize", update);
+    };
+  }, [view, metrics.tileWidth, scrolling, gridMounted]);
 
   // A new directory starts at the top.
   useEffect(() => {
@@ -649,6 +687,7 @@ export function FileList({
           <div
             className={view === "grid" ? "grid-spacer" : "list-spacer"}
             ref={spacer}
+            data-columns={view === "grid" ? gridColumns : undefined}
             style={{
               height: rowCount * rowHeight,
               width: view === "grid" ? undefined : tableWidth + 14,
@@ -698,11 +737,7 @@ export function FileList({
                       onContextMenu={(event) => onContextMenu?.(event, entry)}
                     >
                       <div className="tile-glyph">
-                        <FileGlyph
-                          kind={entry.kind}
-                          size={40}
-                          isSymlink={entry.isSymlink}
-                        />
+                        <EntryIcon entry={entry} size={40} />
                       </div>
                       <div className="tile-label">
                         <MatchedName name={entry.name} indices={matched?.get(entry.path)} />
@@ -836,7 +871,7 @@ function DetailRow({
       onContextMenu={onContextMenu}
     >
       <div className="cell cell-name">
-        <FileGlyph kind={entry.kind} size={16} isSymlink={entry.isSymlink} />
+        <EntryIcon entry={entry} size={16} />
         {editing ? (
           <RenameInput
             name={entry.name}

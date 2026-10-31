@@ -7,6 +7,16 @@ while the rest are still arriving, so a folder of 20,000 entries is on screen in
 under 20 ms. Windows, macOS and Linux from one codebase: Rust core, Tauri v2
 shell, React 19 interface.
 
+![Linux](https://img.shields.io/badge/Linux-tested-2ea44f?style=flat-square)
+![Windows](https://img.shields.io/badge/Windows-tested%20in%20a%20VM-2ea44f?style=flat-square)
+![macOS](https://img.shields.io/badge/macOS-untested-d29922?style=flat-square)
+
+> [!WARNING]
+> **macOS is untested.** The macOS branches are written, but no one has run this
+> window on a Mac. Treat it as experimental: it cannot be the default folder
+> handler there (Finder is the shell) and the "open with" list comes back empty.
+> Linux and Windows are the platforms this is used on.
+
 [Benchmarks](#benchmarks) • [Build and run](#build-and-run) • [Keyboard](#keyboard) • [Status](#status) • [How it stays fast](docs/performance.md) • [Platform notes](docs/platforms.md)
 
 ## Features
@@ -45,9 +55,11 @@ shell, React 19 interface.
 
 ## Benchmarks
 
-Measured on a Ryzen 5 3600 (6 cores, 12 threads), NVMe, btrfs for real trees and
-tmpfs for the synthetic one, warm page cache, development build
-(`opt-level = 1`). Each table names the command that reproduces it.
+> [!NOTE]
+> These are development-build numbers on one machine (`opt-level = 1`): a Ryzen
+> 5 3600, NVMe, btrfs for real trees and tmpfs for the synthetic one, warm page
+> cache. A release build is faster. What matters here is the order of magnitude,
+> and that every table names the command that reproduces it.
 
 ### Listing a folder
 
@@ -116,6 +128,9 @@ recorded here, this README claims nothing about it.
 
 Needs Rust, Bun, and Tauri's prerequisites for the platform. On Linux that is the
 development packages for `webkit2gtk-4.1`, `gtk3` and `libsoup3`.
+
+> [!TIP]
+> Two commands get you a window: `bun install`, then `bun dev`.
 
 ```bash
 bun install

@@ -5,6 +5,10 @@ enough that the differences are not cosmetic. What follows is what Lyre does on
 each, and where a platform makes something impossible it says so rather than
 pretending.
 
+**macOS is the untested one.** Linux and Windows are used; the macOS branches are
+written but have not been run on a Mac, so read them as intent rather than
+experience.
+
 ## Being the default folder handler
 
 ### Linux

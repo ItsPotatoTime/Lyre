@@ -11,7 +11,7 @@
 #
 # If the share is not showing the script, copy it somewhere local and point it
 # back at the shared folder:
-#     powershell -File C:\Temp\dump.ps1 -OutDir "C:\Users\potato\Desktop\Shared\Seafile\Projects\Rust\Lyre\build"
+#     powershell -File C:\Temp\dump.ps1 -OutDir "C:\path\to\Lyre\build"
 
 param(
     # Where the dump is written. Defaults to build\ next to the repo.

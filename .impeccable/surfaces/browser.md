@@ -97,7 +97,7 @@ What was verified against the built result, not the intent:
   does not claim completion, readable failure for a missing directory. 20,000
   entries in 16 ms in a debug build.
 - The packaged app launches, and the webview completes a real scan round trip
-  (`scan 1 start /home/potato`, `scan 1 done 59`).
+  (`scan 1 start /home/you`, `scan 1 done 59`).
 
 Known gaps, deliberately: no file operations, no search index, no drag and drop,
 no thumbnails, no context menu, no OS file associations. Each is stated in the

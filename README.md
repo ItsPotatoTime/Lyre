@@ -50,11 +50,11 @@ Working now:
 - Window chrome: tabs in a custom title bar, caption buttons, edge resizing
 - Opening a file in whatever the desktop associates with its type
 - Search: instant results for the folder on screen, then matches from every
-  subfolder streaming in behind them, ranked by relevance with the matched
-  letters emphasised
+  subfolder streaming in behind them, folders first and then files, each by
+  relevance, with the matched letters emphasised
 
-Not implemented yet, and honest about it in the interface: share, drag and drop,
-file contents search, thumbnails and the preview pane.
+Not implemented yet, and honest about it in the interface: share, and searching
+inside file contents rather than by name.
 
 A paste that would land on an existing name asks first: keep both, which numbers
 the incoming item, or replace. Replacing merges a folder rather than deleting it,
@@ -77,8 +77,16 @@ bun install
 bun dev            # builds the Rust core and opens the app, with hot reload
 ```
 
-`bun dev` is the whole thing: it starts Vite on port 1420, compiles the Rust
-crate, and opens the window against your real filesystem.
+`bun dev` is the whole thing: it starts Vite, compiles the Rust crate, and opens
+the window against your real filesystem.
+
+Vite starts on port 1420. If that port is taken, by a leftover dev server or a
+second checkout, `bun dev` moves up to the next free one instead of failing, and
+tells Tauri where it went: the port is chosen once, in `scripts/dev.ts`, and
+handed to Vite through `LYRE_DEV_PORT` and to Tauri through `--config`, which
+merges over `build.devUrl`. Both numbers therefore always agree, which is the
+whole reason it is done in one place. `bun dev --port 1500` starts somewhere
+specific, and `--dry-run` prints the port and the command without running it.
 
 ```bash
 bun buildit        # build for whichever OS is running it
@@ -163,6 +171,22 @@ identity, so selecting it again is a file read.
 Decoding is delegated to tools a desktop already has: `pdftoppm` for PDFs,
 `ffmpegthumbnailer` for video, `ffmpeg` or ImageMagick for images. When none is
 installed the pane still shows the file's details rather than failing.
+
+Rows and tiles show the file's own picture too, made and cached the same way,
+except that a file over 24 MB keeps its glyph in a row: decoding that much to
+show it 16 pixels wide is not a trade worth making, and the pane still shows it
+at full size. A row asks for a picture only once it has stayed on screen for a
+moment, at most three are made at a time, and the finished picture is handed to
+every row waiting for it. That last part is what makes the pictures appear in
+place: storing one in the cache is invisible to a row that has already drawn
+itself, so before that a row only ever saw pictures that were cached before it
+mounted.
+
+The pane is 300 px on a large window but gives way with the window down to
+220 px, and the details columns narrow to fit whatever the list has left. In a
+half-sized window that means a long date ellipsizes rather than the Type and
+Size columns sliding under the pane, where they could not be read or scrolled
+to. Dragging a divider trades width with the other columns, so it still moves.
 
 ## Search
 
@@ -337,16 +361,16 @@ Four decisions carry the latency:
    entries to an index keyed by path, so the first phase of a search reads no
    disk at all.
 2. **Names are matched, metadata is not.** A recursive search reads directory
-   entries and matches file names; only the items that match are stat'ed. The
-   walk is breadth-first: depth-first disappears into the first large system
-   tree it meets and spends its whole budget there before reaching your own
-   folders.
+   entries and matches the name, of a file or of a folder; only the items that
+   match are stat'ed. The walk is breadth-first: depth-first disappears into the
+   first large system tree it meets and spends its whole budget there before
+   reaching your own folders.
 3. **Two phases, one keystroke.** The local phase is emitted before the walk
    starts, so results appear immediately and deeper matches stream in behind
    them. Both are cancelled the moment the query moves.
 4. **One sort, at the end.** Results stream in the order they are found, so the
-   list never jumps while you type. A single stable sort by relevance runs when
-   the walk completes.
+   list never jumps while you type. A single stable sort runs when the walk
+   completes: folders first, then the files, each by relevance.
 5. **The comparator does not allocate.** Ranking 30,000 tied matches ran through
    `char::to_lowercase` iterators per comparison and cost 21 ms of a 23 ms
    search. A byte-wise comparison cut that to 2.7 ms.

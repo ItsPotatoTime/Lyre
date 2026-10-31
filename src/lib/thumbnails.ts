@@ -16,6 +16,12 @@ import { previewThumbnail } from "./ipc";
  * - Results live in a bounded cache, since a folder can hold thousands of
  *   pictures and keeping every thumbnail forever is the memory problem this app
  *   already spent a session undoing.
+ * - A finished picture is handed to the rows waiting for it, not only stored.
+ *   Storing alone is invisible to a row that has already rendered: it read the
+ *   cache when it mounted, found nothing, and was never told otherwise. That is
+ *   why a picture appeared only after something remounted the row, which is what
+ *   made the icons in Details look like they needed a trip through Large icons
+ *   to acquire their pictures.
  */
 
 const MAX_CACHED = 240;
@@ -26,13 +32,16 @@ const SETTLE_MS = 140;
 /// on a row, and the preview pane still shows them at full quality.
 const ROW_MAX_BYTES = 24 * 1024 * 1024;
 
-interface Task {
-  path: string;
-  cancelled: boolean;
-}
-
 const cache = new Map<string, string>();
-const queue: Task[] = [];
+/// Rows waiting for a picture, keyed by path. One request serves every row
+/// showing the same file, and a row that goes away stops waiting.
+type Listener = (url: string | null) => void;
+const waiting = new Map<string, Set<Listener>>();
+/// Paths with a request in the queue, and paths being fetched right now. Both
+/// keep a second row from asking for the same file again.
+const queued = new Set<string>();
+const running = new Set<string>();
+const queue: string[] = [];
 let inFlight = 0;
 
 function remember(path: string, url: string) {
@@ -44,39 +53,46 @@ function remember(path: string, url: string) {
     cache.delete(oldest);
     if (stale) URL.revokeObjectURL(stale);
   }
+  for (const listener of waiting.get(path) ?? []) listener(url);
 }
 
 function pump() {
   while (inFlight < MAX_IN_FLIGHT) {
-    const task = queue.shift();
-    if (!task) return;
-    if (task.cancelled) continue;
+    const path = queue.shift();
+    if (path === undefined) return;
+    queued.delete(path);
     inFlight += 1;
-    previewThumbnail(task.path)
+    running.add(path);
+    previewThumbnail(path)
       .then((url) => {
-        if (url && !task.cancelled) remember(task.path, url);
-        else if (url) URL.revokeObjectURL(url);
+        if (url) remember(path, url);
       })
       .catch(() => {
         // A file that cannot be previewed keeps its glyph.
       })
       .finally(() => {
         inFlight -= 1;
+        running.delete(path);
         pump();
       });
   }
 }
 
-/** Queue a thumbnail; the returned function cancels it properly. */
-function enqueue(path: string): () => void {
-  const task: Task = { path, cancelled: false };
-  queue.push(task);
+/** Ask for one picture, unless it is queued, in flight, or already here. */
+function request(path: string) {
+  if (queued.has(path) || running.has(path) || cache.has(path)) return;
+  queue.push(path);
+  queued.add(path);
   pump();
-  return () => {
-    task.cancelled = true;
-    const at = queue.indexOf(task);
-    if (at >= 0) queue.splice(at, 1);
-  };
+}
+
+/** Drop a queued request that nothing on screen is waiting for any more. */
+function withdraw(path: string) {
+  const at = queue.indexOf(path);
+  if (at >= 0) {
+    queue.splice(at, 1);
+    queued.delete(path);
+  }
 }
 
 /** Extensions worth showing a picture for. */
@@ -105,17 +121,26 @@ export function useThumbnail(
     }
     setUrl(null);
 
-    let cancelTask: (() => void) | null = null;
+    let joined = waiting.get(path);
+    if (!joined) {
+      joined = new Set();
+      waiting.set(path, joined);
+    }
+    const listener: Listener = (next) => setUrl(next);
+    joined.add(listener);
+
     // Wait for the row to settle, so a fast scroll never asks for a picture it
     // has already scrolled past.
-    const settle = window.setTimeout(() => {
-      cancelTask = enqueue(path);
-    }, SETTLE_MS);
+    const settle = window.setTimeout(() => request(path), SETTLE_MS);
 
     return () => {
       window.clearTimeout(settle);
-      cancelTask?.();
-      // The result, if it already arrived, stays in the cache for next time.
+      joined.delete(listener);
+      if (joined.size === 0) {
+        waiting.delete(path);
+        withdraw(path);
+      }
+      // A picture that already arrived stays in the cache for next time.
     };
   }, [path, enabled, bytes]);
 

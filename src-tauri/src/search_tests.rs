@@ -136,6 +136,149 @@ fn run_roots(index: &Index, roots: &[PathBuf], query: &str) -> Collected {
     out
 }
 
+/// Every hit from both phases, in the order the engine ranks them, with the
+/// flag that decides whether it opens as a folder. Names alone cannot tell a
+/// folder from a file that shares its name.
+fn run_typed(index: &Index, path: &Path, query: &str, recursive: bool) -> Vec<(String, bool)> {
+    let cancel = Arc::new(AtomicBool::new(false));
+    let mut found = Vec::new();
+    search(
+        index,
+        &SearchRequest {
+            path: path.to_string_lossy().into_owned(),
+            roots: Vec::new(),
+            query: query.to_string(),
+            recursive,
+            show_hidden: false,
+        },
+        &cancel,
+        |event| {
+            match event {
+                SearchEvent::Local { items, .. } | SearchEvent::Batch { items, .. } => {
+                    found.extend(
+                        items
+                            .into_iter()
+                            .map(|hit| (hit.entry.name, hit.entry.is_dir)),
+                    );
+                }
+                SearchEvent::Done { .. } => {}
+                SearchEvent::Failed { message } => panic!("search failed: {message}"),
+            }
+            true
+        },
+    );
+    found
+}
+
+/// The folder on screen is answered from memory, and folders in it are
+/// results rather than only places to go next.
+#[test]
+fn a_folder_in_the_current_folder_is_found_by_its_name() {
+    let dir = scratch("local-folder");
+    fs::create_dir_all(dir.join("Invoices")).unwrap();
+    fs::write(dir.join("invoices.txt"), b"x").unwrap();
+
+    let index = Index::default();
+    scan_into_index(&index, &dir);
+    let found = run_typed(&index, &dir, "invoices", true);
+
+    assert!(
+        found.contains(&("Invoices".to_string(), true)),
+        "the folder must be a hit marked as a folder: {found:?}"
+    );
+    assert!(
+        found.contains(&("invoices.txt".to_string(), false)),
+        "the file beside it must stay a hit: {found:?}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// The walk reports folders as results, and still descends into them.
+#[test]
+fn a_recursive_search_finds_folders_below_the_starting_folder() {
+    let dir = scratch("walk-folders");
+    fs::create_dir_all(dir.join("projects/lyre-archive")).unwrap();
+    fs::write(dir.join("projects/lyre-archive/lyre-notes.txt"), b"x").unwrap();
+
+    let index = Index::default();
+    scan_into_index(&index, &dir);
+    let found = run_typed(&index, &dir, "lyre", true);
+
+    assert!(
+        found.contains(&("lyre-archive".to_string(), true)),
+        "a folder below the starting folder must be found as a folder: {found:?}"
+    );
+    assert!(
+        found.contains(&("lyre-notes.txt".to_string(), false)),
+        "matching the folder must not stop the walk entering it: {found:?}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// A folder is a place rather than a hit, so it leads even when a file beside
+/// it matched better: "reports" is the file's whole name and only a fragment of
+/// the folder's.
+#[test]
+fn a_folder_leads_a_file_that_matched_better() {
+    let dir = scratch("folders-first");
+    fs::create_dir_all(dir.join("reports-archive-2019")).unwrap();
+    fs::write(dir.join("reports.txt"), b"x").unwrap();
+
+    let index = Index::default();
+    scan_into_index(&index, &dir);
+    let found = run_typed(&index, &dir, "reports", false);
+
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert_eq!(
+        found[0],
+        ("reports-archive-2019".to_string(), true),
+        "the folder must lead: {found:?}"
+    );
+    assert_eq!(found[1], ("reports.txt".to_string(), false));
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// Matching more than a list of rows can hold must not cost a folder its place:
+/// folders are ranked first, and that ranking is what the cut to the row limit
+/// uses, so the folders survive and the files fill what is left.
+///
+/// The folder names are deliberately the weakest matches here, scattered
+/// letters with long names, so they can only survive the cut on being folders.
+#[test]
+fn every_folder_survives_the_row_limit() {
+    let dir = scratch("folders-under-cap");
+    for i in 0..1_200 {
+        fs::write(dir.join(format!("report-{i:04}.txt")), b"x").unwrap();
+    }
+    for name in ["r-e-p-o-r-t-alpha", "r-e-p-o-r-t-beta", "r-e-p-o-r-t-gamma"] {
+        fs::create_dir_all(dir.join(name)).unwrap();
+    }
+
+    let index = Index::default();
+    scan_into_index(&index, &dir);
+    let found = run_typed(&index, &dir, "report", false);
+
+    assert!(
+        found.len() < 1_203,
+        "the answer must still be capped, not 1203 rows: {}",
+        found.len()
+    );
+    let leading: Vec<&str> = found.iter().take(3).map(|(name, _)| name.as_str()).collect();
+    assert!(
+        leading.iter().all(|name| name.starts_with("r-e-p-o-r-t-")),
+        "the folders must lead the capped list: {leading:?}"
+    );
+    assert!(
+        found.iter().take(3).all(|(_, is_dir)| *is_dir),
+        "those rows must be the folders: {leading:?}"
+    );
+
+    fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn subsequences_match_and_rank_above_scattered_letters() {
     let dir = scratch("rank");

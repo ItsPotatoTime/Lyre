@@ -8,19 +8,24 @@
   grid-template-columns: var(--nav-w, var(--navrail-w)) 1px 1fr;
   min-height: 0;
   background: var(--bg-content);
+  /* The preview pane takes a fixed column on the right, the way Explorer's
+     does, but a fixed 300px is a third of a half-sized window and leaves the
+     list too narrow for its own columns. It gives way with the window instead,
+     between a width that can still show a picture and the width it is on a
+     large one. */
+  --preview-w: clamp(220px, 24vw, 300px);
 }
 
 .body[data-nav="false"] {
   grid-template-columns: 1fr;
 }
 
-/* The preview pane takes a fixed column on the right, the way Explorer's does. */
 .body[data-preview="true"] {
-  grid-template-columns: var(--nav-w, var(--navrail-w)) 1px 1fr var(--preview-w, 300px);
+  grid-template-columns: var(--nav-w, var(--navrail-w)) 1px 1fr var(--preview-w);
 }
 
 .body[data-preview="true"][data-nav="false"] {
-  grid-template-columns: 1fr var(--preview-w, 300px);
+  grid-template-columns: 1fr var(--preview-w);
 }
 
 .preview {

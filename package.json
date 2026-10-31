@@ -6,7 +6,7 @@
   "description": "A fast, cross-platform file manager in the Windows 11 design language.",
   "packageManager": "bun@1.4.4",
   "scripts": {
-    "dev": "tauri dev",
+    "dev": "bun run scripts/dev.ts",
     "dev:web": "vite",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",

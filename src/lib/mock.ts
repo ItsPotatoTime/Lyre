@@ -14,6 +14,30 @@ const HOME = "/home/you";
 
 export const mockHome = () => HOME;
 
+/**
+ * A stand-in thumbnail for the browser.
+ *
+ * The real one is a PNG made by the desktop app, and the browser cannot run
+ * ffmpeg or pdftoppm. Without something here, the row and tile thumbnails exist
+ * in the code and never in the page, so how they look and when they appear could
+ * only be judged in the packaged build. This paints a small landscape in the
+ * file's own colour instead, derived from its path so a picture looks the same
+ * on every reload.
+ */
+export function mockThumbnail(path: string): string {
+  let hash = 0;
+  for (let i = 0; i < path.length; i += 1) {
+    hash = (hash * 31 + path.charCodeAt(i)) | 0;
+  }
+  const hue = Math.abs(hash) % 360;
+  const svg =
+    `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64">` +
+    `<rect width="64" height="64" fill="hsl(${hue} 42% 54%)"/>` +
+    `<path d="M0 64 L18 32 L32 48 L45 37 L64 56 L64 64 Z" fill="hsl(${hue} 38% 33%)"/>` +
+    `</svg>`;
+  return `data:image/svg+xml,${encodeURIComponent(svg)}`;
+}
+
 export function mockPlaces(): Place[] {
   const folders: [string, string, string][] = [
     ["Desktop", "desktop", "folder"],

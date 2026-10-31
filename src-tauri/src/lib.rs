@@ -512,7 +512,12 @@ fn dir_stamp(path: String) -> Option<i64> {
 pub fn run() {
     // Before the webview exists: WebKit reads this once, at initialisation.
     graphics::apply_at_startup();
-    tauri::Builder::default()
+    // Under LYRE_TRACE, a close reports which step it reached. A freeze can be
+    // the request never arriving, the window not being disposed, or the event
+    // loop not ending, and one line says which without attaching a debugger to
+    // a window that no longer responds.
+    let tracing = std::env::var_os("LYRE_TRACE").is_some();
+    let app = tauri::Builder::default()
         // Lets a drag that reaches the window edge become a real operating
         // system drag, so files can be dropped into other applications.
         .plugin(tauri_plugin_drag::init())
@@ -521,6 +526,31 @@ pub fn run() {
             Ok(())
         })
         .manage(AppState::default())
+        .on_window_event(move |_window, event| {
+            let tauri::WindowEvent::CloseRequested { api, .. } = event else {
+                return;
+            };
+            // Closing ends the process instead of disposing the window, and the
+            // reason is a bug below us rather than a preference.
+            //
+            // Disposing the window runs `on_window_close` in tauri-runtime-wry,
+            // which drops the Tao window while holding a mutable borrow of its
+            // window store. The drag plugin leaves GTK signal handlers on the
+            // window whenever a drag-out neither completes nor fails, and those
+            // handlers are destroyed as part of that drop; their teardown
+            // borrows the same store, so it panics with "RefCell already
+            // mutably borrowed" inside an extern "C" callback, which cannot
+            // unwind and therefore aborts. The desktop showed that as a window
+            // that had stopped responding.
+            //
+            // Nothing is lost by skipping it: preferences are written when they
+            // change, no edit is buffered, and the window is the only one.
+            api.prevent_close();
+            if tracing {
+                eprintln!("[lyre] exit on close");
+            }
+            std::process::exit(0);
+        })
         .invoke_handler(tauri::generate_handler![
             scan_dir,
             search_dir,
@@ -553,8 +583,13 @@ pub fn run() {
             open_with_app,
             set_default_app
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Lyre");
+        .build(tauri::generate_context!())
+        .expect("error while building Lyre");
+    app.run(move |_app, event| {
+        if tracing && matches!(event, tauri::RunEvent::Exit) {
+            eprintln!("[lyre] exit");
+        }
+    });
 }
 
 #[cfg(test)]

@@ -368,7 +368,10 @@ export async function previewInfo(path: string): Promise<PreviewInfo> {
 
 /** A thumbnail for the file as an object URL, or null when there is none. */
 export async function previewThumbnail(path: string): Promise<string | null> {
-  if (!isTauri) return null;
+  if (!isTauri) {
+    const { mockThumbnail } = await import("./mock");
+    return mockThumbnail(path);
+  }
   const { invoke } = await import("@tauri-apps/api/core");
   const raw = await invoke<ArrayBuffer | number[]>("preview_thumbnail", { path });
   // Binary IPC normally arrives as an ArrayBuffer; a plain array is accepted

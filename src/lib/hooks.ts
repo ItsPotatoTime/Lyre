@@ -61,6 +61,19 @@ export function useVirtual(
 ) {
   const ref = useRef<HTMLDivElement | null>(null);
   const [bounds, setBounds] = useState({ start: 0, end: 40, height: 640, width: 0 });
+  // The scroll container is not in the document while a folder is still being
+  // read: the list shows a skeleton instead. The effect below therefore runs
+  // once with nothing to attach to, and none of its dependencies change when
+  // the container finally appears, so it never ran again. The list scrolled
+  // while the same first screenful of rows stayed where it was, and everything
+  // past them looked empty. Mirroring the attached node into state gives that
+  // effect something that does change, and also covers the element being
+  // swapped for the grid, which uses the same ref.
+  const [element, setElement] = useState<HTMLDivElement | null>(null);
+  useEffect(() => {
+    if (ref.current !== element) setElement(ref.current);
+  });
+
   // The row count changes on every streamed batch. Keeping it in a ref means
   // the listener and observer setup below runs once per layout change instead
   // of being torn down and rebuilt dozens of times during one scan.
@@ -69,7 +82,7 @@ export function useVirtual(
   const measureRef = useRef<() => void>(() => {});
 
   useEffect(() => {
-    const el = ref.current;
+    const el = element;
     if (!el) return;
     let frame = 0;
 
@@ -107,7 +120,7 @@ export function useVirtual(
       observer.disconnect();
       if (frame !== 0) cancelAnimationFrame(frame);
     };
-  }, [rowHeight, overscan]);
+  }, [element, rowHeight, overscan]);
 
   // More rows can mean more visible rows, so re-measure when the count moves.
   useEffect(() => {

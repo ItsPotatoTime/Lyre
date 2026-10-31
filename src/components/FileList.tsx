@@ -8,7 +8,14 @@ import type {
   ViewMode,
 } from "@/types";
 import type { DirStatus } from "@/lib/useDirectory";
-import { MIN_COLUMN, metricsFor, type Mode } from "@/lib/modes";
+import {
+  DEFAULT_COLUMNS,
+  fitColumns,
+  metricsFor,
+  MIN_COLUMN,
+  resizeColumns,
+  type Mode,
+} from "@/lib/modes";
 import { formatDate, formatSize, typeLabel } from "@/lib/format";
 import { useDelayed, useVirtual } from "@/lib/hooks";
 import { previewable, useThumbnail } from "@/lib/thumbnails";
@@ -17,10 +24,14 @@ import { Icon } from "./Icons";
 
 const COLUMNS: { key: SortKey; label: string; min: number }[] = [
   { key: "name", label: "Name", min: 160 },
-  { key: "modified", label: "Date modified", min: MIN_COLUMN },
-  { key: "type", label: "Type", min: MIN_COLUMN },
-  { key: "size", label: "Size", min: 46 },
+  // Enough for the date without its time, which is what the column is for; a
+  // narrower date column shows "10/29/2..." and tells nobody anything.
+  { key: "modified", label: "Date modified", min: 96 },
+  { key: "type", label: "Type", min: MIN_COLUMN + 4 },
+  { key: "size", label: "Size", min: 50 },
 ];
+
+const COLUMN_MINS = COLUMNS.map((column) => column.min) as ColumnWidths;
 
 /** One display row: either a date group header or a file. */
 type Row =
@@ -144,8 +155,6 @@ export function FileList({
 }) {
   const metrics = metricsFor(density);
   const rowHeight = view === "grid" ? metrics.tileHeight : metrics.rowHeight;
-  const tableWidth = columns.reduce((sum, width) => sum + width, 0);
-  const template = columns.map((width) => `${width}px`).join(" ");
 
   const display = useMemo(
     () => (grouped && view === "details" ? buildGroups(entries) : null),
@@ -193,6 +202,31 @@ export function FileList({
 
   const { ref, bounds } = useVirtual(rowCount, rowHeight, view === "grid" ? 1 : 6);
   const scrolling = ref as React.RefObject<HTMLDivElement | null>;
+
+  // The width the details list actually has, so the columns can be narrowed to
+  // fit it rather than running past its edge and being cut off there by the
+  // preview pane. Rows are inset 14px, so that much of the list is never
+  // available to them.
+  const [listWidth, setListWidth] = useState(0);
+  const listMounted = view === "details" && entries.length > 0;
+
+  useEffect(() => {
+    if (view !== "details") return;
+    const element = scrolling.current;
+    if (!element) return;
+    const update = () => setListWidth(element.getBoundingClientRect().width);
+    update();
+    const observer = new ResizeObserver(update);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [view, scrolling, listMounted]);
+
+  const effective = useMemo(
+    () => fitColumns(columns, COLUMN_MINS, Math.max(0, listWidth - 14)),
+    [columns, listWidth],
+  );
+  const tableWidth = effective.reduce((sum, width) => sum + width, 0);
+  const template = effective.map((width) => `${width}px`).join(" ");
 
   // While a folder is still scanning there are no rows, so the grid element is
   // not in the document at all. Without this the measuring effect ran once,
@@ -521,11 +555,15 @@ export function FileList({
     event.preventDefault();
     event.stopPropagation();
     const startX = event.clientX;
-    const startWidth = columns[index]!;
+    // Drag from what the column measures on screen rather than from the stored
+    // width: in a narrow window the two differ, and starting from the stored one
+    // made the column jump on the first pixel of movement.
+    const startWidth = effective[index]!;
+    const base = effective;
     const onMove = (move: PointerEvent) => {
-      const next = [...columns] as ColumnWidths;
-      next[index] = Math.max(COLUMNS[index]!.min, startWidth + move.clientX - startX);
-      onColumns(next);
+      onColumns(
+        resizeColumns(base, COLUMN_MINS, index, startWidth + move.clientX - startX),
+      );
     };
     const onUp = () => {
       window.removeEventListener("pointermove", onMove);
@@ -577,7 +615,7 @@ export function FileList({
                     onPointerDown={startResize(index)}
                     onDoubleClick={() => {
                       const next = [...columns] as ColumnWidths;
-                      next[index] = [271, 122, 122, 82][index]!;
+                      next[index] = DEFAULT_COLUMNS[index]!;
                       onColumns(next);
                     }}
                   />

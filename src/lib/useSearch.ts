@@ -102,11 +102,13 @@ export function useSearch(
           if (disposed) return;
           setState((prev) => ({
             ...prev,
-            // One relevance sort when the walk finishes, never during it: the
-            // list stays still while results stream in, then settles into the
-            // order the scores actually describe. Sorting is stable, so equal
-            // scores keep the order they arrived in.
-            items: [...prev.items].sort((a, b) => b.score - a.score),
+            // One sort when the walk finishes, never during it: the list stays
+            // still while results stream in, then settles into the order the
+            // scores actually describe. The engine ranks folders first as well,
+            // but the walk streams rows in the order it finds them, so the
+            // merged list is put back in order here. Sorting is stable, so
+            // equal scores keep the order they arrived in.
+            items: sortHits(prev.items),
             matched,
             scanned,
             elapsedMs,
@@ -137,6 +139,21 @@ export function useSearch(
   }, [path, rootsKey, query, showHidden, enabled]);
 
   return state;
+}
+
+/**
+ * The order the list settles into once the walk finishes: every folder first,
+ * then the files, each group by relevance.
+ *
+ * The engine orders its own answers this way, but a search that spans folders
+ * is assembled from a local phase and a stream of batches, so the merged list
+ * has to be sorted again or folders would land wherever the walk met them.
+ */
+export function sortHits(items: Hit[]): Hit[] {
+  return [...items].sort((a, b) => {
+    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1;
+    return b.score - a.score;
+  });
 }
 
 /** Match positions keyed by path, for the renderer. */

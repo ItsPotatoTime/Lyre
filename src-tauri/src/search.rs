@@ -11,9 +11,9 @@
 //!    entries to an index keyed by path, so the first phase of a search is a
 //!    pure memory scan with no syscalls at all.
 //! 2. **Names are matched, not metadata.** Walking subfolders reads directory
-//!    entries and matches the file name; only the items that match are
-//!    stat'ed. A recursive search therefore costs about one `readdir` per
-//!    folder instead of one `stat` per file.
+//!    entries and matches the name, of a file or of a folder; only the items
+//!    that match are stat'ed. A recursive search therefore costs about one
+//!    `readdir` per folder instead of one `stat` per file.
 //! 3. **The first phase is emitted before the second begins.** Local results
 //!    arrive in single-digit milliseconds and matches from deeper in the tree
 //!    stream in behind them. A keystroke cancels the work it started.
@@ -429,18 +429,28 @@ fn score_local(
     (materialise(&scored, entries, folder, pattern), matched)
 }
 
-/// Best score first, then the shorter name, then alphabetical. A short name
-/// that matches is a stronger signal than a long one containing the same
-/// letters by coincidence.
+/// Folders first, then best score, then the shorter name, then alphabetical. A
+/// short name that matches is a stronger signal than a long one containing the
+/// same letters by coincidence.
 ///
 /// A packed folder produces tens of thousands of ties (a two-letter query
 /// matches almost everything), so this comparator is the hot loop: it never
 /// allocates, and the list is cut to `limit` before it is fully sorted.
 fn rank(scored: &mut Vec<(u32, u32)>, entries: &[CompactEntry], limit: usize) {
     let compare = |a: &(u32, u32), b: &(u32, u32)| {
-        let left = &entries[a.1 as usize].name;
-        let right = &entries[b.1 as usize].name;
-        b.0.cmp(&a.0)
+        let left_entry = &entries[a.1 as usize];
+        let right_entry = &entries[b.1 as usize];
+        let left = &left_entry.name;
+        let right = &right_entry.name;
+        // Folders first, whatever their score. A folder is a place rather than
+        // a hit, so someone searching for one is usually navigating, and a
+        // folder buried under a page of matching files is a folder they will
+        // not find. This is also the primary key for the cut to `limit`, so
+        // folders keep their places in the list even when files outnumber them.
+        right_entry
+            .is_dir()
+            .cmp(&left_entry.is_dir())
+            .then_with(|| b.0.cmp(&a.0))
             .then_with(|| left.len().cmp(&right.len()))
             .then_with(|| compare_ignore_case(left, right))
     };
@@ -643,15 +653,15 @@ where
                             let is_symlink =
                                 file_type.as_ref().map(|t| t.is_symlink()).unwrap_or(false);
 
-                            if is_dir {
-                                // A link can point at its own parent, so linked
-                                // folders are never followed.
-                                if !is_symlink && depth < MAX_DEPTH {
-                                    subdirs.push((item.path(), depth + 1));
-                                }
-                                continue;
+                            // A link can point at its own parent, so linked
+                            // folders are followed only when they are not links.
+                            if is_dir && !is_symlink && depth < MAX_DEPTH {
+                                subdirs.push((item.path(), depth + 1));
                             }
 
+                            // A folder is a result in its own right, not only a
+                            // stop on the way down, so its name is matched here
+                            // exactly as a file's is.
                             fold_into(&name, &mut folded);
                             let Some(score) =
                                 pattern.score(Utf32Str::new(&folded, &mut buf), &mut matcher)

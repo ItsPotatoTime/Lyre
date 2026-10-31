@@ -110,11 +110,12 @@ export function mockPathInfo(path: string): PathInfo {
 export async function mockScan(
   path: string,
   showHidden: boolean,
+  showProtected: boolean,
   handlers: ScanHandlers,
 ): Promise<ScanHandle> {
   const started = performance.now();
   const all = listing(path);
-  const entries = showHidden ? all : all.filter((e) => !e.hidden);
+  const entries = all.filter((e) => visible(e, showHidden, showProtected));
   let cancelled = false;
 
   // Stream the way the real core does: a few hundred rows per frame so the
@@ -199,6 +200,18 @@ function uniqueName(name: string, taken: Set<string>): string {
   }
 }
 
+/**
+ * A stand-in for the system attribute the desktop uses to keep its own entries
+ * out of a listing. Unix has no such mark, so these names exist only to make the
+ * browser show the state the packaged app shows on Windows.
+ */
+const PROTECTED = new Set(["lost+found", "snap"]);
+
+/** Whether a row belongs in the list at the current settings. */
+function visible(entry: Entry, showHidden: boolean, showProtected: boolean): boolean {
+  return (showHidden || !entry.hidden) && (showProtected || !entry.protected);
+}
+
 function makeEntry(
   parent: string,
   name: string,
@@ -222,12 +235,15 @@ function makeEntry(
     kind: resolved,
     ext,
     hidden: name.startsWith("."),
+    protected: PROTECTED.has(name),
     readable: true,
   };
 }
 
 const CHILDREN: Record<string, [string, EntryKind | "folder"][]> = {
   "/": [
+    ["lost+found", "folder"],
+    ["snap", "folder"],
     ["home", "folder"],
     ["media", "folder"],
     ["usr", "folder"],
@@ -476,6 +492,7 @@ export async function mockSearch(
   query: string,
   recursive: boolean,
   showHidden: boolean,
+  showProtected: boolean,
   handlers: SearchHandlers,
 ): Promise<ScanHandle> {
   const started = performance.now();
@@ -484,7 +501,7 @@ export async function mockSearch(
   const start = path === "" ? (roots[0] ?? "/") : path;
 
   const local = path === "" ? [] : listing(path)
-    .filter((entry) => showHidden || !entry.hidden)
+    .filter((entry) => visible(entry, showHidden, showProtected))
     .map((entry) => toHit(entry, query))
     .filter((hit): hit is Hit => hit !== null)
     .sort((a, b) => b.score - a.score);
@@ -518,7 +535,7 @@ export async function mockSearch(
       push(dirHit);
       for (const [name, kind] of CHILDREN[key]!) {
         const entry = makeEntry(key, name, kind, mulberry32(hash(key + name)), Date.now());
-        push(toHit(entry, query));
+        if (visible(entry, showHidden, showProtected)) push(toHit(entry, query));
       }
     }
 

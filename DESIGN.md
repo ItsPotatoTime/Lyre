@@ -73,6 +73,12 @@ spreadsheets, orange presentations, indigo code.
 
 Contrast: every text pairing measures at or above 5.0:1, most above 7:1.
 
+A hidden entry is drawn dimmed, the way Explorer marks one: its name takes
+`--text-hidden` (`#6d6e6e` light, `#9a9a9a` dark, 5.1 and 5.3:1 on the content
+surface) and its picture drops to 55 percent. The row that is selected or
+focused is not dimmed, because the accent tint under it would pull the dim tone
+below 4.5:1 and that row is the one being acted on.
+
 ## Iconography
 
 One authored set, 20x20 grid, 1.5 px stroke, round joins, drawn as SVG in
@@ -111,6 +117,8 @@ rows, where the cost would scale with the directory.
 Every region has all five: rest, hover, pressed, selected, focused.
 
 - Selection: accent tint plus, when focused, a 1 px accent ring.
+- Hidden entries: dimmed name and picture, restored on the selected or focused
+  row. The tooltip says so in words, so the state does not rest on colour alone.
 - Empty folder: "This folder is empty", with the hidden-items hint.
 - Empty search: "No items match your search", naming the cause rather than
   pretending the folder is empty.

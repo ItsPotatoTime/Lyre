@@ -29,6 +29,12 @@ export interface Entry {
   kind: EntryKind;
   ext: string;
   hidden: boolean;
+  /**
+   * Belongs to the system rather than to the person using it, which is what
+   * the desktop's own file manager hides even when it is showing hidden
+   * files. Only Windows marks entries this way.
+   */
+  protected: boolean;
   readable: boolean;
 }
 

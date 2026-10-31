@@ -77,6 +77,10 @@ pub struct SearchRequest {
     pub recursive: bool,
     #[serde(default)]
     pub show_hidden: bool,
+    /// Whether to match the entries the system marks as its own. Off by
+    /// default, matching the scanner.
+    #[serde(default)]
+    pub show_protected: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -103,13 +107,21 @@ pub struct CompactEntry {
     pub size: u64,
     pub modified_ms: Option<i64>,
     pub kind: &'static str,
-    /// is_dir | is_symlink << 1 | hidden << 2 | readable << 3
+    /// is_dir | is_symlink << 1 | hidden << 2 | readable << 3 | protected << 4
     flags: u8,
 }
 
 impl CompactEntry {
     pub fn is_dir(&self) -> bool {
         self.flags & 1 != 0
+    }
+
+    pub fn hidden(&self) -> bool {
+        self.flags & 4 != 0
+    }
+
+    pub fn protected(&self) -> bool {
+        self.flags & 16 != 0
     }
 
     /// Rebuild the row the interface renders, from the folder it lives in.
@@ -126,8 +138,9 @@ impl CompactEntry {
             ext,
             is_dir: self.is_dir(),
             is_symlink: self.flags & 2 != 0,
-            hidden: self.flags & 4 != 0,
+            hidden: self.hidden(),
             readable: self.flags & 8 != 0,
+            protected: self.protected(),
             name,
             size: self.size,
             modified_ms: self.modified_ms,
@@ -150,6 +163,9 @@ impl From<&Entry> for CompactEntry {
         }
         if entry.readable {
             flags |= 8;
+        }
+        if entry.protected {
+            flags |= 16;
         }
         CompactEntry {
             name: entry.name.as_str().into(),
@@ -293,7 +309,8 @@ where
             let entries = match index.get(path) {
                 Some(cached) => cached,
                 None => {
-                    let collected = collect(path, request.show_hidden, cancel);
+                    let collected =
+                        collect(path, request.show_hidden, request.show_protected, cancel);
                     let compact: Vec<CompactEntry> =
                         collected.iter().map(CompactEntry::from).collect();
                     let shared = Arc::new(compact);
@@ -301,7 +318,14 @@ where
                     shared
                 }
             };
-            let (hits, matched) = score_local(&pattern, &entries, path, LIMIT);
+            let (hits, matched) = score_local(
+                &pattern,
+                &entries,
+                path,
+                LIMIT,
+                request.show_hidden,
+                request.show_protected,
+            );
             (hits, matched, entries.len())
         }
         None => (Vec::new(), 0, 0),
@@ -345,6 +369,7 @@ where
             covered: local_path.as_deref(),
             pattern: &pattern,
             show_hidden: request.show_hidden,
+            show_protected: request.show_protected,
             cancel,
             matched_so_far: matched_local,
             scanned_so_far: laid_out,
@@ -362,9 +387,14 @@ where
 
 /// Scan a folder synchronously when the index has nothing for it yet. Rare:
 /// the interface scans a folder before showing it, so the cache is warm.
-fn collect(path: &Path, show_hidden: bool, cancel: &Arc<AtomicBool>) -> Vec<Entry> {
+fn collect(
+    path: &Path,
+    show_hidden: bool,
+    show_protected: bool,
+    cancel: &Arc<AtomicBool>,
+) -> Vec<Entry> {
     let mut out = Vec::new();
-    scan::scan(path, show_hidden, cancel, |event| {
+    scan::scan(path, show_hidden, show_protected, cancel, |event| {
         if let scan::ScanEvent::Batch { entries, .. } = event {
             out.extend(entries);
         }
@@ -377,11 +407,19 @@ fn collect(path: &Path, show_hidden: bool, cancel: &Arc<AtomicBool>) -> Vec<Entr
 ///
 /// Returns the hits and the total number of matches, which the status bar
 /// reports even when the list itself is capped.
+///
+/// Entries the settings keep out of the list are dropped here rather than only
+/// in the scanner. The folder on screen is usually answered from an index built
+/// by a scan that ran with the settings of that moment, and a switch flipped
+/// since then must not surface a row through memory that a fresh read would not
+/// have found.
 fn score_local(
     pattern: &Pattern,
     entries: &[CompactEntry],
     folder: &Path,
     limit: usize,
+    show_hidden: bool,
+    show_protected: bool,
 ) -> (Vec<Hit>, usize) {
     if entries.is_empty() {
         return (Vec::new(), 0);
@@ -406,6 +444,11 @@ fn score_local(
                 while index < entries.len() {
                     let end = (index + CHUNK).min(entries.len());
                     for (offset, entry) in entries[index..end].iter().enumerate() {
+                        if (!show_hidden && entry.hidden())
+                            || (!show_protected && entry.protected())
+                        {
+                            continue;
+                        }
                         fold_into(&entry.name, &mut folded);
                         if let Some(score) =
                             pattern.score(Utf32Str::new(&folded, &mut buf), &mut matcher)
@@ -531,6 +574,7 @@ struct Walk<'a> {
     covered: Option<&'a Path>,
     pattern: &'a Pattern,
     show_hidden: bool,
+    show_protected: bool,
     cancel: &'a Arc<AtomicBool>,
     matched_so_far: usize,
     scanned_so_far: usize,
@@ -550,6 +594,7 @@ where
         covered,
         pattern,
         show_hidden,
+        show_protected,
         cancel,
         matched_so_far,
         scanned_so_far,
@@ -625,7 +670,8 @@ where
                         // Phase one already answered for this folder's own
                         // entries; only its children are still unexamined.
                         if covered.is_some_and(|path| path == dir) {
-                            let children = subfolders(&dir, show_hidden, depth);
+                            let children =
+                                subfolders(&dir, show_hidden, show_protected, depth);
                             if !children.is_empty() {
                                 if let Ok(mut queue) = queue.lock() {
                                     queue.extend(children);
@@ -645,7 +691,16 @@ where
                             let Ok(item) = item else { continue };
                             examined.fetch_add(1, Ordering::Relaxed);
                             let name = item.file_name().to_string_lossy().into_owned();
-                            if !show_hidden && name.starts_with('.') {
+                            // Neither a result nor a place to walk into while
+                            // the setting that would show it is off. The
+                            // attributes come free with the directory entry
+                            // where they exist.
+                            if !scan::is_listed(
+                                show_hidden,
+                                show_protected,
+                                name.starts_with('.'),
+                                scan::entry_flags(&item),
+                            ) {
                                 continue;
                             }
                             let file_type = item.file_type().ok();
@@ -795,7 +850,12 @@ fn is_virtual_filesystem(path: &Path) -> bool {
 }
 
 /// Immediate children of a folder that are folders, for the walk to start on.
-fn subfolders(dir: &Path, show_hidden: bool, depth: usize) -> Vec<(PathBuf, usize)> {
+fn subfolders(
+    dir: &Path,
+    show_hidden: bool,
+    show_protected: bool,
+    depth: usize,
+) -> Vec<(PathBuf, usize)> {
     let mut out = Vec::new();
     if depth >= MAX_DEPTH {
         return out;
@@ -805,7 +865,12 @@ fn subfolders(dir: &Path, show_hidden: bool, depth: usize) -> Vec<(PathBuf, usiz
     };
     for item in read.flatten() {
         let name = item.file_name().to_string_lossy().into_owned();
-        if !show_hidden && name.starts_with('.') {
+        if !scan::is_listed(
+            show_hidden,
+            show_protected,
+            name.starts_with('.'),
+            scan::entry_flags(&item),
+        ) {
             continue;
         }
         let Ok(file_type) = item.file_type() else {
@@ -833,6 +898,7 @@ mod memory_tests {
             kind: "Text document",
             ext: "txt".into(),
             hidden: false,
+            protected: false,
             readable: true,
         }
     }

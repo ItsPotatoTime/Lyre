@@ -55,7 +55,6 @@ import {
 import { targetAt, useDrag, type DragTarget, type DropMode } from "@/lib/dragAndDrop";
 import { sameVolume } from "@/lib/volumes";
 import { startNativeDrag } from "@/lib/nativeDrag";
-import { measureFrameRate } from "@/lib/frameRate";
 import {
   clearDropHighlight,
   setDropHighlight,
@@ -221,6 +220,8 @@ function Browser({
   const [navOpen, setNavOpen] = useState(prefs.navOpen);
   const [navWidth, setNavWidth] = useState(prefs.navWidth);
   const [showHidden, setShowHidden] = useState(prefs.showHidden);
+  const [showProtected, setShowProtected] = useState(prefs.showProtected);
+  const [showFrameRate, setShowFrameRate] = useState(false);
   const [mode, setMode] = useState<Mode>(prefs.mode);
   const [columns, setColumns] = useState<ColumnWidths>(prefs.columns);
   const [notice, setNotice] = useState<string | null>(null);
@@ -302,6 +303,7 @@ function Browser({
   const dir = useDirectory(
     showsFiles ? location.path : "",
     showHidden,
+    showProtected,
     active.sort,
     nonce,
   );
@@ -322,7 +324,14 @@ function Browser({
   }, [location.kind, home, volumes]);
 
   const searching = query.trim().length > 0;
-  const search = useSearch(searchPath, roots, query, showHidden, searching);
+  const search = useSearch(
+    searchPath,
+    roots,
+    query,
+    showHidden,
+    showProtected,
+    searching,
+  );
   const highlights = useMemo(() => matchIndex(search.items), [search.items]);
 
   const patchTab = useCallback((patch: (tab: Tab) => Tab) => {
@@ -407,6 +416,7 @@ function Browser({
       groupByDate: active.groupByDate,
       mode,
       showHidden,
+      showProtected,
       navOpen,
       navWidth,
       columns,
@@ -419,6 +429,7 @@ function Browser({
     active.groupByDate,
     mode,
     showHidden,
+    showProtected,
     navOpen,
     navWidth,
     columns,
@@ -1667,6 +1678,8 @@ function Browser({
         onToggleNav={() => setNavOpen((value) => !value)}
         showHidden={showHidden}
         onToggleHidden={() => setShowHidden((value) => !value)}
+        showProtected={showProtected}
+        onToggleProtected={() => setShowProtected((value) => !value)}
         selectedCount={selection.selected.size}
         onSelectAll={() =>
           setSelection({
@@ -1713,13 +1726,8 @@ function Browser({
           library.hiddenPins.length > 0 || library.extraPins.length > 0
         }
         onRestorePins={restorePins}
-        onMeasureFrameRate={() => {
-          void measureFrameRate().then((report) => {
-            flash(
-              `${report.hz} Hz · ${report.frames} frames · median ${report.interval.toFixed(1)} ms · fastest ${report.fastest.toFixed(1)} ms`,
-            );
-          });
-        }}
+        frameRate={showFrameRate}
+        onToggleFrameRate={() => setShowFrameRate((value) => !value)}
         notice={flash}
       />
 
@@ -1947,6 +1955,7 @@ function Browser({
         filtering={filtering}
         notice={notice}
         search={searching ? search : null}
+        showFrameRate={showFrameRate}
       />
     </div>
   );

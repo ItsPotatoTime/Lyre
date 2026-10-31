@@ -674,8 +674,8 @@ export function FileList({
             <>
               <div className="state-title">This folder is empty</div>
               <div className="state-body">
-                There is nothing here. Hidden items may still be present: turn
-                them on from the View menu.
+                There is nothing here. Hidden or protected items may still be
+                present: turn them on from the View menu.
               </div>
             </>
           )}
@@ -764,12 +764,13 @@ export function FileList({
                         selection.selected.has(entry.path) ? "true" : "false"
                       }
                       data-focused={index === focusedIndex ? "true" : "false"}
+                      data-hidden={entry.hidden ? "true" : "false"}
                       style={{
                         width: metrics.tileWidth,
                         height: metrics.tileHeight,
                         transform: `translate(${column * metrics.tileWidth}px, ${row * metrics.tileHeight}px)`,
                       }}
-                      title={entry.name}
+                      title={entry.hidden ? `${entry.name} (hidden)` : entry.name}
                       onPointerDown={(event) => handleRowPointerDown(event, index)}
                       onDoubleClick={() => onOpen(entry)}
                       onContextMenu={(event) => onContextMenu?.(event, entry)}
@@ -778,7 +779,11 @@ export function FileList({
                         <EntryIcon entry={entry} size={40} />
                       </div>
                       <div className="tile-label">
-                        <MatchedName name={entry.name} indices={matched?.get(entry.path)} />
+                        <MatchedName
+                          name={entry.name}
+                          indices={matched?.get(entry.path)}
+                          hidden={entry.hidden}
+                        />
                       </div>
                     </div>
                   );
@@ -898,6 +903,7 @@ function DetailRow({
       aria-selected={selected}
       data-selected={selected ? "true" : "false"}
       data-focused={focused ? "true" : "false"}
+      data-hidden={entry.hidden ? "true" : "false"}
       style={{
         gridTemplateColumns: template,
         width,
@@ -917,7 +923,7 @@ function DetailRow({
             onCancel={() => onCancelRename?.()}
           />
         ) : (
-          <MatchedName name={entry.name} indices={indices} />
+          <MatchedName name={entry.name} indices={indices} hidden={entry.hidden} />
         )}
       </div>
       <div className="cell cell-muted tabular">{formatDate(entry.modifiedMs)}</div>
@@ -969,17 +975,24 @@ function GroupRow({
  * what matched. `indices` are character offsets, so the string is walked as
  * code points rather than UTF-16 units, and runs of hits collapse into one
  * element instead of one per character.
+ *
+ * `hidden` only reaches the tooltip. The dimming is a style on the row, so the
+ * name stays one element and a search highlight lands in the same place whether
+ * the entry is hidden or not.
  */
 function MatchedName({
   name,
   indices,
+  hidden = false,
 }: {
   name: string;
   indices?: number[] | undefined;
+  hidden?: boolean;
 }) {
+  const title = hidden ? `${name} (hidden)` : name;
   if (!indices || indices.length === 0) {
     return (
-      <span className="cell-text" title={name}>
+      <span className="cell-text" title={title}>
         {name}
       </span>
     );
@@ -996,7 +1009,7 @@ function MatchedName({
   }
 
   return (
-    <span className="cell-text" title={name}>
+    <span className="cell-text" title={title}>
       {parts.map((part, index) =>
         part.hit ? (
           <span key={index} className="hit">

@@ -45,7 +45,7 @@ Working now:
 - Selection (click, ctrl-click, shift-range, keyboard), type-ahead, Home/End,
   PageUp/PageDown, Enter, Backspace
 - In-folder filter from the search field
-- Explorer and compact density, hidden items toggle
+- Explorer and compact density, hidden and protected item toggles
 - Light, dark, and system themes
 - Window chrome: tabs in a custom title bar, caption buttons, edge resizing
 - Opening a file in whatever the desktop associates with its type
@@ -188,6 +188,32 @@ half-sized window that means a long date ellipsizes rather than the Type and
 Size columns sliding under the pane, where they could not be read or scrolled
 to. Dragging a divider trades width with the other columns, so it still moves.
 
+## Hidden and protected items
+
+Two different things keep an entry out of a listing, and they are two switches
+because the desktop's own file manager treats them as two.
+
+An entry is **hidden** when its name begins with a dot, or when it carries the
+hidden attribute on Windows. "Show hidden items" in the View menu brings those
+back, drawn dimmed so a list that is showing them still says which ones they
+are: the name takes the dim tone and the picture drops to 55 percent, and both
+return to full strength once the row is selected or focused.
+
+An entry is **protected** when the system marks it as its own, which on Windows
+means `FILE_ATTRIBUTE_SYSTEM`: `pagefile.sys`, `hiberfil.sys`, `bootmgr`,
+`$Recycle.Bin`, `System Volume Information`, `Config.Msi`, the `DumpStack` logs.
+Explorer keeps those out of the list even with hidden files turned on, and that
+is the listing difference worth fixing: with hidden items shown, Lyre was
+offering files Explorer would not. "Show protected operating system items" is
+off by default, so the default listing is the one Explorer shows, and switching
+it on lists everything the volume holds. No other platform marks entries this
+way, so there the switch has nothing to reveal.
+
+The reverse difference stays, and is worth knowing: a leading dot hides a name
+on every platform here, because that is what a dot means everywhere except
+Windows, where Explorer has no such rule and lists `.gitignore` normally.
+Explorer's own rule is the file attribute, which is read as well.
+
 ## Search
 
 Search runs in two phases: the folder on screen is answered from memory, then a
@@ -246,14 +272,47 @@ lever that moved them materially was the graphics setting above.
 ## Frame rate
 
 A file manager does not animate continuously, so "it feels like 60 Hz" is
-usually about scrolling rather than idle frames. **More → Measure frame rate**
-samples the paint loop for 1.2 seconds and reports the median interval, which is
-the only honest way to tell a capped webview from a misperception.
+usually about scrolling rather than idle frames. **More → Show frame rate** puts
+the paint loop in the status bar: it samples continuously in one second windows
+and reports the median rate, so the number is live rather than a single reading
+that has already gone by the time you look at it. A rate that does not move
+while you scroll a large folder is a cap, and the number names it.
 
-On WebKitGTK, a compositor falling back to software is the usual cause of a
-locked rate. `WEBKIT_DISABLE_DMABUF_RENDERER=1` is the first thing to try with
-NVIDIA drivers; `vblank_mode=0` or `__GL_SYNC_TO_VBLANK=0` affect whether the
-compositor is allowed to exceed the monitor rate.
+The meter keeps one pixel changing every frame, so it measures a window that is
+actually being drawn rather than one being spared work. That is also why it is a
+switch you turn on for a moment and not a setting: while it is on, the
+compositor is working as hard as it can.
+
+On Linux the webview has a ceiling of its own. Measured on this machine
+(WebKitGTK 2.54.2, Hyprland 0.56.2, a 1920x1080 panel at 300 Hz, Radeon 6700 XT
+on Mesa), the same second of `requestAnimationFrame` gave:
+
+- GTK's own frame clock: **294 to 297 Hz** with the window redrawn every frame, and
+  60 Hz when nothing asks for a frame.
+- WebKitGTK: **59 Hz**, for a 1x1 transparent probe, for a 1x1 repaint, and for
+  a full-window repaint every frame. The same number with the dmabuf renderer
+  disabled, with compositing disabled, and under XWayland.
+- WebKitGTK with `WEBKIT_DISPLAY_REFRESH_THROTTLE_FPS` set to 300 and to 0:
+  still 59 Hz.
+
+So the monitor is not the limit, the compositor is not the limit, and the meter
+is not wrong. The build contains WebKit's own preference for this,
+`PreferPageRenderingUpdatesNear60FPS` ("Prefer page rendering updates near 60
+frames per second rather than using the display's refresh rate"), and 2.54
+exposes no property or environment variable that turns it off, so nothing the
+application sets moves the number. On Linux the window is a 60 fps window
+because its renderer is one.
+
+Where the reading is far below 60, a compositor falling back to software is the
+usual cause: a desktop in a VM measured 31 Hz. On WebKitGTK,
+`WEBKIT_DISABLE_DMABUF_RENDERER=1` is the first thing to try with NVIDIA
+drivers; `vblank_mode=0` or `__GL_SYNC_TO_VBLANK=0` affect whether the compositor
+is allowed to exceed the monitor rate.
+
+On Windows there is no equivalent engine ceiling to look for: Chromium's paint
+loop follows the display, so a rate near 60 on a faster panel means the webview
+has lost its hardware compositing path. Check the panel's own refresh rate in
+Windows Settings first.
 
 ## Drag and drop
 

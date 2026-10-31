@@ -16,6 +16,12 @@ export interface Prefs {
   groupByDate: boolean;
   mode: Mode;
   showHidden: boolean;
+  /**
+   * Whether to list the entries the system marks as its own. Off by default,
+   * so a folder shows what the desktop's own file manager shows; on, the
+   * window lists everything on the volume.
+   */
+  showProtected: boolean;
   navOpen: boolean;
   navWidth: number;
   columns: ColumnWidths;
@@ -33,6 +39,7 @@ export const DEFAULT_PREFS: Prefs = {
   groupByDate: false,
   mode: "explorer",
   showHidden: false,
+  showProtected: false,
   navOpen: true,
   navWidth: 160,
   columns: DEFAULT_COLUMNS,
@@ -83,6 +90,10 @@ export function loadPrefs(): Prefs {
     groupByDate: typeof saved.groupByDate === "boolean" ? saved.groupByDate : DEFAULT_PREFS.groupByDate,
     mode: saved.mode === "compact" ? "compact" : "explorer",
     showHidden: typeof saved.showHidden === "boolean" ? saved.showHidden : DEFAULT_PREFS.showHidden,
+    showProtected:
+      typeof saved.showProtected === "boolean"
+        ? saved.showProtected
+        : DEFAULT_PREFS.showProtected,
     navOpen: typeof saved.navOpen === "boolean" ? saved.navOpen : DEFAULT_PREFS.navOpen,
     navWidth:
       typeof saved.navWidth === "number" && saved.navWidth >= 140 && saved.navWidth <= 360

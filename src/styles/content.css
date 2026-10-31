@@ -413,6 +413,41 @@
   color: var(--text-secondary);
 }
 
+/* Hidden entries ----------------------------------------------------------- */
+/* An entry carrying the hidden attribute is drawn dimmed, which is how the
+   desktop's own file manager marks one. Only the name and its picture lose
+   weight: the metadata columns are already secondary, and dimming them further
+   would cost the date its legibility without adding a signal. */
+.row[data-hidden="true"] .cell-name,
+.tile[data-hidden="true"] .tile-label {
+  color: var(--text-hidden);
+}
+
+.row[data-hidden="true"] .cell-name > svg,
+.row[data-hidden="true"] .cell-name > img,
+.tile[data-hidden="true"] .tile-glyph {
+  opacity: 0.55;
+}
+
+/* The row or tile being acted on is never dimmed. Whether it is the keyboard's
+   cursor or part of the selection, its name has to read as clearly as any
+   other, and it is already carrying a fill that says what it is. */
+.row[data-hidden="true"][data-focused="true"] .cell-name,
+.row[data-hidden="true"][data-selected="true"] .cell-name,
+.tile[data-hidden="true"][data-focused="true"] .tile-label,
+.tile[data-hidden="true"][data-selected="true"] .tile-label {
+  color: var(--text-primary);
+}
+
+.row[data-hidden="true"][data-focused="true"] .cell-name > svg,
+.row[data-hidden="true"][data-focused="true"] .cell-name > img,
+.row[data-hidden="true"][data-selected="true"] .cell-name > svg,
+.row[data-hidden="true"][data-selected="true"] .cell-name > img,
+.tile[data-hidden="true"][data-focused="true"] .tile-glyph,
+.tile[data-hidden="true"][data-selected="true"] .tile-glyph {
+  opacity: 1;
+}
+
 /* Group header ------------------------------------------------------------- */
 .group {
   position: absolute;

@@ -23,11 +23,12 @@ export interface ScanHandle {
 export async function scanDir(
   path: string,
   showHidden: boolean,
+  showProtected: boolean,
   handlers: ScanHandlers,
 ): Promise<ScanHandle> {
   if (!isTauri) {
     const { mockScan } = await import("./mock");
-    return mockScan(path, showHidden, handlers);
+    return mockScan(path, showHidden, showProtected, handlers);
   }
 
   const { Channel, invoke } = await import("@tauri-apps/api/core");
@@ -52,7 +53,7 @@ export async function scanDir(
 
   try {
     jobId = await invoke<number>("scan_dir", {
-      request: { path, showHidden, },
+      request: { path, showHidden, showProtected },
       onEvent: channel,
     });
   } catch (error) {
@@ -94,11 +95,20 @@ export async function searchDir(
   query: string,
   recursive: boolean,
   showHidden: boolean,
+  showProtected: boolean,
   handlers: SearchHandlers,
 ): Promise<ScanHandle> {
   if (!isTauri) {
     const { mockSearch } = await import("./mock");
-    return mockSearch(path, roots, query, recursive, showHidden, handlers);
+    return mockSearch(
+      path,
+      roots,
+      query,
+      recursive,
+      showHidden,
+      showProtected,
+      handlers,
+    );
   }
 
   const { Channel, invoke } = await import("@tauri-apps/api/core");
@@ -131,7 +141,7 @@ export async function searchDir(
 
   try {
     jobId = await invoke<number>("search_dir", {
-      request: { path, roots, query, recursive, showHidden },
+      request: { path, roots, query, recursive, showHidden, showProtected },
       onEvent: channel,
     });
   } catch (error) {

@@ -30,6 +30,7 @@ export interface DirectoryState {
 export function useDirectory(
   path: string,
   showHidden: boolean,
+  showProtected: boolean,
   sort: SortState,
   /** Bumped by the interface to force a re-read of the same path. */
   nonce = 0,
@@ -105,7 +106,7 @@ export function useDirectory(
       if (frame === 0) frame = requestAnimationFrame(flush);
     };
 
-    void scanDir(path, showHidden, {
+    void scanDir(path, showHidden, showProtected, {
       onBatch: (entries, scanned) => {
         if (disposed) return;
         const pending = pendingRef.current;
@@ -149,7 +150,7 @@ export function useDirectory(
     };
     // `sort` is intentionally absent: changing it must not restart the scan.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [path, showHidden, nonce]);
+  }, [path, showHidden, showProtected, nonce]);
 
   // Re-sort what is already on screen when the comparator changes, and bump the
   // version so the change is published.

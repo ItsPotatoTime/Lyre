@@ -95,6 +95,9 @@
   --text-primary: #ffffff;
   --text-secondary: #c8c8c8;
   --text-tertiary: #9a9a9a;
+  /* A hidden entry's name: dimmed, the way the desktop's file manager dims
+     one, but not so far that the name stops being readable. */
+  --text-hidden: #9a9a9a;
   --text-disabled: #6b6b6b;
   --text-on-accent: #000000;
 
@@ -133,6 +136,7 @@
   --text-primary: #191a1a;
   --text-secondary: #5c5d5e;
   --text-tertiary: #767778;
+  --text-hidden: #6d6e6e;
   --text-disabled: #9a9b9c;
   --text-on-accent: #ffffff;
 

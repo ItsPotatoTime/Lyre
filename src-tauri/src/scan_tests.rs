@@ -1,7 +1,7 @@
 //! Tests for the hot path. These do not need a window: the scanner talks to a
 //! plain closure, so what is asserted here is the same code the interface runs.
 
-use crate::scan::{scan, Entry, ScanEvent};
+use crate::scan::{is_listed, scan, Entry, EntryFlags, ScanEvent};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -13,7 +13,7 @@ fn collect(path: &Path, show_hidden: bool) -> (Vec<Entry>, usize, u64) {
     let mut entries: Vec<Entry> = Vec::new();
     let mut reported = 0usize;
     let mut elapsed = 0u64;
-    scan(path, show_hidden, &cancel, |event| {
+    scan(path, show_hidden, false, &cancel, |event| {
         match event {
             ScanEvent::Batch { entries: batch, .. } => entries.extend(batch),
             ScanEvent::Done {
@@ -86,6 +86,43 @@ fn hidden_entries_are_opt_in() {
     fs::remove_dir_all(&dir).ok();
 }
 
+/// The rule that decides what a listing contains, exercised on a platform that
+/// has no attributes to read: the facts are supplied, because the answer must
+/// not depend on which platform is asking.
+#[test]
+fn an_attribute_hides_an_entry_without_a_leading_dot() {
+    let plain = EntryFlags::default();
+    // C:\ProgramData: no dot in the name, hidden by its attribute.
+    let hidden = EntryFlags {
+        hidden: true,
+        protected: false,
+    };
+    // C:\pagefile.sys: hidden, and attributed to the system as well.
+    let hidden_system = EntryFlags {
+        hidden: true,
+        protected: true,
+    };
+
+    assert!(
+        !is_listed(false, false, false, hidden),
+        "hidden files off must hide an entry hidden by attribute"
+    );
+    assert!(
+        is_listed(true, false, false, hidden),
+        "hidden files on must show it"
+    );
+    assert!(
+        !is_listed(true, false, false, hidden_system),
+        "a system entry stays out even with hidden files on"
+    );
+    assert!(
+        is_listed(true, true, false, hidden_system),
+        "and comes back with protected items shown"
+    );
+    assert!(!is_listed(false, false, true, plain), "a dot hides a name");
+    assert!(is_listed(true, false, true, plain));
+}
+
 #[test]
 fn a_large_directory_arrives_in_batches_and_completes() {
     let dir = scratch("large");
@@ -100,7 +137,7 @@ fn a_large_directory_arrives_in_batches_and_completes() {
     let mut seen = HashSet::new();
     let mut total = 0usize;
     let mut done = false;
-    scan(&dir, false, &cancel, |event| {
+    scan(&dir, false, false, &cancel, |event| {
         match event {
             ScanEvent::Batch { entries, scanned } => {
                 batches += 1;
@@ -133,6 +170,7 @@ fn a_missing_directory_fails_with_a_readable_message() {
     scan(
         Path::new("/definitely/not/a/real/path/lyre"),
         false,
+        false,
         &cancel,
         |event| {
             if let ScanEvent::Failed { message: m } = event {
@@ -159,7 +197,7 @@ fn cancellation_stops_the_scan_without_reporting_done() {
     cancel.store(true, Ordering::Relaxed);
 
     let mut done = false;
-    scan(&dir, false, &cancel, |event| {
+    scan(&dir, false, false, &cancel, |event| {
         if matches!(event, ScanEvent::Done { .. }) {
             done = true;
         }

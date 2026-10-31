@@ -20,7 +20,7 @@ fn scratch(name: &str) -> PathBuf {
 fn scan_into_index(index: &Index, path: &Path) -> Vec<Entry> {
     let cancel = Arc::new(AtomicBool::new(false));
     let mut entries = Vec::new();
-    scan::scan(path, false, &cancel, |event| {
+    scan::scan(path, false, false, &cancel, |event| {
         if let scan::ScanEvent::Batch { entries: batch, .. } = event {
             entries.extend(batch);
         }
@@ -43,6 +43,17 @@ struct Collected {
 }
 
 fn run(index: &Index, path: &Path, query: &str, recursive: bool) -> Collected {
+    run_with(index, path, query, recursive, false, false)
+}
+
+fn run_with(
+    index: &Index,
+    path: &Path,
+    query: &str,
+    recursive: bool,
+    show_hidden: bool,
+    show_protected: bool,
+) -> Collected {
     let cancel = Arc::new(AtomicBool::new(false));
     let mut out = Collected {
         local: Vec::new(),
@@ -59,7 +70,8 @@ fn run(index: &Index, path: &Path, query: &str, recursive: bool) -> Collected {
             roots: Vec::new(),
             query: query.to_string(),
             recursive,
-            show_hidden: false,
+            show_hidden,
+            show_protected,
         },
         &cancel,
         |event| {
@@ -112,6 +124,7 @@ fn run_roots(index: &Index, roots: &[PathBuf], query: &str) -> Collected {
             query: query.to_string(),
             recursive: true,
             show_hidden: false,
+            show_protected: false,
         },
         &cancel,
         |event| {
@@ -150,6 +163,7 @@ fn run_typed(index: &Index, path: &Path, query: &str, recursive: bool) -> Vec<(S
             query: query.to_string(),
             recursive,
             show_hidden: false,
+            show_protected: false,
         },
         &cancel,
         |event| {
@@ -547,6 +561,7 @@ fn events_serialise_to_the_shape_the_interface_reads() {
             kind: "document",
             ext: "docx".into(),
             hidden: false,
+            protected: false,
             readable: true,
         },
         score: 104,
@@ -569,6 +584,36 @@ fn hidden_items_are_skipped_when_the_interface_hides_them() {
 
     let result = run(&index, &dir, "note", false);
     assert_eq!(result.local, vec!["visible-note.txt".to_string()]);
+
+    fs::remove_dir_all(&dir).ok();
+}
+
+/// An entry the system marks as its own is out of the answer until the setting
+/// that shows those is on, even when the index still holds it from a scan made
+/// while they were.
+#[test]
+fn protected_entries_in_the_index_obey_the_setting() {
+    let dir = scratch("protected-index");
+    fs::write(dir.join("pagefile.sys"), b"x").unwrap();
+    let index = Index::default();
+    let mut entries = scan_into_index(&index, &dir);
+    for entry in &mut entries {
+        entry.protected = true;
+    }
+    index.store(
+        &dir,
+        Arc::new(entries.iter().map(CompactEntry::from).collect()),
+    );
+
+    let hidden = run(&index, &dir, "pagefile", false);
+    assert!(
+        hidden.local.is_empty(),
+        "a protected row must not surface while the setting is off"
+    );
+    assert_eq!(hidden.matched, 0, "the count must agree with the list");
+
+    let shown = run_with(&index, &dir, "pagefile", false, false, true);
+    assert_eq!(shown.local, vec!["pagefile.sys".to_string()]);
 
     fs::remove_dir_all(&dir).ok();
 }
@@ -763,6 +808,7 @@ fn accents_do_not_shift_the_highlights() {
             roots: Vec::new(),
             recursive: false,
             show_hidden: false,
+            show_protected: false,
         },
         &cancel,
         |event| {

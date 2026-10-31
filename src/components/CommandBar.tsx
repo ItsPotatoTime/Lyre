@@ -32,6 +32,8 @@ export function CommandBar({
   onToggleNav,
   showHidden,
   onToggleHidden,
+  showProtected,
+  onToggleProtected,
   selectedCount,
   onSelectAll,
   onCopyPath,
@@ -43,7 +45,8 @@ export function CommandBar({
   promptDefaultManager,
   onSetDefaultManager,
   onTogglePromptManager,
-  onMeasureFrameRate,
+  frameRate,
+  onToggleFrameRate,
   canRestoreFileManager,
   onRestoreFileManager,
   previewOpen,
@@ -68,6 +71,8 @@ export function CommandBar({
   onToggleNav: () => void;
   showHidden: boolean;
   onToggleHidden: () => void;
+  showProtected: boolean;
+  onToggleProtected: () => void;
   selectedCount: number;
   onSelectAll: () => void;
   onCopyPath: () => void;
@@ -79,7 +84,8 @@ export function CommandBar({
   promptDefaultManager: boolean;
   onSetDefaultManager: () => void;
   onTogglePromptManager: () => void;
-  onMeasureFrameRate: () => void;
+  frameRate: boolean;
+  onToggleFrameRate: () => void;
   canRestoreFileManager: boolean;
   onRestoreFileManager: () => void;
   previewOpen: boolean;
@@ -141,6 +147,13 @@ export function CommandBar({
       label: "Show hidden items",
       checked: showHidden,
       onSelect: onToggleHidden,
+    },
+    {
+      kind: "item",
+      id: "protected",
+      label: "Show protected operating system items",
+      checked: showProtected,
+      onSelect: onToggleProtected,
     },
     {
       kind: "item",
@@ -219,8 +232,9 @@ export function CommandBar({
     {
       kind: "item",
       id: "frame-rate",
-      label: "Measure frame rate",
-      onSelect: onMeasureFrameRate,
+      label: "Show frame rate",
+      checked: frameRate,
+      onSelect: onToggleFrameRate,
     },
     ...(canRestorePins
       ? ([

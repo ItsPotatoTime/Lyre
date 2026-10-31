@@ -34,6 +34,7 @@ export function useSearch(
   roots: string[],
   query: string,
   showHidden: boolean,
+  showProtected: boolean,
   enabled: boolean,
 ): SearchState {
   const [state, setState] = useState<SearchState>(EMPTY);
@@ -72,7 +73,7 @@ export function useSearch(
     setState((prev) => ({ ...prev, phase: "local", error: null }));
 
     const timer = window.setTimeout(() => {
-      void searchDir(path, where, needle, true, showHidden, {
+      void searchDir(path, where, needle, true, showHidden, showProtected, {
         onLocal: (items, matched, elapsedMs) => {
           if (disposed) return;
           seen.current = new Set(items.map((item) => item.path));
@@ -136,7 +137,7 @@ export function useSearch(
       handle.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [path, rootsKey, query, showHidden, enabled]);
+  }, [path, rootsKey, query, showHidden, showProtected, enabled]);
 
   return state;
 }

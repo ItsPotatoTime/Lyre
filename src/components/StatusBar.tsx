@@ -1,11 +1,13 @@
 import type { DirStatus } from "@/lib/useDirectory";
 import type { SearchState } from "@/types";
 import { formatCount } from "@/lib/format";
+import { useFrameRate } from "@/lib/frameRate";
 
 /**
  * Explorer's status bar: item count, then selection, separated by a rule.
- * The scan time on the right is the one addition, because it is the whole
- * claim the product makes.
+ * The measurements on the right are the one addition, because speed is the
+ * whole claim the product makes: how long the folder took to read, and, when
+ * asked for, what the paint loop is doing right now.
  */
 export function StatusBar({
   status,
@@ -17,6 +19,7 @@ export function StatusBar({
   filtering,
   notice,
   search,
+  showFrameRate,
 }: {
   status: DirStatus;
   scanned: number;
@@ -27,9 +30,22 @@ export function StatusBar({
   filtering: boolean;
   notice: string | null;
   search: SearchState | null;
+  /** Whether the paint loop is being reported on the right. */
+  showFrameRate: boolean;
 }) {
   const scanning = status === "loading";
   const plural = (n: number) => (n === 1 ? "item" : "items");
+  // Sampled here rather than in the window, so a readout that updates once a
+  // second redraws this footer and nothing else.
+  const meter = useFrameRate(showFrameRate);
+  const readout = meter ? (
+    <span
+      className="tabular"
+      title={`${formatCount(meter.frames)} frames in the last second, median ${meter.interval.toFixed(1)} ms, fastest ${meter.fastest.toFixed(1)} ms, slowest ${meter.slowest.toFixed(1)} ms`}
+    >
+      {meter.hz > 0 ? `${meter.hz} Hz` : "measuring"}
+    </span>
+  ) : null;
 
   // While searching, the count that matters is matches, not items, and the
   // walk reports how much of the tree it has looked at.
@@ -56,6 +72,7 @@ export function StatusBar({
               </>
             ) : null}
             <span className="status-spacer" />
+            {readout}
             {busy ? (
               <span className="status-scan">
                 <span className="status-dot" />
@@ -104,6 +121,8 @@ export function StatusBar({
       )}
 
       <span className="status-spacer" />
+
+      {readout}
 
       {filtering ? (
         <span className="tabular">

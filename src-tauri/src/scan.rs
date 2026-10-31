@@ -15,6 +15,12 @@
 //!    channel, so the interface renders while the rest of the directory is
 //!    still being read.
 //!
+//!
+//! Two kinds of entry are opt-in, and both are settled in that first pass
+//! before anything is stat'ed: a name that begins with a dot, and one the
+//! system attributes to itself, which is what a desktop's own file manager
+//! keeps out of the list even when it is showing hidden files.
+//!
 //! Sorting is deliberately *not* done here. The interface owns the comparator
 //! because the user can change it at any time by clicking a column, and one
 //! comparator in one language cannot drift out of sync with itself.
@@ -38,6 +44,10 @@ pub struct ScanRequest {
     pub path: String,
     #[serde(default)]
     pub show_hidden: bool,
+    /// Whether to include the entries the system marks as its own. Off by
+    /// default, so a folder lists what the desktop's own file manager lists.
+    #[serde(default)]
+    pub show_protected: bool,
 }
 
 /// One row in the file list. Field names are camelCase on the wire.
@@ -56,6 +66,11 @@ pub struct Entry {
     pub kind: &'static str,
     pub ext: String,
     pub hidden: bool,
+    /// Belongs to the system rather than to the person using it: on Windows,
+    /// the entry carries `FILE_ATTRIBUTE_SYSTEM`, which is what makes the
+    /// desktop's own file manager keep it out of the list even when it is
+    /// showing hidden files. No other platform marks entries this way.
+    pub protected: bool,
     /// False when the entry was listed but could not be stat'ed (a dangling
     /// symlink, a permission wall, a race with a delete).
     pub readable: bool,
@@ -84,7 +99,13 @@ struct Raw {
 /// The sink is a plain closure rather than a Tauri channel so the scanner can
 /// be exercised without a window: `emit` returning false means the consumer
 /// went away and the scan should stop.
-pub fn scan<F>(path: &Path, show_hidden: bool, cancel: &Arc<AtomicBool>, mut emit: F)
+pub fn scan<F>(
+    path: &Path,
+    show_hidden: bool,
+    show_protected: bool,
+    cancel: &Arc<AtomicBool>,
+    mut emit: F,
+)
 where
     F: FnMut(ScanEvent) -> bool,
 {
@@ -107,7 +128,10 @@ where
         }
         let Ok(item) = item else { continue };
         let name = item.file_name().to_string_lossy().into_owned();
-        if !show_hidden && is_hidden_name(&name) {
+        // Decided here rather than after the stat, so a row the settings
+        // exclude never reaches a worker at all. The attributes come from the
+        // directory entry, which carries them without a syscall on Windows.
+        if !is_listed(show_hidden, show_protected, is_hidden_name(&name), entry_flags(&item)) {
             continue;
         }
         // `file_type` is free on Unix (d_type) and on Windows (find data); on
@@ -254,6 +278,7 @@ pub(crate) fn describe_entry(
         },
         ext,
         hidden: is_hidden_name(&name) || meta.as_ref().map(is_hidden_meta).unwrap_or(false),
+        protected: meta.as_ref().map(is_protected_meta).unwrap_or(false),
         readable: meta.is_some(),
     })
 }
@@ -271,6 +296,9 @@ fn is_hidden_name(name: &str) -> bool {
     name.starts_with('.')
 }
 
+/// Windows attributes an entry as hidden, as system, or both. Both are kept
+/// out of a plain listing; only the hidden ones come back with "show hidden
+/// files" ticked, which is why system entries need their own switch.
 #[cfg(windows)]
 fn is_hidden_meta(meta: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
@@ -281,6 +309,69 @@ fn is_hidden_meta(meta: &fs::Metadata) -> bool {
 #[cfg(not(windows))]
 fn is_hidden_meta(_meta: &fs::Metadata) -> bool {
     false
+}
+
+#[cfg(windows)]
+fn is_protected_meta(meta: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_SYSTEM: u32 = 0x4;
+    meta.file_attributes() & FILE_ATTRIBUTE_SYSTEM != 0
+}
+
+#[cfg(not(windows))]
+fn is_protected_meta(_meta: &fs::Metadata) -> bool {
+    false
+}
+
+/// What the platform says about an entry beyond its name.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct EntryFlags {
+    pub hidden: bool,
+    pub protected: bool,
+}
+
+/// Read the attributes a name cannot carry: hidden, and belonging to the
+/// system.
+///
+/// On Windows both arrive with the directory listing, so reading them through
+/// the entry costs no syscall, which is what lets search afford this on every
+/// entry it reads. Elsewhere no entry is attributed either way, and the answer
+/// is nothing.
+#[cfg(windows)]
+pub(crate) fn entry_flags(item: &fs::DirEntry) -> EntryFlags {
+    let Ok(meta) = item.metadata() else {
+        return EntryFlags::default();
+    };
+    EntryFlags {
+        hidden: is_hidden_meta(&meta),
+        protected: is_protected_meta(&meta),
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn entry_flags(_item: &fs::DirEntry) -> EntryFlags {
+    EntryFlags::default()
+}
+
+/// Whether an entry belongs in a listing at the current settings.
+///
+/// Two facts can hide a row and they are not the same fact. A leading dot is a
+/// hidden name on every platform, while a hidden attribute is how Windows hides
+/// a folder such as ProgramData, and the system attribute marks the entries a
+/// desktop's own file manager keeps out even when hidden files are shown.
+///
+/// Kept as its own function, taking the facts rather than reading them, so the
+/// rule can be tested on a platform that has no attributes to read.
+pub(crate) fn is_listed(
+    show_hidden: bool,
+    show_protected: bool,
+    name_hidden: bool,
+    flags: EntryFlags,
+) -> bool {
+    if !show_hidden && (name_hidden || flags.hidden) {
+        return false;
+    }
+    show_protected || !flags.protected
 }
 
 /// Map an extension to a glyph family. This runs once per entry and allocates

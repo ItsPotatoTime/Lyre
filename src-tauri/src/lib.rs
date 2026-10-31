@@ -74,7 +74,10 @@ fn scan_dir(
     let path = std::path::PathBuf::from(&request.path);
     let trace = std::env::var_os("LYRE_TRACE").is_some();
     if trace {
-        eprintln!("[lyre] scan {id} start {path:?} hidden={}", request.show_hidden);
+        eprintln!(
+            "[lyre] scan {id} start {path:?} hidden={} protected={}",
+            request.show_hidden, request.show_protected
+        );
     }
 
     // The state is reached through the app handle inside the thread; keeping a
@@ -86,21 +89,27 @@ fn scan_dir(
             // not clone every row's path and extension just to index it.
             let mut collected: Vec<search::CompactEntry> = Vec::new();
             let mut complete = false;
-            scan::scan(&path, request.show_hidden, &cancel, |event| {
-                if trace {
-                    if let scan::ScanEvent::Done { total, elapsed_ms } = &event {
-                        eprintln!("[lyre] scan {id} done {total} in {elapsed_ms} ms");
+            scan::scan(
+                &path,
+                request.show_hidden,
+                request.show_protected,
+                &cancel,
+                |event| {
+                    if trace {
+                        if let scan::ScanEvent::Done { total, elapsed_ms } = &event {
+                            eprintln!("[lyre] scan {id} done {total} in {elapsed_ms} ms");
+                        }
                     }
-                }
-                match &event {
-                    scan::ScanEvent::Batch { entries, .. } => {
-                        collected.extend(entries.iter().map(search::CompactEntry::from))
+                    match &event {
+                        scan::ScanEvent::Batch { entries, .. } => {
+                            collected.extend(entries.iter().map(search::CompactEntry::from))
+                        }
+                        scan::ScanEvent::Done { .. } => complete = true,
+                        scan::ScanEvent::Failed { .. } => {}
                     }
-                    scan::ScanEvent::Done { .. } => complete = true,
-                    scan::ScanEvent::Failed { .. } => {}
-                }
-                on_event.send(event).is_ok()
-            });
+                    on_event.send(event).is_ok()
+                },
+            );
             // Only a complete read is worth indexing; a cancelled scan would
             // leave the search answering from a partial folder.
             if complete {

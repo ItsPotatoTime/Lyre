@@ -17,8 +17,7 @@ options=('!strip')
 
 _debfile="Lyre_${pkgver}_amd64.deb"
 source=("$url/releases/download/v$pkgver/$_debfile")
-# Fill in with `makepkg -g` once the release asset exists.
-sha256sums=('SKIP')
+sha256sums=('18ef7436195d2d94f4e937617881a96f267c3466f9d4dcce48d78e9b73739218')
 
 package() {
   # A .deb is an ar archive holding control.tar.* and data.tar.*; only the data

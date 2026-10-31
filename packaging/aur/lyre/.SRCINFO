@@ -17,6 +17,6 @@ pkgbase = lyre
 	provides = lyre
 	conflicts = lyre-bin
 	source = lyre-0.1.0.tar.gz::https://github.com/ItsPotatoTime/Lyre/archive/refs/tags/v0.1.0.tar.gz
-	sha256sums = SKIP
+	sha256sums = f54c55c78f4bfe5c9a25e1127049970d77424ea71de7b9a45071ff2b83330803
 
 pkgname = lyre

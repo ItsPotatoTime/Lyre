@@ -12,6 +12,6 @@ pkgbase = lyre-bin
 	conflicts = lyre
 	options = !strip
 	source = https://github.com/ItsPotatoTime/Lyre/releases/download/v0.1.0/Lyre_0.1.0_amd64.deb
-	sha256sums = SKIP
+	sha256sums = 18ef7436195d2d94f4e937617881a96f267c3466f9d4dcce48d78e9b73739218
 
 pkgname = lyre-bin

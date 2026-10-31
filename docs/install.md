@@ -27,7 +27,7 @@ chmod +x Lyre_*.AppImage
 ```
 
 No installation and no root. It carries its own WebKit, which is why the file is
-around 110 MB: the system's libraries are not needed. It needs glibc 2.35 or
+around 80 MB: the system's libraries are not needed. It needs glibc 2.35 or
 newer, because it is built on Ubuntu 22.04, so a distribution from after early
 2022 is fine.
 

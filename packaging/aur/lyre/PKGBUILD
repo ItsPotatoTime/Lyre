@@ -14,8 +14,7 @@ makedepends=('cargo' 'rust' 'bun-bin')
 provides=('lyre')
 conflicts=('lyre-bin')
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-# Fill in with `makepkg -g` once the v$pkgver tag exists.
-sha256sums=('SKIP')
+sha256sums=('f54c55c78f4bfe5c9a25e1127049970d77424ea71de7b9a45071ff2b83330803')
 
 build() {
   cd "$pkgname-$pkgver"

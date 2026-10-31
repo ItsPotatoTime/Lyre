@@ -17,7 +17,7 @@ shell, React 19 interface.
 > handler there (Finder is the shell) and the "open with" list comes back empty.
 > Linux and Windows are the platforms this is used on.
 
-[Benchmarks](#benchmarks) • [Build and run](#build-and-run) • [Keyboard](#keyboard) • [Status](#status) • [How it stays fast](docs/performance.md) • [Platform notes](docs/platforms.md)
+[Install](#install) • [Benchmarks](#benchmarks) • [Build and run](#build-and-run) • [Keyboard](#keyboard) • [Status](#status) • [How it stays fast](docs/performance.md) • [Platform notes](docs/platforms.md)
 
 ## Features
 
@@ -52,6 +52,27 @@ shell, React 19 interface.
   entries stay out of the listing until asked for.
 - **Light, dark or the system's choice**, Explorer's keyboard shortcuts,
   type-ahead, and rubber-band selection.
+
+## Install
+
+Releases carry an installer for every platform, built by
+[the release workflow](.github/workflows/release.yml) on GitHub's runners:
+
+| Platform | File |
+| --- | --- |
+| Windows | `Lyre_<version>_x64-setup.exe` for one user, or the `.msi` for all |
+| macOS | `Lyre_<version>_universal.dmg`, one app for Apple silicon and Intel |
+| Linux | `AppImage`, `deb`, `rpm` |
+
+Arch users can build from the PKGBUILDs in
+[packaging/aur](packaging/aur) until the packages are in the AUR, after which it
+is `paru -S lyre-bin` (the prebuilt release) or `paru -S lyre` (from source). A
+Flatpak manifest lives in [flatpak](flatpak/app.lyre.files.yml) but is not
+published yet.
+
+Nothing is signed, so Windows SmartScreen and macOS Gatekeeper each ask once.
+Per-platform detail, the AUR submission steps and the release procedure are in
+[docs/install.md](docs/install.md).
 
 ## Benchmarks
 

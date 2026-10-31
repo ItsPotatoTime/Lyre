@@ -357,6 +357,12 @@ if (platform === "windows") {
     "build",
     ...(bundles ? ["--bundles", bundles] : ["--no-bundle"]),
     ...(debug ? ["--debug"] : []),
+    // Embed the frontend, the same way the Windows path does. `cargo` gets
+    // these after the separator, and build.rs refuses a release build without
+    // the feature rather than shipping a binary that waits for a dev server.
+    "--",
+    "--features",
+    "custom-protocol",
   ]);
 
   stage(4, bundles ? "Installers" : "Executable");

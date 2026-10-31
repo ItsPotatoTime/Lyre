@@ -1,0 +1,43 @@
+# Maintainer: ItsPotatoTime <https://github.com/ItsPotatoTime>
+# Built from the release tarball, with bun for the interface and cargo for the
+# core. The -bin package next door installs the prebuilt .deb instead.
+pkgname=lyre
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='A fast, cross-platform file manager in the Windows 11 Explorer design language'
+arch=('x86_64')
+url='https://github.com/ItsPotatoTime/Lyre'
+# No license has been chosen for this project yet.
+license=('unknown')
+depends=('webkit2gtk-4.1' 'gtk3' 'libsoup3' 'cairo' 'pango' 'gdk-pixbuf2')
+makedepends=('cargo' 'rust' 'bun-bin')
+provides=('lyre')
+conflicts=('lyre-bin')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
+# Fill in with `makepkg -g` once the v$pkgver tag exists.
+sha256sums=('SKIP')
+
+build() {
+  cd "$pkgname-$pkgver"
+  export CARGO_HOME="$srcdir/cargo"
+  bun install --frozen-lockfile
+  bun run build
+  cargo build --frozen --release --manifest-path src-tauri/Cargo.toml
+}
+
+package() {
+  cd "$pkgname-$pkgver"
+
+  install -Dm755 src-tauri/target/release/lyre "$pkgdir/usr/bin/lyre"
+  install -Dm644 packaging/app.lyre.files.desktop \
+    "$pkgdir/usr/share/applications/app.lyre.files.desktop"
+
+  install -Dm644 src-tauri/icons/32x32.png \
+    "$pkgdir/usr/share/icons/hicolor/32x32/apps/app.lyre.files.png"
+  install -Dm644 src-tauri/icons/128x128.png \
+    "$pkgdir/usr/share/icons/hicolor/128x128/apps/app.lyre.files.png"
+  install -Dm644 'src-tauri/icons/128x128@2x.png' \
+    "$pkgdir/usr/share/icons/hicolor/256x256/apps/app.lyre.files.png"
+  install -Dm644 src-tauri/icons/icon-512.png \
+    "$pkgdir/usr/share/icons/hicolor/512x512/apps/app.lyre.files.png"
+}

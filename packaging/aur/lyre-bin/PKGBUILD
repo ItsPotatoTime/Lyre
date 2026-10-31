@@ -1,0 +1,28 @@
+# Maintainer: ItsPotatoTime <https://github.com/ItsPotatoTime>
+# Installs the prebuilt .deb from the GitHub release: the binary, the desktop
+# entry and the icons, with the shared libraries left to the system. The `lyre`
+# package next door builds from source if you would rather.
+pkgname=lyre-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc='A fast, cross-platform file manager in the Windows 11 Explorer design language'
+arch=('x86_64')
+url='https://github.com/ItsPotatoTime/Lyre'
+# No license has been chosen for this project yet.
+license=('unknown')
+depends=('webkit2gtk-4.1' 'gtk3' 'libsoup3')
+provides=('lyre')
+conflicts=('lyre')
+options=('!strip')
+
+_debfile="Lyre_${pkgver}_amd64.deb"
+source=("$url/releases/download/v$pkgver/$_debfile")
+# Fill in with `makepkg -g` once the release asset exists.
+sha256sums=('SKIP')
+
+package() {
+  # A .deb is an ar archive holding control.tar.* and data.tar.*; only the data
+  # half is wanted, and bsdtar reads both layers.
+  bsdtar -xf "$srcdir/$_debfile" -C "$srcdir"
+  bsdtar -xf "$srcdir"/data.tar.* -C "$pkgdir"
+}

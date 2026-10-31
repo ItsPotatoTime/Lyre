@@ -1,0 +1,22 @@
+pkgbase = lyre
+	pkgdesc = A fast, cross-platform file manager in the Windows 11 Explorer design language
+	pkgver = 0.1.0
+	pkgrel = 1
+	url = https://github.com/ItsPotatoTime/Lyre
+	arch = x86_64
+	license = unknown
+	makedepends = cargo
+	makedepends = rust
+	makedepends = bun-bin
+	depends = webkit2gtk-4.1
+	depends = gtk3
+	depends = libsoup3
+	depends = cairo
+	depends = pango
+	depends = gdk-pixbuf2
+	provides = lyre
+	conflicts = lyre-bin
+	source = lyre-0.1.0.tar.gz::https://github.com/ItsPotatoTime/Lyre/archive/refs/tags/v0.1.0.tar.gz
+	sha256sums = SKIP
+
+pkgname = lyre

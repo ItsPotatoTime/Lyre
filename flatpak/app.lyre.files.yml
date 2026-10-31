@@ -1,0 +1,58 @@
+# Flatpak manifest, for a self-hosted build.
+#
+# Status: not yet built by the release pipeline, and not submitted to Flathub.
+# It is written against the org.gnome runtime because that is the one that ships
+# webkit2gtk, which Tauri links against. Build it with:
+#
+#   flatpak install flathub org.gnome.Platform//44 org.gnome.Sdk//44 \
+#       org.freedesktop.Sdk.Extension.rust-stable//44
+#   flatpak-builder --user --install --force-clean build-dir flatpak/app.lyre.files.yml
+#
+# The bun download is not something a Flathub submission would accept: there the
+# interface would be built with the node SDK extension instead, which means a
+# lockfile npm understands. That is its own piece of work.
+app-id: app.lyre.files
+runtime: org.gnome.Platform
+runtime-version: "44"
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: lyre
+
+finish-args:
+  # A file manager that cannot see the filesystem is not a file manager.
+  - --filesystem=host
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --talk-name=org.freedesktop.portal.Desktop
+  - --talk-name=org.freedesktop.portal.Files
+  - --talk-name=org.freedesktop.Notifications
+
+modules:
+  - name: lyre
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/lyre/cargo
+      # Flatpak builds are offline by default. A self-hosted build takes the
+      # network rather than vendoring the crates and the interface's packages.
+      build-args:
+        - --share=network
+    build-commands:
+      - install -Dm755 bun-linux-x64/bun /usr/bin/bun
+      - bun install --frozen-lockfile
+      - bun run build
+      - cargo build --release --frozen --manifest-path src-tauri/Cargo.toml
+      - install -Dm755 src-tauri/target/release/lyre /app/bin/lyre
+      - install -Dm644 packaging/app.lyre.files.desktop /app/share/applications/app.lyre.files.desktop
+      - install -Dm644 src-tauri/icons/128x128.png /app/share/icons/hicolor/128x128/apps/app.lyre.files.png
+      - install -Dm644 src-tauri/icons/icon-512.png /app/share/icons/hicolor/512x512/apps/app.lyre.files.png
+    sources:
+      - type: dir
+        path: ..
+      - type: archive
+        url: https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-linux-x64.zip
+        sha256: bf8ccbfb2b0b80159e0f9a6d15c55317add8077534dbc6130a3edb52fccb395c

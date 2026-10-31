@@ -1,0 +1,95 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      # One platform failing must not cost the others their artifacts.
+      fail-fast: false
+      matrix:
+        include:
+          - name: Linux (AppImage, deb, rpm)
+            os: ubuntu-22.04
+            args: "-- --features custom-protocol"
+          - name: Windows (msi, exe)
+            os: windows-latest
+            args: "-- --features custom-protocol"
+          - name: macOS (universal dmg, app)
+            os: macos-latest
+            # build.rs refuses a release build that does not embed the
+            # frontend, so the feature travels with every platform.
+            args: "--target universal-apple-darwin -- --features custom-protocol"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Building on 22.04 rather than 24.04 on purpose: the AppImage links
+      # against whatever glibc the runner has, so an older base is the one that
+      # runs on more distributions.
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf \
+            rpm
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Add both macOS targets
+        if: matrix.os == 'macos-latest'
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - name: Install the interface's dependencies
+        run: bun install --frozen-lockfile
+
+      # Creates the draft release for this tag on the first job that reaches it,
+      # and adds to it from the others.
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: Lyre ${{ github.ref_name }}
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}
+          releaseBody: |
+            A fast, cross-platform file manager in the Windows 11 Explorer design
+            language.
+
+            | Platform | File |
+            | --- | --- |
+            | Linux | `AppImage` (no install), `deb`, `rpm` |
+            | Windows | `-setup.exe` (NSIS), `msi` |
+            | macOS | `dmg`, universal (Apple silicon and Intel) |
+
+            The `deb` and `rpm` use the system's `webkit2gtk-4.1`; the AppImage
+            carries its own, and needs glibc 2.35 or newer because it is built
+            on Ubuntu 22.04.
+
+            Nothing is code-signed yet. On Windows expect a SmartScreen prompt
+            (More info, then Run anyway); on macOS the app is unsigned and not
+            notarised, so the first launch needs a right-click and Open, or
+            `xattr -d com.apple.quarantine /Applications/Lyre.app`.
+
+            Installing from a package manager is described in
+            [docs/install.md](https://github.com/ItsPotatoTime/Lyre/blob/main/docs/install.md).

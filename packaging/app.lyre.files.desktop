@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=Lyre
+GenericName=File Manager
+Comment=A fast, cross-platform file manager
+Exec=lyre %U
+Icon=app.lyre.files
+Terminal=false
+Categories=System;FileManager;Utility;
+MimeType=inode/directory;
+Keywords=files;folder;manager;explorer;
+StartupWMClass=Lyre

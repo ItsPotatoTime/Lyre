@@ -272,10 +272,18 @@ mod platform {
                     .into(),
             ),
             desktop_file: None,
+            restore_supported: false,
         }
     }
 
     pub fn make_default() -> Result<ManagerState, String> {
+        Err(state()
+            .unsupported
+            .unwrap_or_else(|| "Not supported on this platform.".into()))
+    }
+
+    /// Nothing to restore, because nothing was changed.
+    pub fn restore() -> Result<ManagerState, String> {
         Err(state()
             .unsupported
             .unwrap_or_else(|| "Not supported on this platform.".into()))
@@ -333,7 +341,7 @@ fn quote_for_test(value: &str) -> String {
     linux::quote(value)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
@@ -360,4 +368,3 @@ mod tests {
         assert!(start.is_none() || std::path::Path::new(&start.unwrap()).is_dir());
     }
 }
-

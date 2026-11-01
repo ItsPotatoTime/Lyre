@@ -1596,6 +1596,32 @@ function Browser({
     tabs,
   ]);
 
+  // The two side buttons a mouse keeps for back and forward. Both engines report
+  // them as buttons 3 and 4, and cancelling the default is what stops the
+  // webview treating them as its own history: the history that matters is the
+  // tab's, and the webview only ever holds one page. The action is on release,
+  // so a press that wanders off the window does nothing.
+  useEffect(() => {
+    const side = (event: MouseEvent) => event.button === 3 || event.button === 4;
+    const press = (event: MouseEvent) => {
+      if (side(event)) event.preventDefault();
+    };
+    const release = (event: MouseEvent) => {
+      if (!side(event)) return;
+      event.preventDefault();
+      if (event.button === 3) goBack();
+      else goForward();
+    };
+    window.addEventListener("mousedown", press);
+    window.addEventListener("mouseup", release);
+    window.addEventListener("auxclick", press);
+    return () => {
+      window.removeEventListener("mousedown", press);
+      window.removeEventListener("mouseup", release);
+      window.removeEventListener("auxclick", press);
+    };
+  }, [goBack, goForward]);
+
   const pageTotal =
     location.kind === "home"
       ? folders.length

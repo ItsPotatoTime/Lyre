@@ -202,6 +202,9 @@ bun run dev:web
 | `Escape` | Clear selection, close a menu |
 | typing | Jump to a name |
 
+The two side buttons on a mouse are back and forward, walking the same per-tab
+history as `Alt+Left` and `Alt+Right`.
+
 `Ctrl+Z`, `Ctrl+Y`, `Ctrl+N`, `Ctrl+D`, `Alt+Z`, `Alt+P` and `F6` do nothing on
 purpose: there is no undo history, second window or pin gesture behind them yet,
 and a shortcut that silently does the wrong thing is worse than one that is

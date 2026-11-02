@@ -229,6 +229,11 @@ fn log(line: &str) {
     }
 }
 
+/// Appends a line to the same diagnostic log from elsewhere in the application.
+pub fn note(line: &str) {
+    log(line);
+}
+
 /// Opens a window of this application, once per press even though every running
 /// instance sees the same keystroke.
 ///

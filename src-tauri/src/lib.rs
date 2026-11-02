@@ -24,7 +24,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tauri::ipc::Channel;
-use tauri::{Emitter, State};
+use tauri::{Emitter, Manager, State};
 
 #[derive(Default)]
 struct AppState {
@@ -593,6 +593,32 @@ pub fn run() {
         // system drag, so files can be dropped into other applications.
         .plugin(tauri_plugin_drag::init())
         .setup(|app| {
+            // A window created by a background process can be handed the
+            // launcher's show state and come up minimized. Nothing here asks for
+            // that, so if it happens, undo it. Only while it is actually
+            // minimized, so a window the person put away is left alone.
+            if let Some(window) = app.get_webview_window("main") {
+                if window.is_minimized().unwrap_or(false) {
+                    #[cfg(windows)]
+                    hotkey::note("the window came up minimized; restoring it");
+                    let _ = window.unminimize();
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
+                // The shell can apply its show state after creation returns, so
+                // look once more rather than only during setup.
+                let window = window.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    if window.is_minimized().unwrap_or(false) {
+                        #[cfg(windows)]
+                        hotkey::note("the window was minimized after starting; restoring it");
+                        let _ = window.unminimize();
+                        let _ = window.show();
+                        let _ = window.set_focus();
+                    }
+                });
+            }
             watch_places(app.handle().clone());
             Ok(())
         })

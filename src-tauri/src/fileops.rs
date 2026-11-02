@@ -291,7 +291,7 @@ pub fn paste<F>(
 fn trash_dir() -> Option<PathBuf> {
     #[cfg(not(unix))]
     {
-        return None;
+        None
     }
     #[cfg(unix)]
     {

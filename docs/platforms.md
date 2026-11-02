@@ -80,6 +80,23 @@ the callback runs, for the same reason. Each press writes one line to
 state was, and whether it was taken, which is what makes "Win+E still opens
 Explorer" answerable without a debugger.
 
+### Win+E with Lyre closed
+
+The hook lives in a process, so with every window closed there is nothing to take
+the key. "Take Win+E even with Lyre closed" in the More menu registers `LyreWinE`
+under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run`, which starts
+`lyre.exe --win-e-agent` with the session. That is the same helper with one
+difference: it does not stop when the last window closes, and it watches the
+logon entry so turning the switch off ends it within a few seconds. It costs
+about 9 MB and has no window.
+
+The alternative would be an Image File Execution Options shim on `explorer.exe`.
+It catches more, because Win+E, the taskbar button, the Start menu entry and even
+`explorer.exe /select,` all launch that image, and it needs no resident process.
+It also intercepts the shell's own startup, where the shim has to relaunch a
+renamed copy of the real Explorer, so a stale copy or one wrong switch means no
+desktop at logon. That is not a risk worth taking for one hotkey.
+
 ### macOS
 
 No route at all: Finder is the shell and offers nothing equivalent.

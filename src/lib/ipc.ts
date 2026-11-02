@@ -467,6 +467,20 @@ export async function becomeFileManager(): Promise<ManagerState> {
   return invoke<ManagerState>("become_file_manager");
 }
 
+/** Whether Win+E is taken even with no Lyre window open. */
+export async function winEAgent(): Promise<boolean> {
+  if (!isTauri) return false;
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<boolean>("win_e_agent");
+}
+
+/** Turn the logon agent that owns Win+E on or off. */
+export async function setWinEAgent(enabled: boolean): Promise<boolean> {
+  if (!isTauri) throw new Error("Needs the desktop app.");
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<boolean>("set_win_e_agent", { enabled });
+}
+
 /** The folder this process was launched with, when a desktop opened one. */
 export async function startupFolder(): Promise<string | null> {
   if (!isTauri) return null;

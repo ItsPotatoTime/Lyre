@@ -49,6 +49,9 @@ export function CommandBar({
   onToggleFrameRate,
   canRestoreFileManager,
   onRestoreFileManager,
+  winESupported,
+  winEAgent,
+  onToggleWinEAgent,
   previewOpen,
   onTogglePreview,
   reducedMemory,
@@ -88,6 +91,11 @@ export function CommandBar({
   onToggleFrameRate: () => void;
   canRestoreFileManager: boolean;
   onRestoreFileManager: () => void;
+  /** Windows is the only platform where Win+E is a key to take. */
+  winESupported: boolean;
+  /** Whether the logon agent that owns Win+E is registered. */
+  winEAgent: boolean;
+  onToggleWinEAgent: () => void;
   previewOpen: boolean;
   onTogglePreview: () => void;
   reducedMemory: boolean;
@@ -212,6 +220,17 @@ export function CommandBar({
             id: "restore-manager",
             label: "Stop opening folders with Lyre",
             onSelect: onRestoreFileManager,
+          },
+        ])
+      : []),
+    ...(winESupported
+      ? ([
+          {
+            kind: "item" as const,
+            id: "win-e-agent",
+            label: "Take Win+E even with Lyre closed",
+            checked: winEAgent,
+            onSelect: onToggleWinEAgent,
           },
         ])
       : []),

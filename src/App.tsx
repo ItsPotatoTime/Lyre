@@ -33,6 +33,8 @@ import {
   becomeFileManager,
   restoreFileManager,
   fileManagerState,
+  winEAgent as readWinEAgent,
+  setWinEAgent,
   graphicsSettings,
   setGraphicsSettings,
   startupFolder,
@@ -246,6 +248,7 @@ function Browser({
   const [showManagerPrompt, setShowManagerPrompt] = useState(false);
   const [managerBusy, setManagerBusy] = useState(false);
   const [managerError, setManagerError] = useState<string | null>(null);
+  const [winEAgent, setWinEAgentOn] = useState(false);
   const [clipboard, setClipboard] = useState<{
     mode: "copy" | "cut";
     paths: string[];
@@ -458,6 +461,12 @@ function Browser({
       .catch(() => {
         // No answer means no prompt; this must never block the window.
       });
+    // Whether the Win+E agent runs at logon, so the menu reads correctly.
+    void readWinEAgent()
+      .then((enabled) => {
+        if (!cancelled) setWinEAgentOn(enabled);
+      })
+      .catch(() => {});
     return () => {
       cancelled = true;
     };
@@ -796,6 +805,25 @@ function Browser({
         );
       });
   }, [flash]);
+
+  /** The logon agent that keeps Win+E here after every window is closed. */
+  const toggleWinEAgent = useCallback(() => {
+    const next = !winEAgent;
+    void setWinEAgent(next)
+      .then((enabled) => {
+        setWinEAgentOn(enabled);
+        flash(
+          enabled
+            ? "Win+E opens Lyre even when it is closed"
+            : "Win+E is Explorer's again when Lyre is closed",
+        );
+      })
+      .catch((error: unknown) => {
+        flash(
+          error instanceof Error ? error.message : "Could not change that.",
+        );
+      });
+  }, [winEAgent, flash]);
 
   const neverManager = useCallback(() => {
     setShowManagerPrompt(false);
@@ -1730,6 +1758,11 @@ function Browser({
           manager?.isDefault === true && manager?.restoreSupported === true
         }
         onRestoreFileManager={restoreManager}
+        winESupported={
+          manager !== null && manager.desktopFile === null && !manager.unsupported
+        }
+        winEAgent={winEAgent}
+        onToggleWinEAgent={toggleWinEAgent}
         reducedMemory={reducedMemory}
         onToggleReducedMemory={() => {
           const next = !reducedMemory;

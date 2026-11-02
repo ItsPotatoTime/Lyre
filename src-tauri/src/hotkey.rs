@@ -38,6 +38,7 @@
 
 use std::ffi::c_void;
 use std::io::Write;
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -45,6 +46,13 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::defaultmanager;
+
+/// Keeps `reg.exe` from flashing a console window.
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+/// Where a per-user logon entry lives.
+const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+/// The entry that keeps the agent running after every window is closed.
+const RUN_NAME: &str = "LyreWinE";
 
 const WH_KEYBOARD_LL: i32 = 13;
 const WM_KEYDOWN: usize = 0x0100;
@@ -415,16 +423,45 @@ pub fn install() {
         WINDOW.store(window, Ordering::Relaxed);
     }
 
+    start_helper();
+
+    // Keep one alive for as long as this window is. The agent can be switched off
+    // or killed while a window is open, and the key would otherwise go back to
+    // Explorer with the window still there.
+    std::thread::spawn(|| loop {
+        std::thread::sleep(Duration::from_secs(10));
+        if !helper_exists() {
+            start_helper();
+        }
+    });
+}
+
+/// Whether any process is already listening for the key, agent or helper.
+fn helper_exists() -> bool {
+    let name = wide(r"Local\Lyre.WinE.helper");
+    let handle = unsafe { OpenMutexW(SYNCHRONIZE, 0, name.as_ptr()) };
+    if handle == 0 {
+        return false;
+    }
+    unsafe { CloseHandle(handle) };
+    true
+}
+
+/// Starts the listener, agent if it is wanted and a plain helper otherwise.
+///
+/// A process that is already listening exits at once on its own name, so calling
+/// this repeatedly is safe.
+fn start_helper() {
     let Ok(exe) = std::env::current_exe() else {
         log("could not locate this application to start the win+e helper");
         return;
     };
-    // A helper already running exits at once on its own name, so starting one
-    // per window is safe and keeps this simple.
-    if let Err(err) = std::process::Command::new(exe)
-        .arg("--win-e-helper")
-        .spawn()
-    {
+    let mode = if agent_enabled() {
+        "--win-e-agent"
+    } else {
+        "--win-e-helper"
+    };
+    if let Err(err) = std::process::Command::new(exe).arg(mode).spawn() {
         log(&format!("could not start the win+e helper: {err}"));
     }
 }
@@ -440,11 +477,80 @@ fn window_exists() -> bool {
     true
 }
 
+/// Whether the agent is registered to start with the user's session.
+pub fn agent_enabled() -> bool {
+    let output = std::process::Command::new("reg")
+        .args(["query", RUN_KEY, "/v", RUN_NAME])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+    matches!(output, Ok(out) if out.status.success())
+}
+
+/// Writes or removes the logon entry. Removing one that is not there is not an
+/// error, because the answer wanted is "it is gone".
+fn register_agent(enabled: bool) -> Result<(), String> {
+    let mut command = std::process::Command::new("reg");
+    command.creation_flags(CREATE_NO_WINDOW);
+    if enabled {
+        let exe = std::env::current_exe()
+            .map_err(|err| format!("Could not locate this application: {err}"))?;
+        let value = format!("\"{}\" --win-e-agent", exe.display());
+        command.args([
+            "add", RUN_KEY, "/v", RUN_NAME, "/t", "REG_SZ", "/d", &value, "/f",
+        ]);
+        let output = command
+            .output()
+            .map_err(|err| format!("Could not run reg: {err}"))?;
+        if !output.status.success() {
+            let reason = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(if reason.is_empty() {
+                "Windows would not write the logon entry.".to_string()
+            } else {
+                reason
+            });
+        }
+        return Ok(());
+    }
+    let _ = command
+        .args(["delete", RUN_KEY, "/v", RUN_NAME, "/f"])
+        .output();
+    Ok(())
+}
+
+/// Starts the agent without waiting for the next session.
+fn start_agent() {
+    if let Ok(exe) = std::env::current_exe() {
+        if let Err(err) = std::process::Command::new(exe)
+            .arg("--win-e-agent")
+            .spawn()
+        {
+            log(&format!("could not start the win+e agent: {err}"));
+        }
+    }
+}
+
+/// Turns the "Win+E even when Lyre is closed" behaviour on or off.
+///
+/// Turning it on writes the logon entry and starts the agent at once. Turning it
+/// off removes the entry; a running agent notices within a few seconds and
+/// stops, which is simpler than a second channel between the two.
+pub fn set_agent(enabled: bool) -> Result<bool, String> {
+    register_agent(enabled)?;
+    if enabled {
+        start_agent();
+    }
+    Ok(agent_enabled())
+}
+
 /// The helper run: owns the key, never owns a window.
+///
+/// `persist` is the agent started with the session, which has to outlive every
+/// window. Otherwise the helper stops once the last window closes, so it does not
+/// sit there holding the executable open after the user is done.
 ///
 /// Returns immediately if another helper already holds the name, so windows can
 /// start one whenever they like.
-pub fn run_helper() {
+pub fn run_helper(persist: bool) {
     let name = wide(r"Local\Lyre.WinE.helper");
     let owner = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) };
     if owner == 0 {
@@ -456,16 +562,28 @@ pub fn run_helper() {
     }
     HELPER.store(owner, Ordering::Relaxed);
 
-    // Outlive the windows, but not the application: once the last window is
-    // gone there is nothing to open, and a process that stays would hold the
-    // executable open against the next update.
-    std::thread::spawn(|| loop {
-        std::thread::sleep(Duration::from_secs(5));
-        if !window_exists() {
-            log("no Lyre window left; the win+e helper is stopping");
-            std::process::exit(0);
-        }
-    });
+    if persist {
+        // The agent lives until it is turned off, and the logon entry is the
+        // switch. Checking it is cheaper than a second way to be told.
+        std::thread::spawn(|| loop {
+            std::thread::sleep(Duration::from_secs(5));
+            if !agent_enabled() {
+                log("the win+e agent is no longer wanted; stopping");
+                std::process::exit(0);
+            }
+        });
+    } else {
+        // Outlive the windows, but not the application: once the last window is
+        // gone there is nothing to open, and a process that stays would hold the
+        // executable open against the next update.
+        std::thread::spawn(|| loop {
+            std::thread::sleep(Duration::from_secs(5));
+            if !window_exists() {
+                log("no Lyre window left; the win+e helper is stopping");
+                std::process::exit(0);
+            }
+        });
+    }
 
     let (sender, receiver) = mpsc::channel();
     let _ = WORK.set(sender);

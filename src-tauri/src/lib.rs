@@ -409,6 +409,36 @@ fn startup_folder() -> Option<String> {
     defaultmanager::startup_path()
 }
 
+/// Whether Win+E is taken even when no Lyre window is open, which is what the
+/// logon agent provides.
+#[tauri::command]
+fn win_e_agent() -> bool {
+    #[cfg(windows)]
+    {
+        hotkey::agent_enabled()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
+/// Turn the Win+E agent on or off, and answer with what is now true.
+#[tauri::command]
+async fn set_win_e_agent(enabled: bool) -> Result<bool, String> {
+    #[cfg(windows)]
+    {
+        tauri::async_runtime::spawn_blocking(move || hotkey::set_agent(enabled))
+            .await
+            .map_err(|err| err.to_string())?
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = enabled;
+        Err("Win+E belongs to Explorer on this platform.".into())
+    }
+}
+
 /// Show the platform's own application picker, for platforms that protect the
 /// list and the default.
 #[tauri::command]
@@ -526,14 +556,22 @@ pub fn run() {
     // A helper run: no window, only the Win+E hook. It exists because a low
     // level keyboard hook is not reliably called while a window of the process
     // that installed it has the foreground, and this process never has one.
-    if std::env::args().any(|arg| arg == "--win-e-helper") {
+    let hook_helper = std::env::args().find_map(|arg| match arg.as_str() {
+        "--win-e-helper" => Some(false),
+        "--win-e-agent" => Some(true),
+        _ => None,
+    });
+    if let Some(persist) = hook_helper {
         #[cfg(windows)]
         {
-            hotkey::run_helper();
+            hotkey::run_helper(persist);
             return;
         }
         #[cfg(not(windows))]
-        return;
+        {
+            let _ = persist;
+            return;
+        }
     }
     // A launch that asked for something only Explorer can serve (a selection, a
     // shell namespace, one of its own switches) is handed straight to it, rather
@@ -606,6 +644,8 @@ pub fn run() {
             become_file_manager,
             restore_file_manager,
             startup_folder,
+            win_e_agent,
+            set_win_e_agent,
             eject_volume,
             drag_icon,
             trace,

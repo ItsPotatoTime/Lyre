@@ -49,8 +49,10 @@ use crate::defaultmanager;
 
 /// Keeps `reg.exe` from flashing a console window.
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-/// Where a per-user logon entry lives.
+/// Where a per-user logon entry lives, as `reg.exe` wants it.
 const RUN_KEY: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+/// The same key without the hive, for the registry API.
+const RUN_SUBKEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 /// The entry that keeps the agent running after every window is closed.
 const RUN_NAME: &str = "LyreWinE";
 
@@ -134,8 +136,45 @@ extern "system" {
     fn GetTickCount64() -> u64;
 }
 
+#[link(name = "shell32")]
+extern "system" {
+    /// Launches a program the way the shell does, which is the difference between
+    /// a window that opens normally and one that inherits a minimized show state.
+    fn ShellExecuteW(
+        window: usize,
+        operation: *const u16,
+        file: *const u16,
+        parameters: *const u16,
+        directory: *const u16,
+        show: i32,
+    ) -> isize;
+}
+
+#[link(name = "advapi32")]
+extern "system" {
+    fn RegGetValueW(
+        key: usize,
+        sub_key: *const u16,
+        value: *const u16,
+        flags: u32,
+        kind: *mut u32,
+        data: *mut c_void,
+        len: *mut u32,
+    ) -> i32;
+}
+
 /// Enough access to open a mutex that is only being watched for existence.
 const SYNCHRONIZE: u32 = 0x0010_0000;
+/// `SW_SHOWNORMAL`, which is what a window is supposed to open as.
+const SW_SHOWNORMAL: i32 = 1;
+/// `RegGetValueW` flag: the value is a string.
+const RRF_RT_REG_SZ: u32 = 0x0000_0002;
+const ERROR_SUCCESS: i32 = 0;
+
+#[cfg(target_pointer_width = "64")]
+const HKEY_CURRENT_USER: usize = 0xFFFF_FFFF_8000_0001;
+#[cfg(target_pointer_width = "32")]
+const HKEY_CURRENT_USER: usize = 0x8000_0001;
 
 /// What the callback decided, handed to the thread that does the slow work.
 enum Work {
@@ -260,9 +299,10 @@ fn open_window() {
 
     std::thread::spawn(|| {
         if let Ok(exe) = std::env::current_exe() {
-            match std::process::Command::new(exe).spawn() {
-                Ok(_) => log("spawned a window"),
-                Err(err) => log(&format!("could not start a window: {err}")),
+            if launch(&exe, None) {
+                log("spawned a window");
+            } else {
+                log("the shell would not start a window");
             }
         }
     });
@@ -466,8 +506,8 @@ fn start_helper() {
     } else {
         "--win-e-helper"
     };
-    if let Err(err) = std::process::Command::new(exe).arg(mode).spawn() {
-        log(&format!("could not start the win+e helper: {err}"));
+    if !launch(&exe, Some(mode)) {
+        log("the shell would not start the win+e helper");
     }
 }
 
@@ -483,12 +523,51 @@ fn window_exists() -> bool {
 }
 
 /// Whether the agent is registered to start with the user's session.
+///
+/// Read straight from the registry rather than by spawning `reg.exe`: this is
+/// asked every few seconds for the life of the agent, and a failed process
+/// launch used to look the same as "not registered", which stopped the agent.
 pub fn agent_enabled() -> bool {
-    let output = std::process::Command::new("reg")
-        .args(["query", RUN_KEY, "/v", RUN_NAME])
-        .creation_flags(CREATE_NO_WINDOW)
-        .output();
-    matches!(output, Ok(out) if out.status.success())
+    let sub_key = wide(RUN_SUBKEY);
+    let name = wide(RUN_NAME);
+    let mut len = 0u32;
+    let asked = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            sub_key.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut len,
+        )
+    };
+    asked == ERROR_SUCCESS
+}
+
+/// Starts a copy of this application with the show state the shell uses.
+///
+/// A plain process creation hands the child whatever show state the launcher
+/// carries, and when that state is minimized the new window comes up minimized.
+/// Go through the shell, which sets it to normal, and the window opens normally
+/// without anyone having to correct it afterwards.
+fn launch(exe: &std::path::Path, argument: Option<&str>) -> bool {
+    let file = wide(&exe.to_string_lossy());
+    let parameters = argument.map(wide);
+    let started = unsafe {
+        ShellExecuteW(
+            0,
+            std::ptr::null(),
+            file.as_ptr(),
+            parameters
+                .as_ref()
+                .map_or(std::ptr::null(), |params| params.as_ptr()),
+            std::ptr::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // ShellExecuteW answers with a value above 32 on success.
+    started > 32
 }
 
 /// Writes or removes the logon entry. Removing one that is not there is not an
@@ -525,11 +604,8 @@ fn register_agent(enabled: bool) -> Result<(), String> {
 /// Starts the agent without waiting for the next session.
 fn start_agent() {
     if let Ok(exe) = std::env::current_exe() {
-        if let Err(err) = std::process::Command::new(exe)
-            .arg("--win-e-agent")
-            .spawn()
-        {
-            log(&format!("could not start the win+e agent: {err}"));
+        if !launch(&exe, Some("--win-e-agent")) {
+            log("the shell would not start the win+e agent");
         }
     }
 }
@@ -569,12 +645,21 @@ pub fn run_helper(persist: bool) {
 
     if persist {
         // The agent lives until it is turned off, and the logon entry is the
-        // switch. Checking it is cheaper than a second way to be told.
-        std::thread::spawn(|| loop {
-            std::thread::sleep(Duration::from_secs(5));
-            if !agent_enabled() {
-                log("the win+e agent is no longer wanted; stopping");
-                std::process::exit(0);
+        // switch. Two misses in a row are required before stopping: one bad read
+        // must not take the key back to Explorer until the next logon.
+        std::thread::spawn(|| {
+            let mut misses = 0;
+            loop {
+                std::thread::sleep(Duration::from_secs(5));
+                if agent_enabled() {
+                    misses = 0;
+                    continue;
+                }
+                misses += 1;
+                if misses >= 2 {
+                    log("the win+e agent is no longer wanted; stopping");
+                    std::process::exit(0);
+                }
             }
         });
     } else {

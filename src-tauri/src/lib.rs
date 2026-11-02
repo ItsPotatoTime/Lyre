@@ -606,16 +606,20 @@ pub fn run() {
                     let _ = window.set_focus();
                 }
                 // The shell can apply its show state after creation returns, so
-                // look once more rather than only during setup.
+                // watch for a few seconds rather than only during setup. The
+                // window is only corrected while it is actually minimized.
                 let window = window.clone();
                 std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(500));
-                    if window.is_minimized().unwrap_or(false) {
-                        #[cfg(windows)]
-                        hotkey::note("the window was minimized after starting; restoring it");
-                        let _ = window.unminimize();
-                        let _ = window.show();
-                        let _ = window.set_focus();
+                    for _ in 0..20 {
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        if window.is_minimized().unwrap_or(false) {
+                            #[cfg(windows)]
+                            hotkey::note("the window was minimized after starting; restoring it");
+                            let _ = window.unminimize();
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                            break;
+                        }
                     }
                 });
             }

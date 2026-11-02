@@ -461,6 +461,20 @@ export function CommandBar({
 
       <div className="cmd-spacer" />
 
+      {/* The pane can be hidden from its own header, so the way back has to be
+          somewhere that is always on screen rather than inside a menu. */}
+      <button
+        type="button"
+        className="cmd-icon"
+        data-active={previewOpen ? "true" : "false"}
+        aria-pressed={previewOpen}
+        aria-label="Preview pane"
+        title={previewOpen ? "Hide the preview pane" : "Show the preview pane"}
+        onClick={onTogglePreview}
+      >
+        <Icon name="preview" size={16} />
+      </button>
+
       <Menu
         align="end"
         entries={[

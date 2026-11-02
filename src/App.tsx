@@ -1914,7 +1914,12 @@ function Browser({
             />
           )}
         </main>
-        {previewOpen && showsFiles ? <PreviewPane entry={previewEntry} /> : null}
+        {previewOpen && showsFiles ? (
+          <PreviewPane
+            entry={previewEntry}
+            onClose={() => setPreviewOpen(false)}
+          />
+        ) : null}
 
       </div>
 

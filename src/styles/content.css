@@ -39,6 +39,36 @@
   background: var(--bg-content);
 }
 
+.preview-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
+.preview-heading {
+  font-size: var(--text-caption);
+  color: var(--text-tertiary);
+}
+
+/* The same small icon button the tab strip uses, so closing this reads like
+   closing anything else in the window. */
+.preview-close {
+  display: grid;
+  place-items: center;
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius-control);
+  color: var(--text-secondary);
+  transition: background-color var(--dur-1) var(--ease-standard);
+}
+
+.preview-close:hover {
+  background: var(--hover);
+  color: var(--text-primary);
+}
+
 .preview-stage {
   display: grid;
   place-items: center;

@@ -8,6 +8,12 @@ way rather than the obvious way.
 The pane shows the focused file: a picture for images, video and PDFs, the first
 lines of a text file, and the name, type, size and date for everything.
 
+It is a switch, not a fixture: the cross in its own header hides it, and the
+preview button in the command bar, which stays on screen, brings it back. The
+View menu carries the same item for anyone who looks there instead, and the
+choice is remembered with the rest of the view. Hiding it gives its column back
+to the list rather than leaving a gap.
+
 Thumbnails are made in the main process and handed over as PNG bytes, never as
 the original file. That is deliberate: letting the webview decode a 50 megapixel
 photograph to show it 300 pixels wide costs a couple of hundred megabytes, which

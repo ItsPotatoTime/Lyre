@@ -170,6 +170,12 @@ const GLYPHS = {
       <path d="M7.8 4v12" />
     </>
   ),
+  preview: (
+    <>
+      <rect x="2.6" y="4" width="14.8" height="12" rx="2" />
+      <path d="M12.2 4v12" />
+    </>
+  ),
   pin: (
     <>
       <path d="M7.2 3.4h5.6M8.6 3.4v4.8L6.2 12h7.6l-2.4-3.8V3.4" />

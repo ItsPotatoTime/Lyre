@@ -434,6 +434,12 @@
   color: var(--text-disabled);
 }
 
+/* A command that is a switch, like the preview pane: the same fill a checked
+   menu item gets, so "on" reads the same wherever it appears. */
+.cmd-icon[data-active="true"] {
+  background: var(--hover);
+}
+
 .cmd-chevron {
   opacity: 0.75;
   margin-left: -1px;

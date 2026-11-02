@@ -12,7 +12,14 @@ import { Icon } from "./Icons";
  * size to show it a few hundred pixels wide is how a file manager ends up using
  * hundreds of megabytes to display one image.
  */
-export function PreviewPane({ entry }: { entry: Entry | null }) {
+export function PreviewPane({
+  entry,
+  onClose,
+}: {
+  entry: Entry | null;
+  /** Hides the pane; the More menu puts it back. */
+  onClose: () => void;
+}) {
   const [info, setInfo] = useState<PreviewInfo | null>(null);
   const [picture, setPicture] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
@@ -56,6 +63,18 @@ export function PreviewPane({ entry }: { entry: Entry | null }) {
 
   return (
     <aside className="preview" aria-label="Preview">
+      <div className="preview-header">
+        <span className="preview-heading">Preview</span>
+        <button
+          type="button"
+          className="preview-close"
+          onClick={onClose}
+          title="Hide the preview pane"
+          aria-label="Hide the preview pane"
+        >
+          <Icon name="close" size={13} strokeWidth={1.3} />
+        </button>
+      </div>
       <div className="preview-stage">
         {picture ? (
           <img className="preview-image" src={picture} alt={entry?.name ?? ""} />

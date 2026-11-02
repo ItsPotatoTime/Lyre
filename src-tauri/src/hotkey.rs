@@ -9,38 +9,39 @@
 //! That leaves the input itself. A low level keyboard hook sees the combination
 //! before the shell's own hotkey handling and can swallow it.
 //!
-//! Three constraints shape the code:
+//! Four constraints shape the code:
 //!
 //! - The hook runs on a thread of its own, with a message pump. A low level hook
 //!   is delivered through the queue of the thread that installed it, and the
 //!   system waits only a short time for that thread to answer before it stops
 //!   consulting it. Installing on the thread that also draws the window means a
 //!   busy frame can lose the key.
-//! - The Windows key is tracked from the key stream rather than read with
-//!   `GetAsyncKeyState`, which answers about the moment the callback runs rather
-//!   than the moment the key was pressed. A fast press can be answered late.
+//! - The callback does nothing slow. No file writes, no registry reads, no
+//!   process creation: it reads atomics and posts to a channel that another
+//!   thread drains. A callback that blocks gets the hook skipped, and then the
+//!   shell opens Explorer while this code looks like it was never called.
+//! - The Windows key and the `E` repeat are tracked from the key stream rather
+//!   than read with `GetAsyncKeyState` at callback time, which answers about the
+//!   moment the callback runs rather than the moment the key was pressed.
 //! - The hook only exists while a process that installed it is alive, so Win+E
 //!   falls back to Explorer when this application is closed.
 //!
 //! Every running instance installs its own hook, so one keystroke reaches all of
 //! them. What stops that from opening a window per instance is a short lived
 //! named mutex per press: the first to create it opens the window and the rest
-//! stay quiet. An earlier version let only one instance hook, which meant that
-//! closing that instance silently switched Win+E back to Explorer for every
-//! window that was still open.
+//! stay quiet.
 //!
-//! Whether the key is ours to take is read at the moment it is pressed rather
-//! than cached, so restoring Explorer from any window stops the redirection
-//! immediately.
-//!
-//! Every press leaves one line in `%LOCALAPPDATA%\Lyre\hotkey.log`, which is what
-//! makes "Win+E still opens Explorer" answerable: it says whether the key
-//! arrived, what the modifier state was, and whether the key was taken.
+//! Every press, and every press declined, leaves one line in
+//! `%LOCALAPPDATA%\Lyre\hotkey.log` with the foreground window and the number of
+//! key events the hook has seen. That is what distinguishes "the hook decided
+//! not to take it" from "the hook never saw it".
 
 use std::ffi::c_void;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::defaultmanager;
@@ -58,7 +59,7 @@ const VK_CONTROL: i32 = 0x11;
 const VK_MENU: i32 = 0x12;
 const ERROR_ALREADY_EXISTS: u32 = 183;
 /// Keep the diagnostic file from growing without limit.
-const LOG_LIMIT: u64 = 64 * 1024;
+const LOG_LIMIT: u64 = 128 * 1024;
 
 /// `KBDLLHOOKSTRUCT`: what the keyboard hook is handed for each key event.
 #[repr(C)]
@@ -101,6 +102,8 @@ extern "system" {
     fn CallNextHookEx(hook: usize, code: i32, wparam: usize, lparam: isize) -> isize;
     fn GetAsyncKeyState(key: i32) -> i16;
     fn GetMessageW(msg: *mut Msg, window: usize, min: u32, max: u32) -> i32;
+    fn GetForegroundWindow() -> usize;
+    fn GetWindowThreadProcessId(window: usize, process: *mut u32) -> u32;
 }
 
 #[link(name = "kernel32")]
@@ -109,6 +112,18 @@ extern "system" {
     fn CreateMutexW(attributes: *mut c_void, owner: i32, name: *const u16) -> usize;
     fn CloseHandle(handle: usize) -> i32;
     fn GetLastError() -> u32;
+}
+
+/// What the callback decided, handed to the thread that does the slow work.
+enum Work {
+    /// The key belongs to this application and was swallowed.
+    Taken { foreground: u32, events: u64 },
+    /// The key was seen and left to the shell, with the reason.
+    Passed {
+        foreground: u32,
+        events: u64,
+        why: &'static str,
+    },
 }
 
 /// The hook handle, or zero before it is installed.
@@ -120,6 +135,13 @@ static WIN_DOWN: AtomicBool = AtomicBool::new(false);
 /// Whether `E` is already down, so a held key opens one window and not one per
 /// repeat.
 static E_DOWN: AtomicBool = AtomicBool::new(false);
+/// How many key events the hook has been handed, which says whether it is being
+/// consulted at all.
+static EVENTS: AtomicU64 = AtomicU64::new(0);
+/// Whether this application is the folder handler, refreshed off the hook thread.
+static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Where the callback hands its work.
+static WORK: OnceLock<Sender<Work>> = OnceLock::new();
 
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
@@ -146,17 +168,26 @@ fn log_path() -> Option<PathBuf> {
 }
 
 /// One line per event worth explaining. Best effort: a hotkey must not fail
-/// because a log could not be written.
+/// because a log could not be written. Never called from the hook thread.
 fn log(line: &str) {
     let Some(path) = log_path() else { return };
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    if std::fs::metadata(&path).map(|meta| meta.len() > LOG_LIMIT).unwrap_or(false) {
+    if std::fs::metadata(&path)
+        .map(|meta| meta.len() > LOG_LIMIT)
+        .unwrap_or(false)
+    {
         let _ = std::fs::remove_file(&path);
     }
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(file, "{line}");
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        // One write per line, so two threads writing at once cannot interleave
+        // into a single unreadable line.
+        let _ = file.write_all(format!("{line}\n").as_bytes());
     }
 }
 
@@ -165,8 +196,8 @@ fn log(line: &str) {
 ///
 /// The first instance to create the press mutex opens the window and holds it
 /// for a moment; the others find it already there and stay quiet. Holding it
-/// also covers the key repeating while it is held down. The spawn happens off
-/// the hook thread: starting a process takes long enough to be felt as input lag
+/// also covers anything that slips past the repeat check. The spawn happens on
+/// its own thread: starting a process takes long enough to be felt as input lag
 /// otherwise.
 fn open_window() {
     let name = wide(r"Local\Lyre.WinE.press");
@@ -194,9 +225,48 @@ fn open_window() {
     });
 }
 
+/// Everything the hook is not allowed to do, done after it has returned.
+fn drain(work: Receiver<Work>) {
+    for item in work {
+        match item {
+            Work::Taken { foreground, events } => {
+                log(&format!(
+                    "win+e taken (foreground {foreground}, {events} key events seen)"
+                ));
+                open_window();
+            }
+            Work::Passed {
+                foreground,
+                events,
+                why,
+            } => {
+                log(&format!(
+                    "win+e passed on: {why} (foreground {foreground}, {events} key events seen)"
+                ));
+            }
+        }
+    }
+}
+
 unsafe extern "system" fn keyboard_proc(code: i32, wparam: usize, lparam: isize) -> isize {
-    if code >= 0 {
+    let seen = EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
+    // A negative code means the event is not ours to look at. It is recorded a
+    // few times because "the hook is installed but only ever handed negative
+    // codes" is a real failure mode, and from the outside it looks exactly like
+    // no hook at all: Win+E opens Explorer and nothing is logged.
+    if code < 0 {
+        if seen <= 8 {
+            if let Some(work) = WORK.get() {
+                let _ = work.send(Work::Passed {
+                    foreground: 0,
+                    events: seen,
+                    why: "the system handed the hook a negative code",
+                });
+            }
+        }
+    } else {
         let event = unsafe { &*(lparam as *const KbdLlHookStruct) };
+        let events = seen;
         let pressed = wparam == WM_KEYDOWN || wparam == WM_SYSKEYDOWN;
         let released = wparam == WM_KEYUP || wparam == WM_SYSKEYUP;
 
@@ -210,41 +280,72 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: usize, lparam: isize)
             }
         }
 
-        if event.vk_code == VK_E as u32 {
+        if event.vk_code == VK_E {
             if released {
                 E_DOWN.store(false, Ordering::Relaxed);
             }
             if pressed {
                 let streamed = WIN_DOWN.load(Ordering::Relaxed);
                 let observed = key_down(VK_LWIN) || key_down(VK_RWIN);
-                // Only a press of the Windows key is interesting. Plain typing has
-                // to stay silent and untouched, or every `e` in the system would be
-                // written to the log and every held `e` would be swallowed.
+                // Plain typing has to stay silent and untouched, or every held
+                // `e` in the system would be swallowed and every one logged.
                 if streamed || observed {
                     let repeat = E_DOWN.swap(true, Ordering::Relaxed);
                     let other = key_down(VK_SHIFT) || key_down(VK_CONTROL) || key_down(VK_MENU);
-                    if takes_the_key(event.vk_code, true, other) {
-                        if defaultmanager::is_current_handler() {
-                            if !repeat {
-                                log(&format!(
-                                    "win+e taken (win streamed={streamed} observed={observed})"
-                                ));
-                                open_window();
-                            }
-                            // Swallow it, and every repeat while it is held, so the
-                            // shell never sees the combination and a held key opens
-                            // one window.
-                            return 1;
+                    let foreground = unsafe { GetForegroundWindow() } as u32;
+                    let mut process = 0u32;
+                    unsafe { GetWindowThreadProcessId(foreground as usize, &mut process) };
+                    if !takes_the_key(event.vk_code, true, other) {
+                        if let Some(work) = WORK.get() {
+                            let _ = work.send(Work::Passed {
+                                foreground: process,
+                                events,
+                                why: "another modifier is down",
+                            });
                         }
-                        log("win+e seen but Lyre is not the folder handler; passing it on");
+                    } else if !ACTIVE.load(Ordering::Relaxed) {
+                        if let Some(work) = WORK.get() {
+                            let _ = work.send(Work::Passed {
+                                foreground: process,
+                                events,
+                                why: "Lyre is not the folder handler",
+                            });
+                        }
                     } else {
-                        log(&format!("win+e seen but not taken (other modifier={other})"));
+                        if !repeat {
+                            if let Some(work) = WORK.get() {
+                                let _ = work.send(Work::Taken {
+                                    foreground: process,
+                                    events,
+                                });
+                            }
+                        }
+                        // Swallow it, and every repeat while it is held, so the
+                        // shell never sees the combination and a held key still
+                        // opens one window.
+                        return 1;
                     }
                 }
             }
         }
     }
     unsafe { CallNextHookEx(0, code, wparam, lparam) }
+}
+
+/// Keeps the handler flag current, so the callback never touches the registry.
+fn watch_handler() {
+    loop {
+        let active = defaultmanager::is_current_handler();
+        let previous = ACTIVE.swap(active, Ordering::Relaxed);
+        if previous != active {
+            log(if active {
+                "Lyre is the folder handler; win+e is taken"
+            } else {
+                "Lyre is not the folder handler; win+e is left alone"
+            });
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }
 
 /// Runs the hook for the rest of the process's life.
@@ -255,6 +356,15 @@ pub fn install() {
     if STARTED.swap(true, Ordering::Relaxed) {
         return;
     }
+
+    let (sender, receiver) = mpsc::channel();
+    let _ = WORK.set(sender);
+    let _ = std::thread::Builder::new()
+        .name("win-e-worker".into())
+        .spawn(move || drain(receiver));
+    let _ = std::thread::Builder::new()
+        .name("win-e-handler".into())
+        .spawn(watch_handler);
 
     let started = std::thread::Builder::new()
         .name("win-e".into())
@@ -273,7 +383,8 @@ pub fn install() {
                 };
                 if hook != 0 {
                     HOOK.store(hook, Ordering::Relaxed);
-                    log("keyboard hook installed");
+                    log(&format!("keyboard hook installed (pid {})", std::process::id()));
+                    log("hook thread pumping");
                     break;
                 }
                 log(&format!(
@@ -297,6 +408,7 @@ pub fn install() {
             loop {
                 let result = unsafe { GetMessageW(&mut message, 0, 0, 0) };
                 if result <= 0 {
+                    log(&format!("hook thread stopped pumping (result {result})"));
                     break;
                 }
             }

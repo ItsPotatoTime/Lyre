@@ -60,6 +60,10 @@ const VK_MENU: i32 = 0x12;
 const ERROR_ALREADY_EXISTS: u32 = 183;
 /// Keep the diagnostic file from growing without limit.
 const LOG_LIMIT: u64 = 128 * 1024;
+/// Posted to a thread by `SetTimer`, used here as a heartbeat.
+const WM_TIMER: u32 = 0x0113;
+/// How often the hook thread says it is still alive and counting.
+const HEARTBEAT_MS: u32 = 30_000;
 
 /// `KBDLLHOOKSTRUCT`: what the keyboard hook is handed for each key event.
 #[repr(C)]
@@ -104,15 +108,26 @@ extern "system" {
     fn GetMessageW(msg: *mut Msg, window: usize, min: u32, max: u32) -> i32;
     fn GetForegroundWindow() -> usize;
     fn GetWindowThreadProcessId(window: usize, process: *mut u32) -> u32;
+    fn SetTimer(
+        window: usize,
+        id: usize,
+        elapse: u32,
+        proc: Option<unsafe extern "system" fn(usize, u32, usize, u32)>,
+    ) -> usize;
 }
 
 #[link(name = "kernel32")]
 extern "system" {
     fn GetModuleHandleW(name: *const u16) -> usize;
     fn CreateMutexW(attributes: *mut c_void, owner: i32, name: *const u16) -> usize;
+    fn OpenMutexW(access: u32, inherit: i32, name: *const u16) -> usize;
     fn CloseHandle(handle: usize) -> i32;
     fn GetLastError() -> u32;
+    fn GetTickCount64() -> u64;
 }
+
+/// Enough access to open a mutex that is only being watched for existence.
+const SYNCHRONIZE: u32 = 0x0010_0000;
 
 /// What the callback decided, handed to the thread that does the slow work.
 enum Work {
@@ -130,6 +145,10 @@ enum Work {
 static HOOK: AtomicUsize = AtomicUsize::new(0);
 /// Whether a thread has already been started for the hook.
 static STARTED: AtomicBool = AtomicBool::new(false);
+/// The name a window process holds for as long as it is running.
+static WINDOW: AtomicUsize = AtomicUsize::new(0);
+/// The name the helper holds, so a second helper exits at once.
+static HELPER: AtomicUsize = AtomicUsize::new(0);
 /// Whether the Windows key is down, as seen in the key stream.
 static WIN_DOWN: AtomicBool = AtomicBool::new(false);
 /// Whether `E` is already down, so a held key opens one window and not one per
@@ -140,8 +159,15 @@ static E_DOWN: AtomicBool = AtomicBool::new(false);
 static EVENTS: AtomicU64 = AtomicU64::new(0);
 /// Whether this application is the folder handler, refreshed off the hook thread.
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+/// When the Windows key was last seen in the stream, so a press that arrives
+/// without a visible modifier can be recognised as that rather than as typing.
+static WIN_SEEN_AT: AtomicU64 = AtomicU64::new(0);
 /// Where the callback hands its work.
 static WORK: OnceLock<Sender<Work>> = OnceLock::new();
+
+fn now_ms() -> u64 {
+    unsafe { GetTickCount64() }
+}
 
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
@@ -187,7 +213,11 @@ fn log(line: &str) {
     {
         // One write per line, so two threads writing at once cannot interleave
         // into a single unreadable line.
-        let _ = file.write_all(format!("{line}\n").as_bytes());
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or(0);
+        let _ = file.write_all(format!("[{stamp}] {line}\n").as_bytes());
     }
 }
 
@@ -231,7 +261,8 @@ fn drain(work: Receiver<Work>) {
         match item {
             Work::Taken { foreground, events } => {
                 log(&format!(
-                    "win+e taken (foreground {foreground}, {events} key events seen)"
+                    "win+e taken (pid {}, foreground {foreground}, {events} key events seen)",
+                    std::process::id()
                 ));
                 open_window();
             }
@@ -241,7 +272,8 @@ fn drain(work: Receiver<Work>) {
                 why,
             } => {
                 log(&format!(
-                    "win+e passed on: {why} (foreground {foreground}, {events} key events seen)"
+                    "win+e passed on: {why} (pid {}, foreground {foreground}, {events} key events seen)",
+                    std::process::id()
                 ));
             }
         }
@@ -273,6 +305,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: usize, lparam: isize)
         // The modifier state is taken from the stream, in order, so it describes
         // the press being reported rather than the moment this code runs.
         if event.vk_code == VK_LWIN as u32 || event.vk_code == VK_RWIN as u32 {
+            WIN_SEEN_AT.store(now_ms(), Ordering::Relaxed);
             if pressed {
                 WIN_DOWN.store(true, Ordering::Relaxed);
             } else if released {
@@ -325,6 +358,20 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: usize, lparam: isize)
                         // opens one window.
                         return 1;
                     }
+                } else if now_ms().saturating_sub(WIN_SEEN_AT.load(Ordering::Relaxed)) < 1500 {
+                    // The key was physically pressed moments ago but neither the
+                    // stream nor the async state can see it. That is worth saying,
+                    // because the key is then left to the shell and Explorer opens.
+                    let foreground = unsafe { GetForegroundWindow() } as u32;
+                    let mut process = 0u32;
+                    unsafe { GetWindowThreadProcessId(foreground as usize, &mut process) };
+                    if let Some(work) = WORK.get() {
+                        let _ = work.send(Work::Passed {
+                            foreground: process,
+                            events,
+                            why: "the windows key was pressed but its state was not visible",
+                        });
+                    }
                 }
             }
         }
@@ -348,14 +395,77 @@ fn watch_handler() {
     }
 }
 
-/// Runs the hook for the rest of the process's life.
+/// Starts the helper that owns the key, once per window process.
 ///
-/// Runs on a thread of its own with a message pump, so the window being busy
-/// cannot delay the callback past the point where the system stops asking it.
+/// The hook itself does not live here. A low level keyboard hook is not called
+/// while a window of the process that installed it has the foreground; measured
+/// on Windows 11 25H2, the press that should have opened a window left the
+/// window's own hook with zero events while a helper process saw it. So the
+/// window keeps a name that says it exists, and the helper does the listening.
 pub fn install() {
     if STARTED.swap(true, Ordering::Relaxed) {
         return;
     }
+
+    // Held for the life of this window process, so the helper can tell when the
+    // last window is gone.
+    let name = wide(r"Local\Lyre.WinE.window");
+    let window = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) };
+    if window != 0 {
+        WINDOW.store(window, Ordering::Relaxed);
+    }
+
+    let Ok(exe) = std::env::current_exe() else {
+        log("could not locate this application to start the win+e helper");
+        return;
+    };
+    // A helper already running exits at once on its own name, so starting one
+    // per window is safe and keeps this simple.
+    if let Err(err) = std::process::Command::new(exe)
+        .arg("--win-e-helper")
+        .spawn()
+    {
+        log(&format!("could not start the win+e helper: {err}"));
+    }
+}
+
+/// Whether a Lyre window process is still running.
+fn window_exists() -> bool {
+    let name = wide(r"Local\Lyre.WinE.window");
+    let handle = unsafe { OpenMutexW(SYNCHRONIZE, 0, name.as_ptr()) };
+    if handle == 0 {
+        return false;
+    }
+    unsafe { CloseHandle(handle) };
+    true
+}
+
+/// The helper run: owns the key, never owns a window.
+///
+/// Returns immediately if another helper already holds the name, so windows can
+/// start one whenever they like.
+pub fn run_helper() {
+    let name = wide(r"Local\Lyre.WinE.helper");
+    let owner = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) };
+    if owner == 0 {
+        return;
+    }
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe { CloseHandle(owner) };
+        return;
+    }
+    HELPER.store(owner, Ordering::Relaxed);
+
+    // Outlive the windows, but not the application: once the last window is
+    // gone there is nothing to open, and a process that stays would hold the
+    // executable open against the next update.
+    std::thread::spawn(|| loop {
+        std::thread::sleep(Duration::from_secs(5));
+        if !window_exists() {
+            log("no Lyre window left; the win+e helper is stopping");
+            std::process::exit(0);
+        }
+    });
 
     let (sender, receiver) = mpsc::channel();
     let _ = WORK.set(sender);
@@ -405,18 +515,34 @@ pub fn install() {
                 point: Point { x: 0, y: 0 },
                 private: 0,
             };
+            // A timer wakes this thread now and then so the log can say the hook
+            // is still installed and still counting. Without it, a hook that has
+            // been dropped and a hook that is merely never called look the same.
+            unsafe { SetTimer(0, 0, HEARTBEAT_MS, None) };
             loop {
                 let result = unsafe { GetMessageW(&mut message, 0, 0, 0) };
                 if result <= 0 {
                     log(&format!("hook thread stopped pumping (result {result})"));
                     break;
                 }
+                if message.message == WM_TIMER {
+                    log(&format!(
+                        "hook thread alive, {} key events seen",
+                        EVENTS.load(Ordering::Relaxed)
+                    ));
+                }
             }
         });
 
     if started.is_err() {
-        STARTED.store(false, Ordering::Relaxed);
         log("could not start the hook thread");
+        return;
+    }
+
+    // Nothing else belongs to this process. The hook thread, the worker and the
+    // watchdog all outlive this call.
+    loop {
+        std::thread::park();
     }
 }
 

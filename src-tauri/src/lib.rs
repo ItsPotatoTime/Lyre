@@ -523,6 +523,18 @@ fn dir_stamp(path: String) -> Option<i64> {
 pub fn run() {
     // Before the webview exists: WebKit reads this once, at initialisation.
     graphics::apply_at_startup();
+    // A helper run: no window, only the Win+E hook. It exists because a low
+    // level keyboard hook is not reliably called while a window of the process
+    // that installed it has the foreground, and this process never has one.
+    if std::env::args().any(|arg| arg == "--win-e-helper") {
+        #[cfg(windows)]
+        {
+            hotkey::run_helper();
+            return;
+        }
+        #[cfg(not(windows))]
+        return;
+    }
     // A launch that asked for something only Explorer can serve (a selection, a
     // shell namespace, one of its own switches) is handed straight to it, rather
     // than opening a window that ignores the request.

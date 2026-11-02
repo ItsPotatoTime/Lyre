@@ -9,6 +9,8 @@ mod eject;
 mod fileops;
 mod fold;
 mod graphics;
+#[cfg(windows)]
+mod hotkey;
 mod openwith;
 mod preview;
 mod ops;
@@ -521,6 +523,16 @@ fn dir_stamp(path: String) -> Option<i64> {
 pub fn run() {
     // Before the webview exists: WebKit reads this once, at initialisation.
     graphics::apply_at_startup();
+    // A launch that asked for something only Explorer can serve (a selection, a
+    // shell namespace, one of its own switches) is handed straight to it, rather
+    // than opening a window that ignores the request.
+    if defaultmanager::forward_unhostable_launch() {
+        return;
+    }
+    // Win+E is launched by full path, so no shell verb can catch it; this takes
+    // the key itself, for as long as this application is the folder handler.
+    #[cfg(windows)]
+    hotkey::install();
     // Under LYRE_TRACE, a close reports which step it reached. A freeze can be
     // the request never arriving, the window not being disposed, or the event
     // loop not ending, and one line says which without attaching a debugger to

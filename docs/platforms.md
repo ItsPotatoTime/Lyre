@@ -26,16 +26,48 @@ preference, and the More menu can turn the offer back on or act on it directly.
 
 Windows has no equivalent *setting*: Explorer is the shell, and folders are part
 of it rather than a file type that can be associated. What third-party file
-managers do instead, and what Lyre does, is override the shell's default verb
-for directories and drives. It is a per-user registry change under
-`HKCU\Software\Classes`, so it needs no administrator rights, the stock `open`
-verb is left untouched, and "Stop opening folders with Lyre" in the More menu
-puts it back.
+managers do instead, and what Lyre does, is override the command the shell runs
+for the classes a folder open passes through. It is a per-user registry change
+under `HKCU\Software\Classes`, so it needs no administrator rights:
 
-The honest caveats: this is a registry override rather than a supported API, so
-anything that launches Explorer directly still gets Explorer, and a Windows
-update can reset it. Restarting Explorer, or signing out, may be needed before
-the change takes effect.
+- `Directory\shell\open` and `explore`, which is the class a folder path
+  resolves to.
+- `Folder\shell\open` and `explore`, for shell items that are not paths.
+- `Drive\shell\open` and `explore`, for a volume opened from This PC.
+- `CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\shell\opennewwindow`, the File
+  Explorer folder's own new-window verb, for anything that invokes it directly.
+
+The machine's own `Folder` and CLSID commands carry a `DelegateExecute` handler
+that runs inside Explorer, so that value is cleared alongside each command;
+without it the inherited delegate wins and the command is never run.
+
+Every value that is replaced is recorded first, under
+`%LOCALAPPDATA%\Lyre\folder-handler.json`, and "Stop opening folders with Lyre"
+puts back what was there rather than guessing at a default. A value another
+application has taken over since is left alone rather than clobbered.
+
+The honest caveats: this is a registry override rather than a supported API.
+Anything that launches Explorer by full path still gets Explorer, which includes
+"Show in folder" and "Open file location" (they call `explorer.exe /select,`) and
+a second double-click inside an Explorer window, because that window navigates
+itself. A launch the window cannot serve is handed to `explorer.exe` instead of
+being dropped: a `/select`, a `shell:` namespace, a `::{CLSID}`, or one of
+Explorer's own switches. A file argument opens the folder that holds it.
+
+### Win+E on Windows
+
+Win+E is not one of those verbs. Measured on Windows 11 25H2, the key spawns a
+new process, `"C:\Windows\explorer.exe" ::{52205FD8-5DFB-447D-801A-D0B52F2E83E1}`.
+That is a full path, so it consults neither the CLSID verb nor `App Paths`, and
+no registry key can intercept it. What can be intercepted is the keystroke, so
+while Lyre is the folder handler it installs a low level keyboard hook, takes
+Win+E, and opens a window itself.
+
+Two limits come with that. The hook lives in the running process, so Win+E goes
+back to Explorer once every Lyre window is closed. And because each press opens a
+new process rather than reusing the running window, only the first instance hooks
+the key, which it claims with a named mutex; otherwise each press would multiply
+the number of windows. Win+Shift+E, Win+Ctrl+E and Win+Alt+E are left alone.
 
 ### macOS
 

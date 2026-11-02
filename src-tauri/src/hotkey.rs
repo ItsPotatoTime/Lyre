@@ -63,7 +63,7 @@ const LOG_LIMIT: u64 = 128 * 1024;
 /// Posted to a thread by `SetTimer`, used here as a heartbeat.
 const WM_TIMER: u32 = 0x0113;
 /// How often the hook thread says it is still alive and counting.
-const HEARTBEAT_MS: u32 = 30_000;
+const HEARTBEAT_MS: u32 = 300_000;
 
 /// `KBDLLHOOKSTRUCT`: what the keyboard hook is handed for each key event.
 #[repr(C)]

@@ -7,10 +7,12 @@
 //! of what a file manager should do. Everything here is scaled to fit the pane
 //! and cached on disk by content, so re-selecting a file is a file read.
 //!
-//! The actual decoding is delegated to the tools every desktop already has:
-//! `pdftoppm` for PDFs, `ffmpegthumbnailer` for video, and `ffmpeg` or
-//! ImageMagick for images. If none of them is installed the pane still shows
-//! the file's details, which is a graceful failure rather than a broken one.
+//! Pictures are decoded here, in process. Delegating that to a tool was wrong
+//! for a clean install: a fresh Windows account has no `ffmpeg`, no `magick`,
+//! and its `convert.exe` is the FAT to NTFS utility rather than ImageMagick, so
+//! every picture came back blank. Video and PDF still go to `ffmpegthumbnailer`
+//! and `pdftoppm`, and a file neither can be made for still shows its details,
+//! which is a graceful failure rather than a broken one.
 
 use serde::Serialize;
 use std::path::{Path, PathBuf};
@@ -61,9 +63,21 @@ fn kind_of(path: &Path, is_dir: bool) -> &'static str {
 }
 
 fn cache_dir() -> Option<PathBuf> {
+    // A Windows account has neither XDG_CACHE_HOME nor HOME, so the lookup used
+    // to come back empty and the thumbnailer gave up before it looked for any
+    // decoder at all.
+    #[cfg(windows)]
+    let base = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("APPDATA").map(PathBuf::from))
+        .or_else(|| {
+            std::env::var_os("USERPROFILE").map(|home| PathBuf::from(home).join(".cache"))
+        });
+    #[cfg(not(windows))]
     let base = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))?;
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")));
+    let base = base?;
     Some(base.join("lyre").join("thumbnails"))
 }
 
@@ -84,6 +98,46 @@ fn run(program: &str, args: &[&str]) -> bool {
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
+}
+
+/// Decodes a picture here and writes it scaled to the cache.
+///
+/// This is the path that has to work on a machine nobody has prepared: no
+/// ffmpeg, no ImageMagick, nothing to install first.
+fn native_image(path: &Path, target: &Path) -> bool {
+    let Ok(reader) = image::ImageReader::open(path) else {
+        return false;
+    };
+    let Ok(reader) = reader.with_guessed_format() else {
+        return false;
+    };
+    let Ok(picture) = reader.decode() else {
+        return false;
+    };
+    // `thumbnail` keeps the aspect ratio and is much cheaper than a general
+    // resize, which is the whole point of doing this instead of the webview.
+    picture
+        .thumbnail(THUMB_EDGE, THUMB_EDGE)
+        .save(target)
+        .is_ok()
+}
+
+/// ImageMagick, under the name current releases use.
+///
+/// `convert` is ImageMagick 6's name and also a Windows system tool that turns a
+/// volume into NTFS, so it is only tried where that collision cannot happen.
+fn imagemagick(source: &str, target: &str) -> bool {
+    let size = format!("{THUMB_EDGE}x{THUMB_EDGE}");
+    if run("magick", &[source, "-thumbnail", &size, target]) {
+        return true;
+    }
+    #[cfg(not(windows))]
+    {
+        if run("convert", &[source, "-thumbnail", &size, target]) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Make the thumbnail if it is not already cached, and return where it is.
@@ -140,9 +194,13 @@ fn thumbnail_path(path: &Path) -> Result<PathBuf, String> {
             ],
         ),
         "image" => {
+            // In process first: it is the only path a clean install has.
+            if native_image(path, &out) {
+                return Ok(out);
+            }
             let scale = format!("scale={THUMB_EDGE}:-1:force_original_aspect_ratio=decrease");
             run("ffmpeg", &["-v", "error", "-y", "-i", &source, "-vf", &scale, &target])
-                || run("convert", &[&source, "-thumbnail", &format!("{THUMB_EDGE}x{THUMB_EDGE}"), &target])
+                || imagemagick(&source, &target)
         }
         _ => false,
     };
@@ -278,46 +336,57 @@ mod tests {
 mod thumbnail_tests {
     use super::*;
 
-    fn have(tool: &str) -> bool {
-        Command::new(tool)
-            .arg("-version")
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .is_ok()
-    }
-
-    /// The whole path: spawn the tool, write the cache file, read it back.
-    /// Skipped rather than failed when the machine has no image tooling.
+    /// The whole path: decode, scale, write the cache file, read it back, and
+    /// get the same bytes the second time. Nothing external is involved, which
+    /// is the point: a clean install has no image tooling at all.
     #[test]
     fn an_image_produces_a_real_png_thumbnail() {
-        if !have("ffmpeg") {
-            println!("skipped: ffmpeg not installed");
-            return;
-        }
         let dir = std::env::temp_dir().join(format!("lyre-thumb-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let image = dir.join("swatch.png");
-        let made = Command::new("ffmpeg")
-            .args([
-                "-v", "error", "-y", "-f", "lavfi", "-i", "color=c=red:s=64x64",
-                "-frames:v", "1",
-            ])
-            .arg(&image)
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-        assert!(made, "could not create a test image");
+        let source = dir.join("swatch.png");
+        let picture = image::RgbImage::from_fn(640, 480, |x, y| {
+            image::Rgb([(x % 256) as u8, (y % 256) as u8, 160])
+        });
+        picture.save(&source).expect("write a test picture");
 
-        let bytes = thumbnail(&image.to_string_lossy()).expect("a thumbnail");
+        let bytes = thumbnail(&source.to_string_lossy()).expect("a thumbnail");
         assert!(bytes.len() > 64, "thumbnail is suspiciously small");
         assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n", "not a PNG");
 
         // Second call is served from the cache, byte for byte.
-        let again = thumbnail(&image.to_string_lossy()).expect("cached thumbnail");
+        let again = thumbnail(&source.to_string_lossy()).expect("cached thumbnail");
         assert_eq!(bytes, again);
 
+        // Scaled to the long edge, with the picture's shape kept.
+        let made = image::load_from_memory(&bytes).expect("the thumbnail decodes");
+        assert!(made.width() <= THUMB_EDGE && made.height() <= THUMB_EDGE);
+        assert_eq!(
+            made.width() * 3,
+            made.height() * 4,
+            "the aspect ratio should survive"
+        );
+
+        // The same path for a JPEG, which is what photographs actually are.
+        let photo = dir.join("photo.jpg");
+        image::RgbImage::from_fn(320, 200, |x, y| image::Rgb([x as u8, y as u8, 90]))
+            .save(&photo)
+            .expect("write a test photo");
+        let from_photo = thumbnail(&photo.to_string_lossy()).expect("a jpeg thumbnail");
+        assert_eq!(&from_photo[..8], b"\x89PNG\r\n\x1a\n", "not a PNG");
+
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The bug that made every preview blank on Windows: no XDG_CACHE_HOME and
+    /// no HOME, so there was nowhere to put a thumbnail and no decoder was ever
+    /// reached.
+    #[test]
+    fn the_cache_is_found_on_every_desktop() {
+        let dir = cache_dir().expect("a cache directory");
+        assert_eq!(
+            dir.file_name().and_then(|name| name.to_str()),
+            Some("thumbnails")
+        );
     }
 }
 

@@ -29,6 +29,7 @@ sysinfo = "0.33"
 nucleo-matcher = "0.3.1"
 tauri-plugin-drag = "2.1.1"
 unicode-normalization = "0.1.26"
+image = { version = "0.25.6", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff"] }
 
 # A file manager's start-up time is a feature. Optimise hard for binary size
 # and code locality rather than peak throughput.

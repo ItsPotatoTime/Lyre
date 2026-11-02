@@ -34,10 +34,12 @@ shell, React 19 interface.
 - **Real file operations.** Copy, cut and paste with a conflict prompt, delete to
   the trash, rename in place, new folder, properties, and open with any
   registered application.
-- **Preview pane.** Image, video and PDF thumbnails, the first lines of a text
-  file, and the details of whatever is focused. Pixels are decoded once, at a
-  size worth showing, and cached by file identity; the webview never sees a 50
-  megapixel original. [How it works](docs/behaviour.md#preview-pane)
+- **Preview pane.** Picture thumbnails on a machine with nothing installed,
+  video and PDF thumbnails where the desktop has a decoder for them, the first
+  lines of a text file, and the details of whatever is focused. Pixels are
+  decoded once, at a size worth showing, and cached by file identity; the
+  webview never sees a 50 megapixel original.
+  [How it works](docs/behaviour.md#preview-pane)
 - **Drag and drop that knows its own mind.** Onto a folder, a breadcrumb, a tab
   or the rail: a move within one volume, a copy across volumes, Shift inverts it,
   and the badge says which. Dragging past the window edge becomes a real

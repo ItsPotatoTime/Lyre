@@ -18,12 +18,19 @@ Thumbnails are made in the main process and handed over as PNG bytes, never as
 the original file. That is deliberate: letting the webview decode a 50 megapixel
 photograph to show it 300 pixels wide costs a couple of hundred megabytes, which
 is the opposite of what the pane should do. Each thumbnail is scaled to 480
-pixels, cached on disk under `~/.cache/lyre/thumbnails`, and keyed by the file's
-identity, so selecting it again is a file read.
+pixels, cached on disk under the platform's cache directory
+(`%LOCALAPPDATA%\lyre\thumbnails` on Windows, `~/.cache/lyre/thumbnails`
+elsewhere), and keyed by the file's identity, so selecting it again is a file
+read.
 
-Decoding is delegated to tools a desktop already has: `pdftoppm` for PDFs,
-`ffmpegthumbnailer` for video, `ffmpeg` or ImageMagick for images. When none is
-installed the pane still shows the file's details rather than failing.
+Pictures are decoded in process, so a machine nobody has prepared still shows
+photographs. That is a deliberate exception to handing work to the desktop: a
+fresh Windows account has neither `ffmpeg` nor ImageMagick, and its `convert.exe`
+is the utility that turns a volume into NTFS, so the delegated path could never
+have worked there. The formats are JPEG, PNG, GIF, WebP, BMP and TIFF; SVG, ICO,
+AVIF and HEIC have no decoder here and fall through to the tools. Video and PDF
+still go to `ffmpegthumbnailer` and `pdftoppm`, and a file neither can be made
+for shows its details rather than failing.
 
 Rows and tiles show the file's own picture too, made and cached the same way,
 except that a file over 24 MB keeps its glyph in a row: decoding that much to

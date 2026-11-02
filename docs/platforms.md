@@ -69,6 +69,15 @@ new process rather than reusing the running window, only the first instance hook
 the key, which it claims with a named mutex; otherwise each press would multiply
 the number of windows. Win+Shift+E, Win+Ctrl+E and Win+Alt+E are left alone.
 
+The hook runs on a thread of its own, not the one that draws the window: a low
+level hook is delivered through the installing thread's message queue and the
+system stops consulting a thread that answers too slowly, so a busy frame could
+lose the key. The Windows key is tracked from the key stream rather than read when
+the callback runs, for the same reason. Each press writes one line to
+`%LOCALAPPDATA%\Lyre\hotkey.log` saying whether the key arrived, what the modifier
+state was, and whether it was taken, which is what makes "Win+E still opens
+Explorer" answerable without a debugger.
+
 ### macOS
 
 No route at all: Finder is the shell and offers nothing equivalent.

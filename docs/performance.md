@@ -151,10 +151,14 @@ the median rate, so the number is live rather than a single reading that has
 already gone by the time you look at it. A rate that does not move while you
 scroll a large folder is a cap, and the number names it.
 
-The meter keeps one pixel changing every frame, so it measures a window that is
-actually being drawn rather than one being spared work. That is also why it is a
-switch you turn on for a moment and not a setting: while it is on, the compositor
-is working as hard as it can.
+The meter keeps one pixel being painted, so it measures a window that is actually
+being drawn rather than one being spared work. It paints at most thirty times a
+second, and that ceiling is deliberate. A display with adaptive sync runs at the
+rate the window presents, so a meter that drew on every vblank held the panel at,
+and a fraction past, its own maximum, and a panel oscillating at the top of its
+variable range answers with flicker across the whole screen. A meter cannot ask
+for fewer frames than that without stopping being a meter, which is also why it is
+a switch you turn on for a moment and not a setting.
 
 ### The ceiling on Linux
 
@@ -188,3 +192,8 @@ On Windows there is no equivalent engine ceiling to look for: Chromium's paint l
 follows the display, so a rate near 60 on a faster panel means the webview has lost
 its hardware compositing path. Check the panel's own refresh rate in Windows
 Settings first.
+
+With adaptive sync on, the panel follows whatever presents rather than a fixed
+rate, so the reading describes what the window achieved and not what the panel can
+do: a panel set to 300 Hz that reads 303 is one being driven a fraction past its
+own maximum, and the flicker that comes with it is the panel's, not the meter's.

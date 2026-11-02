@@ -888,9 +888,10 @@ mod memory_tests {
     use super::*;
 
     fn entry(i: usize, folder: &str) -> Entry {
+        let name = format!("file_{i:05}.txt");
         Entry {
-            name: format!("file_{i:05}.txt"),
-            path: format!("{folder}/file_{i:05}.txt"),
+            path: Path::new(folder).join(&name).to_string_lossy().into_owned(),
+            name,
             is_dir: false,
             is_symlink: false,
             size: i as u64,

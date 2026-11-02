@@ -453,9 +453,11 @@ mod volume_tests {
     /// Unlabelled volumes still need a name a person can read.
     #[test]
     fn an_unlabelled_volume_is_named_by_its_size() {
-        let labels = std::collections::HashMap::new();
+        // Only Linux names an unlabelled volume after its size, so the map the
+        // assertions need exists only in that build.
         #[cfg(target_os = "linux")]
         {
+            let labels = std::collections::HashMap::<String, String>::new();
             assert_eq!(
                 volume_name("/dev/sdz9", "/run/media/you/0A1B", 64_000_000_000, &labels, ""),
                 "59.6 GB Volume"

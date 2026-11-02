@@ -65,9 +65,11 @@ Win+E, and opens a window itself.
 
 Two limits come with that. The hook lives in the running process, so Win+E goes
 back to Explorer once every Lyre window is closed. And because each press opens a
-new process rather than reusing the running window, only the first instance hooks
-the key, which it claims with a named mutex; otherwise each press would multiply
-the number of windows. Win+Shift+E, Win+Ctrl+E and Win+Alt+E are left alone.
+new process rather than reusing the running window, every instance hooks the key
+and a short lived named mutex decides which one opens the window for a given
+press. An earlier version let only one instance hook, which meant closing that
+window quietly returned Win+E to Explorer for every other window. Win+Shift+E,
+Win+Ctrl+E and Win+Alt+E are left alone.
 
 The hook runs on a thread of its own, not the one that draws the window: a low
 level hook is delivered through the installing thread's message queue and the

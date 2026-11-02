@@ -20,9 +20,14 @@
 //!   `GetAsyncKeyState`, which answers about the moment the callback runs rather
 //!   than the moment the key was pressed. A fast press can be answered late.
 //! - The hook only exists while a process that installed it is alive, so Win+E
-//!   falls back to Explorer when this application is closed. Every running
-//!   instance would otherwise install its own hook and open one window each, so
-//!   the first instance takes a named mutex and the rest stay out.
+//!   falls back to Explorer when this application is closed.
+//!
+//! Every running instance installs its own hook, so one keystroke reaches all of
+//! them. What stops that from opening a window per instance is a short lived
+//! named mutex per press: the first to create it opens the window and the rest
+//! stay quiet. An earlier version let only one instance hook, which meant that
+//! closing that instance silently switched Win+E back to Explorer for every
+//! window that was still open.
 //!
 //! Whether the key is ours to take is read at the moment it is pressed rather
 //! than cached, so restoring Explorer from any window stops the redirection
@@ -35,9 +40,8 @@
 use std::ffi::c_void;
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::OnceLock;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
 use crate::defaultmanager;
 
@@ -109,15 +113,13 @@ extern "system" {
 
 /// The hook handle, or zero before it is installed.
 static HOOK: AtomicUsize = AtomicUsize::new(0);
-/// Held for the life of the process that owns the key.
-static OWNER: AtomicUsize = AtomicUsize::new(0);
 /// Whether a thread has already been started for the hook.
 static STARTED: AtomicBool = AtomicBool::new(false);
 /// Whether the Windows key is down, as seen in the key stream.
 static WIN_DOWN: AtomicBool = AtomicBool::new(false);
-/// When the last window was opened, in milliseconds since start.
-static LAST_OPEN: AtomicU64 = AtomicU64::new(0);
-static START: OnceLock<Instant> = OnceLock::new();
+/// Whether `E` is already down, so a held key opens one window and not one per
+/// repeat.
+static E_DOWN: AtomicBool = AtomicBool::new(false);
 
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
@@ -158,18 +160,29 @@ fn log(line: &str) {
     }
 }
 
-/// Opens a window of this application, at most once per press.
+/// Opens a window of this application, once per press even though every running
+/// instance sees the same keystroke.
 ///
-/// The key repeats while it is held, so a repeat has to be swallowed without
-/// opening anything. The spawn happens off the hook thread: starting a process
-/// takes long enough to be felt as input lag otherwise.
+/// The first instance to create the press mutex opens the window and holds it
+/// for a moment; the others find it already there and stay quiet. Holding it
+/// also covers the key repeating while it is held down. The spawn happens off
+/// the hook thread: starting a process takes long enough to be felt as input lag
+/// otherwise.
 fn open_window() {
-    let now = START.get_or_init(Instant::now).elapsed().as_millis() as u64;
-    let last = LAST_OPEN.load(Ordering::Relaxed);
-    if last != 0 && now.saturating_sub(last) < 800 {
+    let name = wide(r"Local\Lyre.WinE.press");
+    let press = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) };
+    if press == 0 {
+        log("could not create the press mutex");
         return;
     }
-    LAST_OPEN.store(now, Ordering::Relaxed);
+    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
+        unsafe { CloseHandle(press) };
+        return;
+    }
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(500));
+        unsafe { CloseHandle(press) };
+    });
 
     std::thread::spawn(|| {
         if let Ok(exe) = std::env::current_exe() {
@@ -197,27 +210,36 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: usize, lparam: isize)
             }
         }
 
-        if pressed && event.vk_code == VK_E {
-            let streamed = WIN_DOWN.load(Ordering::Relaxed);
-            let observed = key_down(VK_LWIN) || key_down(VK_RWIN);
-            // Only a press of the Windows key is interesting. Plain typing has to
-            // stay silent, or every `e` in the system would be written to the log.
-            if streamed || observed {
-                let other = key_down(VK_SHIFT) || key_down(VK_CONTROL) || key_down(VK_MENU);
-                if takes_the_key(event.vk_code, true, other) {
-                    if defaultmanager::is_current_handler() {
-                        log(&format!(
-                            "win+e taken (win streamed={streamed} observed={observed})"
-                        ));
-                        open_window();
-                        // Swallow it, so the shell never sees the combination.
-                        return 1;
+        if event.vk_code == VK_E as u32 {
+            if released {
+                E_DOWN.store(false, Ordering::Relaxed);
+            }
+            if pressed {
+                let streamed = WIN_DOWN.load(Ordering::Relaxed);
+                let observed = key_down(VK_LWIN) || key_down(VK_RWIN);
+                // Only a press of the Windows key is interesting. Plain typing has
+                // to stay silent and untouched, or every `e` in the system would be
+                // written to the log and every held `e` would be swallowed.
+                if streamed || observed {
+                    let repeat = E_DOWN.swap(true, Ordering::Relaxed);
+                    let other = key_down(VK_SHIFT) || key_down(VK_CONTROL) || key_down(VK_MENU);
+                    if takes_the_key(event.vk_code, true, other) {
+                        if defaultmanager::is_current_handler() {
+                            if !repeat {
+                                log(&format!(
+                                    "win+e taken (win streamed={streamed} observed={observed})"
+                                ));
+                                open_window();
+                            }
+                            // Swallow it, and every repeat while it is held, so the
+                            // shell never sees the combination and a held key opens
+                            // one window.
+                            return 1;
+                        }
+                        log("win+e seen but Lyre is not the folder handler; passing it on");
+                    } else {
+                        log(&format!("win+e seen but not taken (other modifier={other})"));
                     }
-                    log("win+e seen but Lyre is not the folder handler; passing it on");
-                } else {
-                    log(&format!(
-                        "win+e seen but not taken (other modifier={other})"
-                    ));
                 }
             }
         }
@@ -225,27 +247,7 @@ unsafe extern "system" fn keyboard_proc(code: i32, wparam: usize, lparam: isize)
     unsafe { CallNextHookEx(0, code, wparam, lparam) }
 }
 
-/// Owns the key for this process, if no other process already does.
-///
-/// The mutex is held for the life of the process: each press opens another
-/// process, and every instance hooking would multiply the windows opened by one
-/// keystroke.
-fn claim() -> Option<usize> {
-    let name = wide(r"Local\Lyre.WinE");
-    let owner = unsafe { CreateMutexW(std::ptr::null_mut(), 0, name.as_ptr()) };
-    if owner == 0 {
-        log("could not create the ownership mutex");
-        return None;
-    }
-    if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
-        unsafe { CloseHandle(owner) };
-        return None;
-    }
-    OWNER.store(owner, Ordering::Relaxed);
-    Some(owner)
-}
-
-/// Claims the key and runs the hook for the rest of the process's life.
+/// Runs the hook for the rest of the process's life.
 ///
 /// Runs on a thread of its own with a message pump, so the window being busy
 /// cannot delay the callback past the point where the system stops asking it.
@@ -257,27 +259,29 @@ pub fn install() {
     let started = std::thread::Builder::new()
         .name("win-e".into())
         .spawn(|| {
-            let Some(_owner) = claim() else {
-                return;
-            };
-
-            let hook = unsafe {
-                SetWindowsHookExW(
-                    WH_KEYBOARD_LL,
-                    Some(keyboard_proc),
-                    GetModuleHandleW(std::ptr::null()),
-                    0,
-                )
-            };
-            if hook == 0 {
+            // A failure here is not permanent: another application can be holding
+            // the hook slot or the desktop can be mid-transition, so keep trying
+            // rather than leaving the key with Explorer for the rest of the run.
+            loop {
+                let hook = unsafe {
+                    SetWindowsHookExW(
+                        WH_KEYBOARD_LL,
+                        Some(keyboard_proc),
+                        GetModuleHandleW(std::ptr::null()),
+                        0,
+                    )
+                };
+                if hook != 0 {
+                    HOOK.store(hook, Ordering::Relaxed);
+                    log("keyboard hook installed");
+                    break;
+                }
                 log(&format!(
                     "could not install the keyboard hook (error {})",
                     unsafe { GetLastError() }
                 ));
-                return;
+                std::thread::sleep(Duration::from_secs(5));
             }
-            HOOK.store(hook, Ordering::Relaxed);
-            log("keyboard hook installed");
 
             // The hook is called while this thread waits for messages, so the
             // loop has to keep running even though nothing is ever handled.

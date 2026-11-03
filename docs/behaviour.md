@@ -28,9 +28,20 @@ photographs. That is a deliberate exception to handing work to the desktop: a
 fresh Windows account has neither `ffmpeg` nor ImageMagick, and its `convert.exe`
 is the utility that turns a volume into NTFS, so the delegated path could never
 have worked there. The formats are JPEG, PNG, GIF, WebP, BMP and TIFF; SVG, ICO,
-AVIF and HEIC have no decoder here and fall through to the tools. Video and PDF
-still go to `ffmpegthumbnailer` and `pdftoppm`, and a file neither can be made
-for shows its details rather than failing.
+AVIF and HEIC have no decoder here and fall through to the tools.
+
+Video and PDF are asked of the system instead, through the thumbnail provider
+Windows registers for the type, which is the one Explorer uses. That is why the
+list of formats is as long as the machine's rather than as long as ours: a codec
+installed for Explorer is a codec available here, and a machine without one shows
+nothing in either. The request is made in two steps because the pane has to feel
+instant. It first asks only for a thumbnail Windows already holds, which costs a
+few milliseconds and no decoding at all, and that is the common case for anything
+Explorer has shown. Only a miss goes to a worker thread, one at a time, with a
+three second budget, and a refusal is remembered for the session so scrolling
+past a folder of films does not pay for the same failed extraction on every row.
+Elsewhere the old tools still serve: `ffmpegthumbnailer` and `pdftoppm`, and a
+file nothing can be made for shows its details rather than failing.
 
 Rows and tiles show the file's own picture too, made and cached the same way,
 except that a file over 24 MB keeps its glyph in a row: decoding that much to

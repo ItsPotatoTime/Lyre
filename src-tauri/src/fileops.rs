@@ -192,8 +192,8 @@ fn bytes_in(path: &Path) -> u64 {
 
 /// A job that reports nothing, for work whose progress is not shown.
 #[cfg(unix)]
-fn quiet_job() -> Job<'static, fn(PasteEvent) -> bool> {
-    fn ignore(_: PasteEvent) -> bool {
+fn quiet_job() -> Job<'static, fn(Step) -> bool> {
+    fn ignore(_: Step) -> bool {
         true
     }
     Job {

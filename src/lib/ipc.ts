@@ -574,6 +574,53 @@ export async function startupFolder(): Promise<string | null> {
   return invoke<string | null>("startup_folder");
 }
 
+/** A newer build that the release page is offering. */
+export interface UpdateOffer {
+  version: string;
+  current: string;
+  notes: string | null;
+}
+
+/** Ask the project's releases whether there is a newer build. */
+export async function checkForUpdate(): Promise<UpdateOffer | null> {
+  if (!isTauri) return null;
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<UpdateOffer | null>("check_for_update");
+}
+
+/**
+ * Download the offered build and hand it to the installer.
+ *
+ * Bytes are reported as they arrive, so a slow connection can be seen to be
+ * working rather than guessed at.
+ */
+export async function installUpdate(handlers: {
+  onProgress: (downloaded: number, total: number | null) => void;
+  onInstalling: () => void;
+}): Promise<void> {
+  if (!isTauri) throw new Error("Updates need the desktop app.");
+  const { Channel, invoke } = await import("@tauri-apps/api/core");
+  const channel = new Channel<
+    | { type: "progress"; downloaded: number; total: number | null }
+    | { type: "installing" }
+  >();
+  channel.onmessage = (event) => {
+    if (event.type === "progress") {
+      handlers.onProgress(event.downloaded, event.total);
+    } else {
+      handlers.onInstalling();
+    }
+  };
+  return invoke("install_update", { onEvent: channel });
+}
+
+/** Restart into the build that was just installed. */
+export async function restartApp(): Promise<void> {
+  if (!isTauri) return;
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("restart_app");
+}
+
 export interface OpenWith {
   mime: string;
   defaultApp: string | null;

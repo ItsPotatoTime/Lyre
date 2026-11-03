@@ -620,13 +620,22 @@ fn protected_entries_in_the_index_obey_the_setting() {
 
 /// Timing run, not an assertion: proves the first phase is a memory scan.
 /// `cargo test --lib search -- --ignored --nocapture`
+///
+/// Set `LYRE_SEARCH_DIR` to measure an existing folder instead of one this test
+/// writes, and `LYRE_SEARCH_QUERY` to choose the query. That is what makes the
+/// number comparable with a search measured in another program.
 #[test]
 #[ignore = "timing run, not an assertion"]
 fn bench_packed_folder() {
-    let dir = scratch("bench");
-    for i in 0..30_000 {
-        fs::write(dir.join(format!("document-{i:05}-report.pdf")), b"x").unwrap();
-    }
+    let existing = std::env::var_os("LYRE_SEARCH_DIR").map(PathBuf::from);
+    let temporary = existing.is_none();
+    let dir = existing.unwrap_or_else(|| {
+        let dir = scratch("bench");
+        for i in 0..30_000 {
+            fs::write(dir.join(format!("document-{i:05}-report.pdf")), b"x").unwrap();
+        }
+        dir
+    });
 
     let index = Index::default();
     let started = Instant::now();
@@ -644,7 +653,9 @@ fn bench_packed_folder() {
         );
     }
 
-    fs::remove_dir_all(&dir).ok();
+    if temporary {
+        fs::remove_dir_all(&dir).ok();
+    }
 }
 
 

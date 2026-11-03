@@ -9,6 +9,7 @@ mod eject;
 mod fileops;
 mod fold;
 mod graphics;
+mod updates;
 #[cfg(windows)]
 mod hotkey;
 mod openwith;
@@ -423,6 +424,27 @@ fn startup_folder() -> Option<String> {
     defaultmanager::startup_path()
 }
 
+/// Is there a newer build on the release page?
+#[tauri::command]
+async fn check_for_update(app: tauri::AppHandle) -> Result<Option<updates::Offer>, String> {
+    updates::check(&app).await
+}
+
+/// Download and install it, reporting the download as it goes.
+#[tauri::command]
+async fn install_update(
+    app: tauri::AppHandle,
+    on_event: Channel<updates::UpdateEvent>,
+) -> Result<(), String> {
+    updates::install(&app, on_event).await
+}
+
+/// Restart into the build that was just installed.
+#[tauri::command]
+fn restart_app(app: tauri::AppHandle) {
+    app.restart();
+}
+
 /// Whether Win+E is taken even when no Lyre window is open, which is what the
 /// logon agent provides.
 #[tauri::command]
@@ -603,6 +625,9 @@ pub fn run() {
     // a window that no longer responds.
     let tracing = std::env::var_os("LYRE_TRACE").is_some();
     let app = tauri::Builder::default()
+        // Updates come from the project's own releases, signed and checked
+        // against the key in `tauri.conf.json`.
+        .plugin(tauri_plugin_updater::Builder::new().build())
         // Lets a drag that reaches the window edge become a real operating
         // system drag, so files can be dropped into other applications.
         .plugin(tauri_plugin_drag::init())
@@ -690,6 +715,9 @@ pub fn run() {
             startup_folder,
             win_e_agent,
             set_win_e_agent,
+            check_for_update,
+            install_update,
+            restart_app,
             eject_volume,
             drag_icon,
             trace,

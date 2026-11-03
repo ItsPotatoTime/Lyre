@@ -4,7 +4,9 @@ version = "0.1.0"
 description = "A fast, cross-platform file manager in the Windows 11 design language."
 authors = ["Lyre contributors"]
 edition = "2021"
-rust-version = "1.77"
+# Tauri 2.12 needs 1.90 itself, so the floor is whatever it needs rather than a
+# number nobody has been able to build with for a while.
+rust-version = "1.90"
 
 [lib]
 name = "lyre_lib"
@@ -30,6 +32,7 @@ nucleo-matcher = "0.3.1"
 tauri-plugin-drag = "2.1.1"
 unicode-normalization = "0.1.26"
 image = { version = "0.25.6", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff"] }
+tauri-plugin-updater = "2"
 
 # A file manager's start-up time is a feature. Optimise hard for binary size
 # and code locality rather than peak throughput.

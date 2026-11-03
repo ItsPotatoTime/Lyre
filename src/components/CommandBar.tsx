@@ -52,6 +52,7 @@ export function CommandBar({
   winESupported,
   winEAgent,
   onToggleWinEAgent,
+  onCheckUpdates,
   previewOpen,
   onTogglePreview,
   reducedMemory,
@@ -96,6 +97,7 @@ export function CommandBar({
   /** Whether the logon agent that owns Win+E is registered. */
   winEAgent: boolean;
   onToggleWinEAgent: () => void;
+  onCheckUpdates: () => void;
   previewOpen: boolean;
   onTogglePreview: () => void;
   reducedMemory: boolean;
@@ -240,6 +242,12 @@ export function CommandBar({
       label: "Offer this at startup",
       checked: promptDefaultManager,
       onSelect: onTogglePromptManager,
+    },
+    {
+      kind: "item",
+      id: "check-updates",
+      label: "Check for updates",
+      onSelect: onCheckUpdates,
     },
     {
       kind: "item",

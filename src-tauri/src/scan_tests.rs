@@ -233,21 +233,39 @@ fn kinds_follow_the_extension() {
 /// Timing run, not an assertion. `cargo test --lib bench -- --ignored
 /// --nocapture` prints how long a real 20,000-entry directory takes end to end
 /// through the streaming path.
+///
+/// Set `LYRE_BENCH_DIR` to scan a folder that already exists, which is what
+/// makes the number comparable with one measured against the Windows shell: the
+/// shell reads a folder that has been on disk for a while, while a folder this
+/// test just wrote is still being inspected by the antivirus.
 #[test]
 #[ignore = "timing run, not an assertion"]
 fn bench_twenty_thousand_entries() {
-    let dir = scratch("bench");
-    for i in 0..20_000 {
-        fs::write(dir.join(format!("file-{i:06}.dat")), b"x").unwrap();
+    let existing = std::env::var_os("LYRE_BENCH_DIR").map(PathBuf::from);
+    let temporary = existing.is_none();
+    let dir = existing.unwrap_or_else(|| {
+        let dir = scratch("bench");
+        for i in 0..20_000 {
+            fs::write(dir.join(format!("file-{i:06}.dat")), b"x").unwrap();
+        }
+        dir
+    });
+
+    let mut samples = Vec::new();
+    for _ in 0..3 {
+        let started = std::time::Instant::now();
+        let (entries, total, elapsed) = collect(&dir, false);
+        let wall = started.elapsed();
+        samples.push(wall.as_secs_f64() * 1000.0);
+        println!(
+            "{} entries reported as {total} in {elapsed} ms internal, {wall:?} including first batch dispatch",
+            entries.len()
+        );
     }
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    println!("median of three: {:.0} ms", samples[1]);
 
-    let started = std::time::Instant::now();
-    let (entries, total, elapsed) = collect(&dir, false);
-    let wall = started.elapsed();
-
-    println!(
-        "{} entries reported as {total} in {elapsed} ms internal, {wall:?} including first batch dispatch",
-        entries.len()
-    );
-    fs::remove_dir_all(&dir).ok();
+    if temporary {
+        fs::remove_dir_all(&dir).ok();
+    }
 }

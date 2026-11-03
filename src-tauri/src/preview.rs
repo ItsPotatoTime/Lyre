@@ -290,12 +290,12 @@ mod shell {
         // leave alpha at zero, so an image where nothing is transparent gets a
         // solid alpha rather than an invisible thumbnail.
         let mut any_alpha = false;
-        for pixel in pixels.chunks_exact_mut(4) {
+        for pixel in pixels.as_chunks_mut::<4>().0 {
             pixel.swap(0, 2);
             any_alpha |= pixel[3] != 0;
         }
         if !any_alpha {
-            for pixel in pixels.chunks_exact_mut(4) {
+            for pixel in pixels.as_chunks_mut::<4>().0 {
                 pixel[3] = 255;
             }
         }

@@ -35,6 +35,10 @@ import {
   fileManagerState,
   winEAgent as readWinEAgent,
   setWinEAgent,
+  checkForUpdate,
+  installUpdate,
+  restartApp,
+  type UpdateOffer,
   graphicsSettings,
   setGraphicsSettings,
   startupFolder,
@@ -83,6 +87,7 @@ import { StatusBar } from "@/components/StatusBar";
 import { ContextMenu, type ContextItem } from "@/components/ContextMenu";
 import { PropertiesDialog } from "@/components/PropertiesDialog";
 import { OpenWithDialog } from "@/components/OpenWithDialog";
+import { UpdateDialog } from "@/components/UpdateDialog";
 import { DefaultManagerPrompt } from "@/components/DefaultManagerPrompt";
 import { PreviewPane } from "@/components/PreviewPane";
 import { ConflictDialog } from "@/components/ConflictDialog";
@@ -249,6 +254,14 @@ function Browser({
   const [managerBusy, setManagerBusy] = useState(false);
   const [managerError, setManagerError] = useState<string | null>(null);
   const [winEAgent, setWinEAgentOn] = useState(false);
+  /** A build the release page is offering, and what is happening to it. */
+  const [update, setUpdate] = useState<{
+    offer: UpdateOffer;
+    phase: "offered" | "downloading" | "installing" | "ready" | "failed";
+    downloaded: number;
+    total: number | null;
+    error: string | null;
+  } | null>(null);
   const [clipboard, setClipboard] = useState<{
     mode: "copy" | "cut";
     paths: string[];
@@ -869,6 +882,68 @@ function Browser({
         );
       });
   }, [winEAgent, flash]);
+
+  /** Ask the release page whether there is something newer. */
+  const checkUpdates = useCallback(() => {
+    void checkForUpdate()
+      .then((offer) => {
+        if (!offer) {
+          flash("Lyre is up to date.");
+          return;
+        }
+        setUpdate({
+          offer,
+          phase: "offered",
+          downloaded: 0,
+          total: null,
+          error: null,
+        });
+      })
+      .catch((error: unknown) =>
+        flash(
+          error instanceof Error
+            ? error.message
+            : "Could not check for updates.",
+        ),
+      );
+  }, [flash]);
+
+  /** Download the offered build and hand it to the installer. */
+  const beginUpdate = useCallback((offer: UpdateOffer) => {
+    setUpdate({
+      offer,
+      phase: "downloading",
+      downloaded: 0,
+      total: null,
+      error: null,
+    });
+    void installUpdate({
+      onProgress: (downloaded, total) =>
+        setUpdate((current) =>
+          current ? { ...current, downloaded, total } : current,
+        ),
+      onInstalling: () =>
+        setUpdate((current) =>
+          current ? { ...current, phase: "installing" } : current,
+        ),
+    })
+      .then(() =>
+        setUpdate((current) =>
+          current ? { ...current, phase: "ready" } : current,
+        ),
+      )
+      .catch((error: unknown) =>
+        setUpdate((current) =>
+          current
+            ? {
+                ...current,
+                phase: "failed",
+                error: error instanceof Error ? error.message : String(error),
+              }
+            : current,
+        ),
+      );
+  }, []);
 
   const neverManager = useCallback(() => {
     setShowManagerPrompt(false);
@@ -1842,6 +1917,7 @@ function Browser({
         }
         winEAgent={winEAgent}
         onToggleWinEAgent={toggleWinEAgent}
+        onCheckUpdates={checkUpdates}
         reducedMemory={reducedMemory}
         onToggleReducedMemory={() => {
           const next = !reducedMemory;
@@ -2081,6 +2157,19 @@ function Browser({
         <PropertiesDialog
           properties={properties}
           onClose={() => setProperties(null)}
+        />
+      ) : null}
+
+      {update ? (
+        <UpdateDialog
+          offer={update.offer}
+          phase={update.phase}
+          downloaded={update.downloaded}
+          total={update.total}
+          error={update.error}
+          onInstall={() => beginUpdate(update.offer)}
+          onRestart={() => void restartApp()}
+          onClose={() => setUpdate(null)}
         />
       ) : null}
 

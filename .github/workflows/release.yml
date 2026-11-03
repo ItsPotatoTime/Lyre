@@ -100,3 +100,28 @@ jobs:
 
             Installing from a package manager is described in
             [docs/install.md](https://github.com/ItsPotatoTime/Lyre/blob/main/docs/install.md).
+
+      # The changelog is the release notes, so the draft is built from it rather
+      # than from a second copy that can drift. One platform does the edit: three
+      # of them appending to the same body would fight each other.
+      - name: Put this version's changelog in the draft
+        if: matrix.os == 'ubuntu-22.04'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          version="${TAG#v}"
+          awk -v heading="## [$version]" '
+            index($0, heading) == 1 { copying = 1; next }
+            copying && /^## \[/ { exit }
+            copying { print }
+          ' CHANGELOG.md > section.md
+
+          if [ ! -s section.md ]; then
+            echo "CHANGELOG.md has no section for $version; leaving the notes as they are."
+            exit 0
+          fi
+
+          gh release view "$TAG" --json body --jq .body > body.md
+          { cat body.md; printf '\n\n---\n\n## What changed in %s\n' "$version"; cat section.md; } > combined.md
+          gh release edit "$TAG" --notes-file combined.md

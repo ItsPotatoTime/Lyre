@@ -255,8 +255,19 @@ export async function pathProperties(path: string): Promise<PathProperties> {
 }
 
 export interface PasteHandlers {
-  onProgress: (done: number, total: number, name: string) => void;
-  onDone: (pasted: number, skipped: string[]) => void;
+  /**
+   * How far the paste has got: the item being worked on, the items finished,
+   * and the bytes written out of the bytes there are. The byte counters are what
+   * move during a single large file.
+   */
+  onProgress: (
+    done: number,
+    total: number,
+    name: string,
+    doneBytes: number,
+    totalBytes: number,
+  ) => void;
+  onDone: (pasted: number, skipped: string[], warnings: string[]) => void;
   onFailed: (message: string) => void;
 }
 
@@ -291,19 +302,36 @@ export async function pasteInto(
   }
   const { Channel, invoke } = await import("@tauri-apps/api/core");
   const channel = new Channel<
-    | { type: "progress"; done: number; total: number; name: string }
-    | { type: "done"; pasted: number; skipped: string[] }
+    | {
+        type: "progress";
+        done: number;
+        total: number;
+        name: string;
+        doneBytes: number;
+        totalBytes: number;
+      }
+    | { type: "done"; pasted: number; skipped: string[]; warnings: string[] }
     | { type: "failed"; message: string }
   >();
   let jobId: number | null = null;
   let cancelled = false;
 
   channel.onmessage = (event) => {
-    if (cancelled) return;
     if (event.type === "progress") {
-      handlers.onProgress(event.done, event.total, event.name);
+      // A cancelled paste stops moving, but it still has to report that it
+      // stopped: swallowing the final message left the progress bar frozen at
+      // whatever percentage it had reached.
+      if (!cancelled) {
+        handlers.onProgress(
+          event.done,
+          event.total,
+          event.name,
+          event.doneBytes,
+          event.totalBytes,
+        );
+      }
     } else if (event.type === "done") {
-      handlers.onDone(event.pasted, event.skipped);
+      handlers.onDone(event.pasted, event.skipped, event.warnings);
     } else {
       handlers.onFailed(event.message);
     }
@@ -332,13 +360,71 @@ export async function pasteInto(
   };
 }
 
-/** Move entries to the operating system's trash. Returns how many went. */
-export async function deleteToTrash(paths: string[]): Promise<number> {
+export interface DeleteHandlers {
+  onProgress: (
+    done: number,
+    total: number,
+    name: string,
+    doneBytes: number,
+    totalBytes: number,
+  ) => void;
+  onDone: (deleted: number, warnings: string[]) => void;
+}
+
+/** Move entries to the operating system's bin, reporting progress as it goes. */
+export async function deletePaths(
+  paths: string[],
+  handlers: DeleteHandlers,
+): Promise<ScanHandle> {
   if (!isTauri) {
     throw new Error("Deleting needs the desktop app, not the browser preview.");
   }
-  const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<number>("delete_to_trash", { paths });
+  const { Channel, invoke } = await import("@tauri-apps/api/core");
+  const channel = new Channel<
+    | {
+        type: "progress";
+        done: number;
+        total: number;
+        name: string;
+        doneBytes: number;
+        totalBytes: number;
+      }
+    | { type: "done"; deleted: number; warnings: string[] }
+  >();
+  let jobId: number | null = null;
+  let cancelled = false;
+
+  channel.onmessage = (event) => {
+    if (event.type === "progress") {
+      if (!cancelled) {
+        handlers.onProgress(
+          event.done,
+          event.total,
+          event.name,
+          event.doneBytes,
+          event.totalBytes,
+        );
+      }
+    } else {
+      handlers.onDone(event.deleted, event.warnings);
+    }
+  };
+
+  try {
+    jobId = await invoke<number>("delete_paths", { paths, onEvent: channel });
+  } catch (error) {
+    handlers.onDone(0, [describe(error)]);
+  }
+
+  return {
+    cancel: () => {
+      cancelled = true;
+      if (jobId !== null) {
+        void invoke("cancel_job", { id: jobId });
+        void invoke("release_job", { id: jobId });
+      }
+    },
+  };
 }
 
 export interface PreviewInfo {

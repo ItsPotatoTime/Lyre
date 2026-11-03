@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -39,9 +40,207 @@ pub enum Conflict {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
 pub enum PasteEvent {
-    Progress { done: usize, total: usize, name: String },
-    Done { pasted: usize, skipped: Vec<String> },
+    Progress {
+        /// Items finished, and how many there are.
+        done: usize,
+        total: usize,
+        /// The item being worked on.
+        name: String,
+        /// Bytes written so far, and how many there are to write.
+        done_bytes: u64,
+        total_bytes: u64,
+    },
+    Done {
+        pasted: usize,
+        skipped: Vec<String>,
+        /// Things that happened but were not what was asked, such as a move
+        /// that copied everything and then could not remove the original.
+        warnings: Vec<String>,
+    },
     Failed { message: String },
+}
+
+/// What a delete reports while it runs, in the same shape as a paste so the
+/// status bar can show either without knowing which it is.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum DeleteEvent {
+    Progress {
+        done: usize,
+        total: usize,
+        name: String,
+        done_bytes: u64,
+        total_bytes: u64,
+    },
+    Done {
+        deleted: usize,
+        warnings: Vec<String>,
+    },
+}
+
+/// One progress report, before it is framed as a paste or a delete.
+///
+/// Both operations move bytes around and both need the same thing on screen, so
+/// the counter is neutral here and each caller turns it into its own event.
+struct Step {
+    done: usize,
+    total: usize,
+    name: String,
+    done_bytes: u64,
+    total_bytes: u64,
+}
+
+/// How much of an operation is done, and when to say so.
+///
+/// A single large file is the case this exists for: reporting per item leaves a
+/// four minute move showing nothing at all. The byte counter is what fills the
+/// bar, and it is throttled because a channel message per megabyte would make
+/// the reporting the slow part of the copy.
+struct Job<'a, F: FnMut(Step) -> bool> {
+    emit: F,
+    cancel: &'a std::sync::atomic::AtomicBool,
+    total_items: usize,
+    done_items: usize,
+    total_bytes: u64,
+    done_bytes: u64,
+    /// The item being copied, so a byte update can name it.
+    current: String,
+    last: std::time::Instant,
+    /// The interface stopped listening, which ends the paste.
+    stopped: bool,
+}
+
+/// Nothing to report and nothing to stop: used by the trash, which reports its
+/// own outcome.
+#[cfg(unix)]
+static NEVER_CANCELLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+impl<'a, F: FnMut(Step) -> bool> Job<'a, F> {
+    fn new(
+        emit: F,
+        cancel: &'a std::sync::atomic::AtomicBool,
+        total_items: usize,
+        total_bytes: u64,
+    ) -> Self {
+        Job {
+            emit,
+            cancel,
+            total_items,
+            done_items: 0,
+            total_bytes,
+            done_bytes: 0,
+            current: String::new(),
+            last: std::time::Instant::now(),
+            stopped: false,
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn send(&mut self, force: bool) {
+        if self.stopped {
+            return;
+        }
+        if !force && self.last.elapsed() < std::time::Duration::from_millis(80) {
+            return;
+        }
+        self.last = std::time::Instant::now();
+        self.stopped = !(self.emit)(Step {
+            done: self.done_items,
+            total: self.total_items,
+            name: self.current.clone(),
+            done_bytes: self.done_bytes,
+            total_bytes: self.total_bytes,
+        });
+    }
+
+    fn start_item(&mut self, name: &str) {
+        self.current = name.to_string();
+        self.send(true);
+    }
+
+    fn advance(&mut self, bytes: u64) {
+        self.done_bytes += bytes;
+        self.send(false);
+    }
+
+    fn finish_item(&mut self) {
+        self.done_items += 1;
+        self.send(true);
+    }
+}
+
+/// Every byte under `path`, for the size of the whole paste.
+fn bytes_in(path: &Path) -> u64 {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if meta.is_dir() {
+        let mut total = 0;
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                total += bytes_in(&entry.path());
+            }
+        }
+        total
+    } else {
+        meta.len()
+    }
+}
+
+/// A job that reports nothing, for work whose progress is not shown.
+#[cfg(unix)]
+fn quiet_job() -> Job<'static, fn(PasteEvent) -> bool> {
+    fn ignore(_: PasteEvent) -> bool {
+        true
+    }
+    Job {
+        emit: ignore,
+        cancel: &NEVER_CANCELLED,
+        total_items: 0,
+        done_items: 0,
+        total_bytes: 0,
+        done_bytes: 0,
+        current: String::new(),
+        last: std::time::Instant::now(),
+        stopped: false,
+    }
+}
+
+/// Copies a file in chunks, so the bar moves during one large file and a cancel
+/// can take effect inside it. A cancelled copy removes what it wrote, rather
+/// than leaving half a file behind.
+fn copy_file<F: FnMut(Step) -> bool>(
+    from: &Path,
+    to: &Path,
+    job: &mut Job<'_, F>,
+) -> io::Result<()> {
+    use std::io::{Read, Write};
+
+    let mut source = fs::File::open(from)?;
+    let mut target = fs::File::create(to)?;
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        if job.cancelled() {
+            drop(target);
+            let _ = fs::remove_file(to);
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+        }
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        target.write_all(&buffer[..read])?;
+        job.advance(read as u64);
+    }
+    // `fs::copy` carried the permission bits across; a chunked copy has to do
+    // it itself, or an executable arrives without its executable bit.
+    if let Ok(meta) = fs::metadata(from) {
+        let _ = fs::set_permissions(to, meta.permissions());
+    }
+    Ok(())
 }
 
 /// Give `path` a name that does not exist yet: "a.txt", "a (2).txt", "a (3).txt".
@@ -69,7 +268,11 @@ fn free_path(path: &Path) -> PathBuf {
 }
 
 /// Copy a file or a whole folder tree.
-fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
+fn copy_tree<F: FnMut(Step) -> bool>(
+    from: &Path,
+    to: &Path,
+    job: &mut Job<'_, F>,
+) -> io::Result<()> {
     let meta = fs::symlink_metadata(from)?;
     if meta.is_symlink() {
         // Copy the link itself, so copying a tree cannot explode into the
@@ -82,32 +285,44 @@ fn copy_tree(from: &Path, to: &Path) -> io::Result<()> {
         }
         #[cfg(not(unix))]
         {
-            fs::copy(from, to)?;
+            copy_file(from, to, job)?;
             return Ok(());
         }
     }
     if meta.is_dir() {
         fs::create_dir(to)?;
         for entry in fs::read_dir(from)? {
+            if job.cancelled() {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+            }
             let entry = entry?;
-            copy_tree(&entry.path(), &to.join(entry.file_name()))?;
+            copy_tree(&entry.path(), &to.join(entry.file_name()), job)?;
         }
         return Ok(());
     }
-    fs::copy(from, to)?;
+    copy_file(from, to, job)?;
     Ok(())
 }
 
 /// Move, falling back to copy-then-remove across filesystems, where a rename
 /// is not possible.
-fn move_tree(from: &Path, to: &Path) -> io::Result<()> {
+fn move_tree<F: FnMut(Step) -> bool>(
+    from: &Path,
+    to: &Path,
+    job: &mut Job<'_, F>,
+) -> io::Result<()> {
     match fs::rename(from, to) {
         Ok(()) => Ok(()),
         Err(_err) => {
             // A rename across mounts fails; copying and removing still lands
             // the item where the user asked.
-            copy_tree(from, to)?;
-            remove_tree(from)
+            copy_tree(from, to, job)?;
+            remove_tree(from).map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!("copied, but the original could not be removed ({err})"),
+                )
+            })
         }
     }
 }
@@ -119,7 +334,11 @@ fn move_tree(from: &Path, to: &Path) -> io::Result<()> {
 /// over, files that exist only in the destination are left alone. Deleting the
 /// old tree first would silently destroy everything the incoming copy did not
 /// happen to contain, which is exactly the loss this exists to avoid.
-fn copy_over(from: &Path, to: &Path) -> io::Result<()> {
+fn copy_over<F: FnMut(Step) -> bool>(
+    from: &Path,
+    to: &Path,
+    job: &mut Job<'_, F>,
+) -> io::Result<()> {
     let meta = fs::symlink_metadata(from)?;
 
     if meta.is_dir() {
@@ -130,8 +349,11 @@ fn copy_over(from: &Path, to: &Path) -> io::Result<()> {
         }
         fs::create_dir_all(to)?;
         for entry in fs::read_dir(from)? {
+            if job.cancelled() {
+                return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
+            }
             let entry = entry?;
-            copy_over(&entry.path(), &to.join(entry.file_name()))?;
+            copy_over(&entry.path(), &to.join(entry.file_name()), job)?;
         }
         return Ok(());
     }
@@ -153,16 +375,20 @@ fn copy_over(from: &Path, to: &Path) -> io::Result<()> {
             return Ok(());
         }
     }
-    fs::copy(from, to)?;
+    copy_file(from, to, job)?;
     Ok(())
 }
 
 /// Move over an existing destination, merging folders the same way a copy does.
-fn move_over(from: &Path, to: &Path) -> io::Result<()> {
+fn move_over<F: FnMut(Step) -> bool>(
+    from: &Path,
+    to: &Path,
+    job: &mut Job<'_, F>,
+) -> io::Result<()> {
     if from.is_dir() && to.is_dir() {
         for entry in fs::read_dir(from)? {
             let entry = entry?;
-            move_over(&entry.path(), &to.join(entry.file_name()))?;
+            move_over(&entry.path(), &to.join(entry.file_name()), job)?;
         }
         // Only the emptied source folder is removed; the destination keeps
         // everything it already had.
@@ -180,8 +406,13 @@ fn move_over(from: &Path, to: &Path) -> io::Result<()> {
     match fs::rename(from, to) {
         Ok(()) => Ok(()),
         Err(_err) => {
-            copy_over(from, to)?;
-            remove_tree(from)
+            copy_over(from, to, job)?;
+            remove_tree(from).map_err(|err| {
+                io::Error::new(
+                    err.kind(),
+                    format!("copied, but the original could not be removed ({err})"),
+                )
+            })
         }
     }
 }
@@ -189,9 +420,35 @@ fn move_over(from: &Path, to: &Path) -> io::Result<()> {
 fn remove_tree(path: &Path) -> io::Result<()> {
     let meta = fs::symlink_metadata(path)?;
     if meta.is_dir() {
+        clear_read_only(path);
         fs::remove_dir_all(path)
     } else {
+        clear_read_only(path);
         fs::remove_file(path)
+    }
+}
+
+/// Clears the attribute that stops Windows deleting a file.
+///
+/// One read-only file inside a folder is enough to make `remove_dir_all` fail,
+/// and a move that has already copied everything should not stop because of an
+/// attribute: Explorer clears it in the same situation.
+fn clear_read_only(path: &Path) {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return;
+    };
+    if meta.is_dir() {
+        if let Ok(entries) = fs::read_dir(path) {
+            for entry in entries.flatten() {
+                clear_read_only(&entry.path());
+            }
+        }
+    }
+    #[allow(clippy::permissions_set_readonly_false)]
+    {
+        let mut permissions = meta.permissions();
+        permissions.set_readonly(false);
+        let _ = fs::set_permissions(path, permissions);
     }
 }
 
@@ -205,12 +462,13 @@ pub fn paste<F>(
     mode: Mode,
     conflict: Conflict,
     cancel: &std::sync::atomic::AtomicBool,
-    mut emit: F,
+    emit: F,
 ) where
     F: FnMut(PasteEvent) -> bool,
 {
     let destination = Path::new(destination);
     if !destination.is_dir() {
+        let mut emit = emit;
         let _ = emit(PasteEvent::Failed {
             message: "The destination folder is no longer available.".into(),
         });
@@ -218,11 +476,31 @@ pub fn paste<F>(
     }
 
     let total = sources.len();
+    // Totalled up front so the bar has a denominator. Only metadata is read, so
+    // this is cheap even for a folder of films.
+    let total_bytes: u64 = sources.iter().map(|source| bytes_in(Path::new(source))).sum();
+    let mut emit = emit;
     let mut pasted = 0usize;
     let mut skipped: Vec<String> = Vec::new();
+    let mut warnings: Vec<String> = Vec::new();
 
+    {
+    let mut job = Job::new(
+        |step: Step| {
+            emit(PasteEvent::Progress {
+                done: step.done,
+                total: step.total,
+                name: step.name,
+                done_bytes: step.done_bytes,
+                total_bytes: step.total_bytes,
+            })
+        },
+        cancel,
+        total,
+        total_bytes,
+    );
     for (index, source) in sources.iter().enumerate() {
-        if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        if job.cancelled() || job.stopped {
             break;
         }
         let from = Path::new(source);
@@ -246,11 +524,8 @@ pub fn paste<F>(
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "item".into());
 
-        if !emit(PasteEvent::Progress {
-            done: index,
-            total,
-            name: name.clone(),
-        }) {
+        job.start_item(&name);
+        if job.stopped {
             return;
         }
 
@@ -273,40 +548,61 @@ pub fn paste<F>(
         let replacing = target.exists();
 
         let result = match (mode, replacing) {
-            (Mode::Copy, false) => copy_tree(from, &target),
-            (Mode::Copy, true) => copy_over(from, &target),
-            (Mode::Cut, false) => move_tree(from, &target),
-            (Mode::Cut, true) => move_over(from, &target),
+            (Mode::Copy, false) => copy_tree(from, &target, &mut job),
+            (Mode::Copy, true) => copy_over(from, &target, &mut job),
+            (Mode::Cut, false) => move_tree(from, &target, &mut job),
+            (Mode::Cut, true) => move_over(from, &target, &mut job),
         };
         match result {
-            Ok(()) => pasted += 1,
-            Err(err) => skipped.push(format!("{name}: {err}")),
+            Ok(()) => {
+                pasted += 1;
+                job.finish_item();
+            }
+            Err(_err) if job.cancelled() => {
+                // Stopped by the person: what was already pasted stays, and the
+                // partial file this item was writing has been removed already.
+                break;
+            }
+            Err(err) => {
+                // A move that copied everything and then failed to remove the
+                // original did happen; saying "skipped" would suggest the item
+                // is still only in one place, which is the opposite of the
+                // truth, and the person needs to know the original is there.
+                if mode == Mode::Cut && target.exists() {
+                    pasted += 1;
+                    job.finish_item();
+                    warnings.push(format!("{name} moved, but the original stayed: {err}"));
+                } else {
+                    skipped.push(format!("{name}: {err}"));
+                }
+            }
         }
+        let _ = index;
+    }
     }
 
-    let _ = emit(PasteEvent::Done { pasted, skipped });
+    let _ = emit(PasteEvent::Done {
+        pasted,
+        skipped,
+        warnings,
+    });
 }
 
 /// The trash folder for this user, following $XDG_DATA_HOME.
+#[cfg(unix)]
 fn trash_dir() -> Option<PathBuf> {
-    #[cfg(not(unix))]
-    {
-        None
-    }
-    #[cfg(unix)]
-    {
-        let base = std::env::var_os("XDG_DATA_HOME")
-            .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
-            })?;
-        Some(base.join("Trash"))
-    }
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share"))
+        })?;
+    Some(base.join("Trash"))
 }
 
 /// The freedesktop trash specification: move the item into `files/` and record
 /// where it came from in `info/<name>.trashinfo`, which is what lets the desktop
 /// put it back.
+#[cfg(unix)]
 fn trash_one(path: &Path) -> Result<(), String> {
     let trash = trash_dir()
         .ok_or_else(|| "Deleting to the trash is not available on this system.".to_string())?;
@@ -340,18 +636,89 @@ fn trash_one(path: &Path) -> Result<(), String> {
         format_trash_date(stamp)
     );
 
-    move_tree(path, &target).map_err(|err| format!("Could not move to the trash: {err}"))?;
+    let mut quiet = quiet_job();
+    move_tree(path, &target, &mut quiet)
+        .map_err(|err| format!("Could not move to the trash: {err}"))?;
     if let Err(err) = fs::write(&info_path, body) {
         // Without the .trashinfo the desktop cannot restore the item, so put it
         // back rather than leaving an orphan in the trash.
-        let _ = move_tree(&target, path);
+        let _ = move_tree(&target, path, &mut quiet);
         return Err(format!("Could not record the deletion: {err}"));
     }
     Ok(())
 }
 
+/// The Recycle Bin, which is what Delete means on Windows.
+///
+/// `SHFileOperationW` with `FOF_ALLOWUNDO` is the shell's own delete: it hands
+/// the item to the bin rather than erasing it, so an accidental delete stays
+/// recoverable exactly as it would from Explorer.
+#[cfg(windows)]
+mod recycle {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+
+    #[repr(C)]
+    struct FileOperation {
+        window: isize,
+        action: u32,
+        from: *const u16,
+        to: *const u16,
+        flags: u16,
+        aborted: i32,
+        mappings: *mut c_void,
+        title: *const u16,
+    }
+
+    /// `FO_DELETE`.
+    const DELETE: u32 = 3;
+    /// `FOF_ALLOWUNDO`: put it in the bin instead of deleting it.
+    const ALLOW_UNDO: u16 = 0x0040;
+    const NO_CONFIRMATION: u16 = 0x0010;
+    const SILENT: u16 = 0x0004;
+    const NO_ERROR_UI: u16 = 0x0400;
+
+    #[link(name = "shell32")]
+    extern "system" {
+        fn SHFileOperationW(operation: *mut FileOperation) -> i32;
+    }
+
+    pub fn send(paths: &[&Path]) -> Result<(), String> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        // The call wants one path after another, each terminated, then a final
+        // terminator of its own.
+        let mut list: Vec<u16> = Vec::new();
+        for path in paths {
+            list.extend(path.as_os_str().encode_wide());
+            list.push(0);
+        }
+        list.push(0);
+
+        let mut operation = FileOperation {
+            window: 0,
+            action: DELETE,
+            from: list.as_ptr(),
+            to: std::ptr::null(),
+            flags: ALLOW_UNDO | NO_CONFIRMATION | SILENT | NO_ERROR_UI,
+            aborted: 0,
+            mappings: std::ptr::null_mut(),
+            title: std::ptr::null(),
+        };
+        let result = unsafe { SHFileOperationW(&mut operation) };
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(format!("Windows would not move it to the Recycle Bin (code {result})."))
+        }
+    }
+}
+
 /// `YYYY-MM-DDThh:mm:ss`. The specification asks for local time; a timezone
 /// crate is not worth a dependency for this, so the value is UTC.
+#[cfg(unix)]
 fn format_trash_date(secs: u64) -> String {
     let days = secs / 86_400;
     let time = secs % 86_400;
@@ -361,6 +728,7 @@ fn format_trash_date(secs: u64) -> String {
 }
 
 /// Days since the Unix epoch to a calendar date (Howard Hinnant's algorithm).
+#[cfg(unix)]
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
@@ -374,6 +742,7 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+#[cfg(unix)]
 fn percent_encode(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     for byte in input.bytes() {
@@ -403,24 +772,78 @@ pub fn conflicts(destination: &str, sources: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Move items to the trash. Returns how many were moved.
-pub fn delete_to_trash(paths: &[String]) -> Result<usize, String> {
-    let mut moved = 0usize;
-    let mut first_error: Option<String> = None;
-    for path in paths {
-        match trash_one(Path::new(path)) {
-            Ok(()) => moved += 1,
-            Err(message) => {
-                if first_error.is_none() {
-                    first_error = Some(message);
+/// Puts one item in whichever bin this platform has.
+fn delete_one(path: &Path) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        recycle::send(&[path])
+    }
+    #[cfg(unix)]
+    {
+        trash_one(path)
+    }
+}
+
+/// Delete items, reporting progress as it goes.
+///
+/// One item at a time rather than the whole list in a single call, so the bar
+/// moves and a cancel takes effect between items. An item already in the bin
+/// stays there: there is no undo to offer here, which is why the bin is used at
+/// all.
+pub fn delete<F>(paths: &[String], cancel: &std::sync::atomic::AtomicBool, emit: F)
+where
+    F: FnMut(DeleteEvent) -> bool,
+{
+    let total = paths.len();
+    let total_bytes: u64 = paths.iter().map(|path| bytes_in(Path::new(path))).sum();
+    let mut emit = emit;
+    let mut deleted = 0usize;
+    let mut warnings: Vec<String> = Vec::new();
+
+    {
+        let mut job = Job::new(
+            |step: Step| {
+                emit(DeleteEvent::Progress {
+                    done: step.done,
+                    total: step.total,
+                    name: step.name,
+                    done_bytes: step.done_bytes,
+                    total_bytes: step.total_bytes,
+                })
+            },
+            cancel,
+            total,
+            total_bytes,
+        );
+
+        for path in paths {
+            if job.cancelled() || job.stopped {
+                break;
+            }
+            let target = Path::new(path);
+            let name = target
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "item".into());
+            let size = bytes_in(target);
+
+            job.start_item(&name);
+            if job.stopped {
+                return;
+            }
+            match delete_one(target) {
+                Ok(()) => {
+                    deleted += 1;
+                    job.advance(size);
+                    job.finish_item();
                 }
+                Err(_err) if job.cancelled() => break,
+                Err(err) => warnings.push(format!("{name}: {err}")),
             }
         }
     }
-    if moved == 0 {
-        return Err(first_error.unwrap_or_else(|| "Nothing was deleted.".into()));
-    }
-    Ok(moved)
+
+    let _ = emit(DeleteEvent::Done { deleted, warnings });
 }
 
 #[cfg(test)]
@@ -455,7 +878,7 @@ mod tests {
             conflict,
             &cancel,
             |event| match event {
-                PasteEvent::Done { pasted: p, skipped: s } => {
+                PasteEvent::Done { pasted: p, skipped: s, .. } => {
                     pasted = p;
                     skipped = s;
                     true
@@ -565,6 +988,105 @@ mod tests {
             fs::read(into.join("project/untouched.txt")).unwrap(),
             b"stay"
         );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// One large file has to show movement on its own. This is the case that
+    /// sat there for four minutes with nothing on screen.
+    #[test]
+    fn one_large_file_reports_bytes_as_it_copies() {
+        const SIZE: usize = 32 * 1024 * 1024;
+        let dir = scratch("bytes");
+        let source = dir.join("film.bin");
+        fs::write(&source, vec![7u8; SIZE]).unwrap();
+        let into = dir.join("into");
+        fs::create_dir_all(&into).unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let mut mid_file = false;
+        let mut total_bytes = 0;
+        let mut done_bytes = 0;
+        let started = std::time::Instant::now();
+        paste(
+            &into.to_string_lossy(),
+            &[source.to_string_lossy().into_owned()],
+            Mode::Copy,
+            Conflict::Rename,
+            &cancel,
+            |event| {
+                if let PasteEvent::Progress {
+                    done_bytes: done,
+                    total_bytes: total,
+                    ..
+                } = event
+                {
+                    done_bytes = done;
+                    total_bytes = total;
+                    if done > 0 && done < total {
+                        mid_file = true;
+                    }
+                }
+                true
+            },
+        );
+        let elapsed = started.elapsed();
+
+        assert_eq!(total_bytes as usize, SIZE, "the paste knows how big it is");
+        assert_eq!(done_bytes, total_bytes, "and finishes at the end");
+        assert_eq!(
+            fs::metadata(into.join("film.bin")).unwrap().len() as usize,
+            SIZE,
+            "and the file is whole"
+        );
+        // A copy that outlives the reporting throttle must have reported part
+        // way through; a faster one legitimately has nothing to report yet.
+        assert!(
+            mid_file || elapsed < std::time::Duration::from_millis(100),
+            "a copy that took {elapsed:?} should have reported part way through"
+        );
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Cancelling works inside a file, not only between files, and does not
+    /// leave half of one behind.
+    #[test]
+    fn cancelling_mid_file_leaves_nothing_behind() {
+        let dir = scratch("cancel");
+        let source = dir.join("big.bin");
+        fs::write(&source, vec![9u8; 8 * 1024 * 1024]).unwrap();
+        let into = dir.join("into");
+        fs::create_dir_all(&into).unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let mut pasted = usize::MAX;
+        paste(
+            &into.to_string_lossy(),
+            &[source.to_string_lossy().into_owned()],
+            Mode::Copy,
+            Conflict::Rename,
+            &cancel,
+            |event| {
+                match event {
+                    // Stop as soon as the item has been announced, which is
+                    // before its first chunk is written.
+                    PasteEvent::Progress { .. } => {
+                        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    PasteEvent::Done { pasted: p, .. } => pasted = p,
+                    PasteEvent::Failed { message } => panic!("{message}"),
+                }
+                true
+            },
+        );
+
+        assert_eq!(pasted, 0, "nothing was reported as pasted");
+        assert!(
+            !into.join("big.bin").exists(),
+            "the half written file is removed rather than left behind"
+        );
+        assert!(source.exists(), "the source is untouched by a cancelled copy");
 
         fs::remove_dir_all(&dir).ok();
     }
@@ -740,10 +1262,58 @@ mod tests {
         fs::remove_dir_all(&dir).ok();
     }
 
+    #[cfg(unix)]
     #[test]
     fn dates_convert_to_the_shape_the_trash_specification_wants() {
         // 2024-02-29T12:00:00Z, a leap day, from its Unix seconds.
         assert_eq!(format_trash_date(1_709_208_000), "2024-02-29T12:00:00");
         assert_eq!(format_trash_date(0), "1970-01-01T00:00:00");
+    }
+
+    /// Delete on Windows means the Recycle Bin. Ignored by default because it
+    /// leaves an item in the real bin.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "moves a file into the real Recycle Bin"]
+    fn delete_sends_the_item_to_the_recycle_bin() {
+        let dir = scratch("recycle");
+        let file = dir.join("gone.txt");
+        fs::write(&file, b"throwaway").unwrap();
+        let other = dir.join("also-gone.txt");
+        fs::write(&other, b"throwaway too").unwrap();
+
+        let cancel = AtomicBool::new(false);
+        let mut deleted = 0usize;
+        let mut reported_total = 0usize;
+        let mut names = Vec::new();
+        delete(
+            &[
+                file.to_string_lossy().into_owned(),
+                other.to_string_lossy().into_owned(),
+            ],
+            &cancel,
+            |event| {
+                match event {
+                    DeleteEvent::Progress { total, name, .. } => {
+                        reported_total = total;
+                        if !name.is_empty() {
+                            names.push(name);
+                        }
+                    }
+                    DeleteEvent::Done { deleted: count, .. } => deleted = count,
+                }
+                true
+            },
+        );
+        assert_eq!(deleted, 2);
+        assert_eq!(reported_total, 2, "the bar knows how many items there are");
+        assert!(
+            names.iter().any(|name| name == "gone.txt"),
+            "the bar names the item being deleted"
+        );
+        assert!(!file.exists(), "the file is no longer in the folder");
+        assert!(!other.exists());
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

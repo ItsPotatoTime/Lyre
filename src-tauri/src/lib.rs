@@ -251,16 +251,30 @@ fn paste_conflicts(destination: String, sources: Vec<String>) -> Vec<String> {
     fileops::conflicts(&destination, &sources)
 }
 
-/// Move entries to the trash and report how many went.
+/// Move entries to the trash, streaming progress the way a paste does.
 #[tauri::command]
-fn delete_to_trash(state: State<'_, AppState>, paths: Vec<String>) -> Result<usize, String> {
-    let moved = fileops::delete_to_trash(&paths)?;
-    for path in &paths {
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            state.index.forget(parent);
-        }
-    }
-    Ok(moved)
+fn delete_paths(
+    state: State<'_, AppState>,
+    paths: Vec<String>,
+    on_event: Channel<fileops::DeleteEvent>,
+) -> Result<u64, String> {
+    let (id, cancel) = state.begin();
+    let index = Arc::clone(&state.index);
+    let paths_for_cache = paths.clone();
+
+    std::thread::Builder::new()
+        .name("lyre-delete".into())
+        .spawn(move || {
+            fileops::delete(&paths, &cancel, |event| on_event.send(event).is_ok());
+            for path in paths_for_cache {
+                if let Some(parent) = std::path::Path::new(&path).parent() {
+                    index.forget(parent);
+                }
+            }
+        })
+        .map_err(|err| format!("Could not start the delete: {err}"))?;
+
+    Ok(id)
 }
 
 /// Which applications can open this file, and which one currently does.
@@ -667,7 +681,7 @@ pub fn run() {
             path_properties,
             paste_into,
             paste_conflicts,
-            delete_to_trash,
+            delete_paths,
             apps_for_file,
             choose_app_with_system,
             file_manager_state,

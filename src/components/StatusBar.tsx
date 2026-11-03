@@ -20,6 +20,8 @@ export function StatusBar({
   notice,
   search,
   showFrameRate,
+  transfer,
+  onCancelTransfer,
 }: {
   status: DirStatus;
   scanned: number;
@@ -32,12 +34,29 @@ export function StatusBar({
   search: SearchState | null;
   /** Whether the paint loop is being reported on the right. */
   showFrameRate: boolean;
+  /** A paste in flight, if one is running. */
+  transfer: {
+    mode: "copy" | "cut" | "delete";
+    name: string;
+    done: number;
+    total: number;
+    doneBytes: number;
+    totalBytes: number;
+    stopping: boolean;
+  } | null;
+  onCancelTransfer: () => void;
 }) {
   const scanning = status === "loading";
   const plural = (n: number) => (n === 1 ? "item" : "items");
   // Sampled here rather than in the window, so a readout that updates once a
   // second redraws this footer and nothing else.
   const meter = useFrameRate(showFrameRate);
+  // Bytes are the honest measure for one large file; item counts are the only
+  // measure for a folder of small ones, so the bar uses whichever it has.
+  const percent =
+    transfer && transfer.totalBytes > 0
+      ? Math.min(100, Math.round((transfer.doneBytes / transfer.totalBytes) * 100))
+      : null;
   const readout = meter ? (
     <span
       className="tabular"
@@ -92,7 +111,45 @@ export function StatusBar({
 
   return (
     <footer className="statusbar">
-      {notice ? (
+      {transfer ? (
+        <>
+          <span className="status-transfer" title={transfer.name}>
+            <span className="status-dot" />
+            {transfer.stopping ? (
+              "Stopping"
+            ) : (
+              <>
+                {transfer.mode === "cut"
+                  ? "Moving"
+                  : transfer.mode === "delete"
+                    ? "Deleting"
+                    : "Copying"}{" "}
+                <span className="status-transfer-name">{transfer.name}</span>
+              </>
+            )}
+          </span>
+          <span className="status-progress" data-known={percent !== null ? "true" : "false"}>
+            <span
+              className="status-progress-fill"
+              style={percent !== null ? { width: `${percent}%` } : undefined}
+            />
+          </span>
+          <span className="tabular">
+            {percent !== null
+              ? `${percent}%`
+              : `${Math.min(transfer.done + 1, transfer.total)} of ${transfer.total}`}
+          </span>
+          <button
+            type="button"
+            className="status-cancel"
+            onClick={onCancelTransfer}
+            title="Stop after the item being written"
+            disabled={transfer.stopping}
+          >
+            {transfer.stopping ? "Stopping…" : "Cancel"}
+          </button>
+        </>
+      ) : notice ? (
         <span className="status-notice">{notice}</span>
       ) : scanning ? (
         <>

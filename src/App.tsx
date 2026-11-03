@@ -15,7 +15,7 @@ import type {
 import {
   isTauri,
   createFolder,
-  deleteToTrash,
+  deletePaths,
   pasteConflicts,
   pasteInto,
   type Conflict,
@@ -253,6 +253,21 @@ function Browser({
     mode: "copy" | "cut";
     paths: string[];
   } | null>(null);
+  /**
+   * A paste in flight, for the status bar. Without this a move between two
+   * drives sat there for minutes with nothing on screen to say it had started.
+   */
+  const [transfer, setTransfer] = useState<{
+    mode: "copy" | "cut" | "delete";
+    name: string;
+    done: number;
+    total: number;
+    doneBytes: number;
+    totalBytes: number;
+    /** Cancelled, waiting for the operation to stop at its next chunk. */
+    stopping: boolean;
+  } | null>(null);
+  const transferControl = useRef<{ cancel: () => void } | null>(null);
   const [properties, setProperties] = useState<PathProperties | null>(null);
   const [openWith, setOpenWith] = useState<{
     path: string;
@@ -641,27 +656,57 @@ function Browser({
    */
   const runPaste = useCallback(
     (destination: string, sources: string[], mode: "copy" | "cut", conflict: Conflict) => {
+      const verb = mode === "cut" ? "Moving" : "Copying";
+      const only = sources.length === 1 ? sources[0].split(/[\\/]/).pop() ?? sources[0] : null;
+      // Shown before the first message arrives, so the bar is there from the
+      // moment the work starts rather than after the first megabyte.
+      setTransfer({
+        mode,
+        name: only ?? `${sources.length} items`,
+        done: 0,
+        total: sources.length,
+        doneBytes: 0,
+        totalBytes: 0,
+        stopping: false,
+      });
       void pasteInto(destination, sources, mode, conflict, {
-        onProgress: (done, total, name) => {
-          if (total > 1) {
-            flash(
-              `${mode === "cut" ? "Moving" : "Copying"} ${name} (${done + 1} of ${total})`,
-            );
-          }
+        onProgress: (done, total, name, doneBytes, totalBytes) => {
+          setTransfer({
+            mode,
+            name: only ?? name,
+            done,
+            total,
+            doneBytes,
+            totalBytes,
+            stopping: false,
+          });
         },
-        onDone: (pasted, skipped) => {
+        onDone: (pasted, skipped, warnings) => {
+          setTransfer(null);
+          transferControl.current = null;
           refreshAfterChange();
           if (mode === "cut") setClipboard(null);
           flash(
-            skipped.length > 0
-              ? `${mode === "cut" ? "Moved" : "Copied"} ${pasted}, ${skipped.length} skipped`
+            warnings.length > 0
+              ? warnings[0]
+              : skipped.length > 0
+              ? `${verb} ${pasted}, ${skipped.length} skipped`
               : `${mode === "cut" ? "Moved" : "Copied"} ${pasted} item${pasted === 1 ? "" : "s"}`,
           );
         },
-        onFailed: (message) => flash(message),
-      }).catch((error: unknown) =>
-        flash(error instanceof Error ? error.message : "Could not finish the paste."),
-      );
+        onFailed: (message) => {
+          setTransfer(null);
+          transferControl.current = null;
+          flash(message);
+        },
+      })
+        .then((control) => {
+          transferControl.current = control;
+        })
+        .catch((error: unknown) => {
+          setTransfer(null);
+          flash(error instanceof Error ? error.message : "Could not finish the paste.");
+        });
     },
     [flash, refreshAfterChange],
   );
@@ -948,15 +993,49 @@ function Browser({
       flash("Select something to delete.");
       return;
     }
-    void deleteToTrash(paths)
-      .then((moved) => {
+    const only = paths.length === 1 ? paths[0].split(/[\\/]/).pop() ?? paths[0] : null;
+    // The same bar as a paste: a folder going to the bin can take a while, and
+    // the wait deserves the same answer whether it is a move or a delete.
+    setTransfer({
+      mode: "delete",
+      name: only ?? `${paths.length} items`,
+      done: 0,
+      total: paths.length,
+      doneBytes: 0,
+      totalBytes: 0,
+      stopping: false,
+    });
+    void deletePaths(paths, {
+      onProgress: (done, total, name, doneBytes, totalBytes) => {
+        setTransfer({
+          mode: "delete",
+          name: only ?? name,
+          done,
+          total,
+          doneBytes,
+          totalBytes,
+          stopping: false,
+        });
+      },
+      onDone: (deleted, warnings) => {
+        setTransfer(null);
+        transferControl.current = null;
         resetSelection();
         refreshAfterChange();
-        flash(`Moved ${moved} item${moved === 1 ? "" : "s"} to the trash`);
+        flash(
+          warnings.length > 0
+            ? warnings[0]
+            : `Moved ${deleted} item${deleted === 1 ? "" : "s"} to the trash`,
+        );
+      },
+    })
+      .then((control) => {
+        transferControl.current = control;
       })
-      .catch((error: unknown) =>
-        flash(error instanceof Error ? error.message : "Could not delete."),
-      );
+      .catch((error: unknown) => {
+        setTransfer(null);
+        flash(error instanceof Error ? error.message : "Could not delete.");
+      });
   }, [flash, refreshAfterChange, resetSelection, selectionPaths]);
 
   const beginRename = useCallback(() => {
@@ -2020,6 +2099,16 @@ function Browser({
         notice={notice}
         search={searching ? search : null}
         showFrameRate={showFrameRate}
+        transfer={transfer}
+        onCancelTransfer={() => {
+          // The bar stays until the operation actually stops, because the item
+          // being written has to finish its chunk and a partial file has to be
+          // removed. Saying "Stopping" is honest; hiding the bar is not.
+          setTransfer((current) =>
+            current ? { ...current, stopping: true } : current,
+          );
+          transferControl.current?.cancel();
+        }}
       />
     </div>
   );

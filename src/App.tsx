@@ -39,6 +39,7 @@ import {
   installUpdate,
   restartApp,
   runShellMenuItem,
+  watchFolder,
   type UpdateOffer,
   graphicsSettings,
   setGraphicsSettings,
@@ -443,6 +444,74 @@ function Browser({
     setNonce((value) => value + 1);
     flash("Refreshed");
   }, [flash]);
+
+  // --- changes made by another program ------------------------------------
+  const currentPath = useRef(location.path);
+  currentPath.current = location.path;
+  const renamingRef = useRef(renaming);
+  renamingRef.current = renaming;
+  const pendingExternal = useRef(false);
+
+  // One folder is watched at a time: the one behind the listing. Virtual pages
+  // have no single folder, so they stop the watcher. It stays active during a
+  // search so clearing the query does not reveal a stale listing.
+  useEffect(() => {
+    void watchFolder(showsFiles ? location.path : null);
+  }, [location.path, showsFiles]);
+
+  useEffect(() => {
+    let stop: (() => void) | null = null;
+    let cancelled = false;
+    let timer: number | null = null;
+    let firstAt = 0;
+
+    const flush = () => {
+      timer = null;
+      firstAt = 0;
+      setNonce((value) => value + 1);
+    };
+
+    void import("@tauri-apps/api/event")
+      .then(({ listen }) =>
+        listen<string>("folder-changed", (event) => {
+          if (event.payload !== currentPath.current) return;
+          // An inline rename owns a row. Replace the listing once it closes
+          // rather than pulling the editor out from under the person typing.
+          if (renamingRef.current !== null) {
+            pendingExternal.current = true;
+            return;
+          }
+          const now = Date.now();
+          if (firstAt === 0) firstAt = now;
+          // A copy of a thousand files is one refresh, not a thousand. The
+          // upper bound keeps a long copy from postponing it indefinitely.
+          const left = Math.max(0, 1200 - (now - firstAt));
+          if (timer !== null) window.clearTimeout(timer);
+          timer = window.setTimeout(flush, Math.min(180, left));
+        }),
+      )
+      .then((unlisten) => {
+        if (cancelled) unlisten();
+        else stop = unlisten;
+      })
+      .catch(() => {
+        // The browser preview has no event bridge; nothing to listen to.
+      });
+
+    return () => {
+      cancelled = true;
+      stop?.();
+      if (timer !== null) window.clearTimeout(timer);
+    };
+  }, []);
+
+  // A change that arrived during a rename is applied once the editor closes.
+  useEffect(() => {
+    if (renaming === null && pendingExternal.current) {
+      pendingExternal.current = false;
+      setNonce((value) => value + 1);
+    }
+  }, [renaming]);
 
   useEffect(() => {
     if (!showsFiles) {

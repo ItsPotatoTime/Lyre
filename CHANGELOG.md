@@ -8,6 +8,12 @@ release notes rather than a second copy of them.
 
 ### Added
 
+- **Folders refresh themselves.** Files another program saves, edits, renames or
+  deletes appear without pressing F5. Windows uses `ReadDirectoryChangesW`; Linux,
+  macOS and volumes that refuse a notification compare a fingerprint of names,
+  sizes and modified times on an interval that grows with the folder, from 500 ms
+  to 3 s. Bursts are collapsed into one re-read, an inline rename keeps its row
+  until the editor closes, and search results still refresh on the next query.
 - **The system's own context menu items, on Windows.** What other programs
   register now appears in Lyre's menus: "Open in Windows Terminal", 7-Zip's
   archive commands, and the rest. Verbs are read from the registry; a menu handler
@@ -29,6 +35,10 @@ release notes rather than a second copy of them.
   application cannot change what a right-click does. They stay listed in
   "Customize this menu" and are switched on one at a time. Lyre's own items are
   unchanged.
+- **The unused directory-mtime stamp is gone.** Editing a file in place leaves
+  the parent folder's timestamp alone, so it could never have detected the very
+  change this feature is for. The watcher compares names, sizes and modified
+  times instead.
 
 ### Fixed
 

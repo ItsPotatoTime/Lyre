@@ -24,6 +24,10 @@ shell, React 19 interface.
 - **Folders open now.** The directory scanner streams batches to the interface as
   it reads, so the first screen paints before the rest of the folder is known,
   and the list is virtualised: 50,000 entries cost the same DOM as 30.
+- **The listing keeps up on its own.** A file another program saves, edits,
+  renames or deletes appears without F5. Windows uses a native change
+  notification; every other platform, and volumes that refuse one, use a bounded
+  fingerprint poll. [How it works](docs/behaviour.md#being-the-first-to-know)
 - **Search that answers while you type.** The folder on screen is answered from
   memory in single-digit milliseconds, then a breadth-first walk covers
   everything below it and streams deeper matches in behind. Folders lead the
@@ -243,6 +247,8 @@ bun run typecheck
 bun run build
 cd src-tauri && cargo test
 cd src-tauri && cargo clippy
+# Real Windows change notification, run by hand on a desktop:
+cd src-tauri && cargo test a_saved_file_wakes_the_watcher -- --ignored --nocapture
 ```
 
 ## Project layout
@@ -260,6 +266,7 @@ src-tauri/
   src/scan.rs           the scanner
   src/search.rs         matching, ranking, the walk
   src/places.rs         known folders, volumes, breadcrumbs
+  src/watch.rs          change notifications for the folder on screen
   src/lib.rs            commands, scan registry
 docs/                   performance, platforms, building, behaviour
 PRODUCT.md              who this is for and what it is

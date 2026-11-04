@@ -198,11 +198,16 @@ export async function getHomeDir(): Promise<string> {
   return invoke<string>("home_dir");
 }
 
-/** Directory mtime, used to decide whether a cached listing is stale. */
-export async function getDirStamp(path: string): Promise<number | null> {
-  if (!isTauri) return null;
+/**
+ * Watch the folder the window is showing, so files changed by another program
+ * appear without a manual refresh. Passing `null` stops watching on Home and
+ * This PC, which have no single folder behind them. Watching continues during
+ * a search so clearing the query does not reveal a stale listing.
+ */
+export async function watchFolder(path: string | null): Promise<void> {
+  if (!isTauri) return;
   const { invoke } = await import("@tauri-apps/api/core");
-  return invoke<number | null>("dir_stamp", { path });
+  await invoke("watch_folder", { path });
 }
 
 /**

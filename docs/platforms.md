@@ -209,3 +209,31 @@ rule is the file attribute, which is read as well.
 Both filters are applied in the scanner and again in every path through search,
 including the folder walk, the descent into subfolders and the rows answered from
 a cached index, so a count can never disagree with the list.
+
+## Watching a folder for changes
+
+The window tells the Rust core which single folder is on screen, and the core
+answers with `folder-changed` when its contents move. The interface then re-runs
+the same streaming scan a manual F5 would. No new dependency is involved.
+
+**Windows** uses `ReadDirectoryChangesW` with one outstanding overlapped read. It
+fires on names, attributes, size, creation and last write, so an edit in place is
+seen as well as an arrival. The read is issued with `FILE_FLAG_OVERLAPPED` and
+collected with `GetOverlappedResult`; on the way out it is cancelled before the
+buffer is dropped, which is the part that is easy to get wrong. Stopping is
+checked on a 200 ms wait rather than interrupting a blocked call.
+
+**Linux, macOS and any volume that refuses a notification** — network shares are
+the usual case — fall back to comparing a fingerprint of the entries: names,
+lengths, modified times and whether each row is a folder, hashed in sorted
+order. That is plain `std`, so it is the same code on every platform and is
+covered by unit tests. The cost is one metadata read per entry each time it is
+checked, so the interval grows from 500 ms for a small folder to 3 s at twenty
+thousand rows. Native watchers on Linux and macOS (inotify and FSEvents) would
+remove that periodic work; they are not implemented yet.
+
+One thread watches one folder and is replaced whenever the folder changes. It
+never walks into subfolders: Lyre lists immediate children, and a change deep in
+a tree is not a change to the listing on screen. Search results are not re-run
+automatically, because repeating a recursive walk on every change is far more
+expensive than the folder listing it would refresh.

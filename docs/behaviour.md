@@ -107,3 +107,21 @@ Volumes appearing or disappearing are noticed while the window is open, so a sti
 plugged in after startup shows up on its own. This PC lists volumes rather than
 mounts: one card per device, labelled by its volume label with the device shown
 underneath.
+
+The folder on screen is watched too. A file saved, edited, renamed or deleted by
+another program is on screen without pressing F5. One folder is watched at a
+time — the one behind the current listing — and switching tabs or navigating
+moves the watcher with it. Home and This PC have no single folder behind them,
+so nothing is watched there; volumes have their own watcher above.
+
+A name, a size and a modified time decide whether anything changed, so editing a
+file in place counts even though the folder's own timestamp does not move.
+Notifications arrive in bursts during a copy, so the window waits for a quiet
+moment and re-reads once, with a cap so a long copy never postpones the refresh
+forever. An inline rename keeps its row until the editor closes; a change that
+arrives during it is applied afterwards. The folder's own operations still
+refresh as before, and a manual F5 is still there.
+
+Search results are not re-run automatically: a recursive walk is far too
+expensive to repeat on every change. Starting a new query picks up the current
+state of the disk. [Platform detail](platforms.md#watching-a-folder-for-changes)

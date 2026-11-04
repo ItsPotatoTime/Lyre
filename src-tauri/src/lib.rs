@@ -19,8 +19,7 @@ mod places;
 mod scan;
 mod search;
 mod shellmenu;
-
-
+mod watch;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -588,18 +587,16 @@ fn home_dir() -> String {
     places::home().to_string_lossy().into_owned()
 }
 
-/// A cheap stamp used to decide whether a cached listing is still valid.
-/// Comparing the directory's own mtime is one `stat`, which is far cheaper
-/// than re-reading the directory to find out nothing changed.
+/// Watch the folder the window is showing. `null` stops watching, which is
+/// what Home, This PC and search pages do. The main process owns the thread;
+/// the window only ever says which folder matters right now.
 #[tauri::command]
-fn dir_stamp(path: String) -> Option<i64> {
-    std::fs::metadata(path)
-        .ok()?
-        .modified()
-        .ok()?
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_millis() as i64)
+fn watch_folder(
+    path: Option<String>,
+    app: tauri::AppHandle,
+    state: State<'_, watch::WatchState>,
+) {
+    watch::set_folder(path, app, &state);
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -683,6 +680,7 @@ pub fn run() {
             Ok(())
         })
         .manage(AppState::default())
+        .manage(watch::WatchState::default())
         .on_window_event(move |_window, event| {
             let tauri::WindowEvent::CloseRequested { api, .. } = event else {
                 return;
@@ -716,7 +714,7 @@ pub fn run() {
             path_info,
             places,
             home_dir,
-            dir_stamp,
+            watch_folder,
             open_path,
             create_folder,
             rename_path,

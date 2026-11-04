@@ -220,6 +220,7 @@ if (platform === "windows") {
       "target",
       ".git",
       ".cairn",
+      ".workbuddy-ai",
       "dist",
       "build",
       ".reference",
@@ -314,9 +315,22 @@ if (platform === "windows") {
   stage(6, `Collecting installers into ${outDir}`);
   const bundleRoot = join(localRoot, "src-tauri", "target", debug ? "debug" : "release", "bundle");
   if (dryRun) {
+    console.log(colour.dim(`  would remove older *.exe/*.msi from ${outDir}`));
     console.log(colour.dim(`  would copy ${bundleRoot}/**/*.{exe,msi} to ${outDir}`));
   } else {
     mkdirSync(outDir, { recursive: true });
+    // A build from a previous version leaves its installers behind, and build/
+    // ends up mixing v0.1.0 and v0.2.0 filenames. Only our own output is
+    // cleared; anything else someone put in build/ is left alone.
+    let cleared = 0;
+    for (const name of readdirSync(outDir)) {
+      if (!/\.(exe|msi)$/i.test(name)) continue;
+      rmSync(join(outDir, name));
+      cleared += 1;
+    }
+    if (cleared > 0) {
+      console.log(colour.dim(`  cleared ${cleared} older installer(s)`));
+    }
     let copied = 0;
     for (const kind of ["nsis", "msi"]) {
       const dir = join(bundleRoot, kind);

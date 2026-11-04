@@ -8,5 +8,6 @@ src-tauri/gen
 .cairn
 .playwright-mcp
 .reference
+.workbuddy-ai/
 build/
 .bun-platform

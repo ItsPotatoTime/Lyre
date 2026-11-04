@@ -22,8 +22,28 @@ release notes rather than a second copy of them.
   shown. Turning something off is remembered. It also lists every registration
   that exists but could not be read, with the reason.
 
+### Changed
+
+- **What other programs add to the menu is off until it is asked for.** Every
+  system verb, handler and background item now starts disabled, so installing an
+  application cannot change what a right-click does. They stay listed in
+  "Customize this menu" and are switched on one at a time. Lyre's own items are
+  unchanged.
+
 ### Fixed
 
+- **"Add to favorites" appeared twice in Customize this menu.** Windows registers
+  an "Add to Favorites" verb that duplicates Lyre's own row. A system entry whose
+  name matches one of Lyre's items in that menu is now left out, and each submenu
+  deduplicates against itself. A group left with no children is dropped rather
+  than becoming a clickable row, and an "Open" inside a program's own submenu is
+  left alone.
+- **The missing "Scan with Bitdefender" is explained rather than silent.** It is
+  a Windows 11 modern context menu command declared in a sparse MSIX package
+  (`desktop4:FileExplorerContextMenus`), not a verb or a `ContextMenuHandlers`
+  entry, so the classic walk cannot see it. The customise list now states that
+  gap, and `print_shell_verb_registrations` prints classic verb keys and
+  packaged-COM packages side by side.
 - **A registration that failed to load no longer looks like one that does not
   exist.** Loading a menu handler means loading someone else's DLL. A missing DLL,
   a refused selection or an unsupported initialiser were all swallowed, so the

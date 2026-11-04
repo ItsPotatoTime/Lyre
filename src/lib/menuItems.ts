@@ -166,6 +166,51 @@ export function filterMenu(
 }
 
 /**
+ * The system's items that are not already Lyre's own, or repeats of each other.
+ *
+ * Windows registers verbs for things Lyre already does: "Add to Favorites" sits
+ * beside Lyre's "Add to favorites", "Open" beside "Open", and so on. Two rows
+ * with the same name in the customise list is a bug a person can see, so one
+ * name gets one row and Lyre's own version keeps it.
+ *
+ * Used by both the menu and the customise list, so the count in one always
+ * describes the other. Only the top level is compared with Lyre's own names:
+ * an "Open" inside a program's own submenu is that program's command, not a
+ * second copy of Lyre's. Each submenu deduplicates against itself instead. A
+ * group left with no children is dropped, because a parent with no children is
+ * not invokable and must not become a clickable row.
+ */
+export function uniqueShellEntries(
+  entries: ShellMenuEntry[],
+  scope: MenuScope,
+): ShellMenuEntry[] {
+  const dedupe = (list: ShellMenuEntry[], names: Set<string>): ShellMenuEntry[] => {
+    const seen = new Set(names);
+    const out: ShellMenuEntry[] = [];
+    for (const entry of list) {
+      const label = entry.label.trim().toLowerCase();
+      if (label) {
+        if (seen.has(label)) continue;
+        seen.add(label);
+      }
+      if (entry.children.length === 0) {
+        out.push(entry);
+        continue;
+      }
+      const children = dedupe(entry.children, new Set());
+      if (children.length === 0) continue;
+      out.push({ ...entry, children });
+    }
+    return out;
+  };
+
+  const own = new Set(
+    menuSpecs(scope).map((spec) => spec.label.trim().toLowerCase()),
+  );
+  return dedupe(entries, own);
+}
+
+/**
  * The system's own items, as menu rows.
  *
  * Only the top level is filtered: a program that adds a group adds it whole, and

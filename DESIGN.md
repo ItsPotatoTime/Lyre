@@ -159,9 +159,10 @@ than inside it, so scrolling cannot clip them.
 it opens holds two inventories, each under a caption and a hairline rule: Lyre's
 items, then the ones other programs added. Rows are 32 px, the box is painted in
 the accent rather than left to the platform, and the hint beside a name is the
-program that added the item or the targets it appears for. An item Lyre already
-offers a better version of starts off but stays listed, so the list is always the
-whole truth rather than only the visible part of it.
+program that added the item or the targets it appears for. Every item another
+program added starts off but stays listed, so installing a program never changes
+what a right-click does and the list is always the whole truth rather than only
+the visible part of it. Lyre's own items start on.
 
 ## Search
 

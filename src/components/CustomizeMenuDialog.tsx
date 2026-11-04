@@ -3,6 +3,7 @@ import { Icon } from "./Icons";
 import {
   menuItemShown,
   menuSpecs,
+  uniqueShellEntries,
   type MenuScope,
   type MenuSpec,
 } from "@/lib/menuItems";
@@ -92,7 +93,7 @@ export function CustomizeMenuDialog({
     menuItemShown(id, defaultOn, hiddenSet, shownSet);
 
   const specs = menuSpecs(scope);
-  const shellRows = shell?.supported ? shell.entries : [];
+  const shellRows = shell?.supported ? uniqueShellEntries(shell.entries, scope) : [];
   // A catalogue crosses an IPC boundary, so the list is read with a default
   // even though the interface requires it.
   const shellWarnings = shell?.warnings ?? [];
@@ -182,6 +183,11 @@ export function CustomizeMenuDialog({
                         </p>
                       ))}
                     </div>
+                  ) : null}
+                  {/* A platform can support the menu and still be missing a
+                      whole class of item. Say which one. */}
+                  {shell.note ? (
+                    <p className="menu-settings-empty">{shell.note}</p>
                   ) : null}
                 </>
               )}

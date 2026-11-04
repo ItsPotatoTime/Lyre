@@ -603,6 +603,9 @@ function toHit(entry: Entry, query: string): Hit | null {
   return { ...entry, score, indices };
 }
 
+const MODERN_MENU_NOTE =
+  "Apps that use the Windows 11 modern context menu register their items in a package rather than a verb or handler key. Those items cannot be listed here yet.";
+
 /**
  * What a real Windows machine reports for its own menu items.
  *
@@ -616,7 +619,7 @@ export function mockShellMenu(background: boolean): ShellMenuCatalog {
   if (background) {
     return {
       supported: true,
-      note: null,
+      note: MODERN_MENU_NOTE,
       warnings: [],
       entries: [
         entry("verb|background|WarpTab", "Open Warp in new tab", "warp"),
@@ -634,17 +637,14 @@ export function mockShellMenu(background: boolean): ShellMenuCatalog {
   }
   return {
     supported: true,
-    note: null,
+    note: MODERN_MENU_NOTE,
     // A registration that exists but cannot be read is shown in the list, so
     // the browser preview has to be able to draw that state too.
     warnings: [
-      "ABBYY.FineReader16.ContextMenu ({DCACA03D-01CA-410C-8F35-FBEB05CA8BF0}): The menu handler could not be used: the handler speaks none of the initialisers Lyre knows; Windows 11 IExplorerCommand handlers are not supported yet.",
+      "ABBYY.FineReader16.ContextMenu ({DCACA03D-01CA-410C-8F35-FBEB05CA8BF0}): The menu handler could not be used: the handler refused the selection through IShellExtInit (0x80070057).",
     ],
     entries: [
-      {
-        ...entry("verb|file|open", "Open", "Lyre"),
-        defaultOn: false,
-      },
+      entry("verb|file|open", "Open", "Lyre"),
       entry("verb|file|AddToArchive", "Add to archive…", "7-Zip Shell Extension"),
       {
         ...entry("verb|file|Bitdefender", "Scan with Bitdefender", "Bitdefender", []),
@@ -691,7 +691,9 @@ function entry(
     origin: id.startsWith("verb|background") || id.startsWith("background") ? "background" : "file",
     source,
     kind: id.startsWith("verb") ? "verb" : "handler",
-    defaultOn: true,
+    // Everything another program registered starts off. Lyre's own items are
+    // the only ones on before anyone has chosen anything.
+    defaultOn: false,
     children,
   };
 }

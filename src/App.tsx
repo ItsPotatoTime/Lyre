@@ -94,6 +94,7 @@ import {
   insertMenuBlock,
   menuItemShown,
   shellMenuItems,
+  uniqueShellEntries,
   type MenuScope,
 } from "@/lib/menuItems";
 import { loadShellMenu, shellMenuKey } from "@/lib/shellMenuCache";
@@ -1432,8 +1433,10 @@ function Browser({
         background || selection.selected.size === 0
           ? [target]
           : [...selection.selected];
-      return shellMenuItems(catalog.entries, isMenuShown, (entry) =>
-        runShellEntry(entry, paths),
+      return shellMenuItems(
+        uniqueShellEntries(catalog.entries, background ? "background" : "item"),
+        isMenuShown,
+        (entry) => runShellEntry(entry, paths),
       );
     },
     [isMenuShown, runShellEntry, selection.selected, shellCatalogs],

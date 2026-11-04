@@ -137,15 +137,39 @@ minutes. A handler is third-party code loaded into this process, exactly as it i
 into Explorer: a broken one can take the window down. There is no way to ask a
 DLL what it would draw without loading it.
 
+None of these items are shown on first install. Every one starts off and is
+switched on individually in "Customize this menu", because installing a program
+should not change what a right-click does. Lyre's own items are the ones that
+start on. Rows that repeat something Lyre already offers under the same name —
+Windows' "Add to Favorites" against Lyre's "Add to favorites", for example — are
+left out of the list rather than shown twice.
+
 A handler is told what is selected through one of `IShellExtInit`,
-`IInitializeWithItem` or `IInitializeWithFile`, and Lyre tries all three. Windows
-11 also has `IExplorerCommand` handlers, which are enumerated differently and are
-**not supported yet**; cascading `SubCommands` verbs are not runnable yet. None of
-these are silently dropped. Every registration that exists but could not be read
-is listed under "Customize this menu" as a warning naming the program, the class
-id and the reason. That list is where to look when an expected item is missing.
+`IInitializeWithItem` or `IInitializeWithFile`, and Lyre tries all three. Every
+registration that exists but could not be read is listed under "Customize this
+menu" as a warning naming the program, the class id and the reason. That list is
+where to look when an expected item is missing.
 `cargo test print_what_the_installed_handlers_offer -- --ignored --nocapture`
 prints the same information for the whole machine.
+
+**Windows 11's modern menu is a third kind, and is not supported yet.** An app
+can declare `windows.fileExplorerContextMenus` in a sparse MSIX package and
+implement `IExplorerCommand`. Bitdefender's "Scan with Bitdefender" is exactly
+this: `BDContextualPack.msix` registers CLSID
+`325C7BE3-E00C-4943-ADC1-2387FD06E08E` for `*`, `Directory` and `Drive`. It
+creates no verb key and no `ContextMenuHandlers` key, so the classic walk sees
+nothing. Packaged COM classes are indexed under `HKCR\PackagedCom\ClassIndex`,
+but the index does not say which are menu commands or which item types they apply
+to — that lives in the package manifest. The shell's own `IContextMenu` does not
+expose `IExplorerCommandProvider` either, so there is no generic enumeration a
+separate application can borrow. Lyre can create such a command and read its
+title, but discovering them all needs package-manifest reading and a full
+`IExplorerCommand`/`IShellItemArray` implementation. The customise list states
+this gap rather than leaving someone hunting for an item that cannot appear.
+Cascading `SubCommands` verbs are also named as unsupported rather than dropped.
+
+`cargo test print_shell_verb_registrations -- --ignored --nocapture` prints the
+classic verb keys and the installed packaged-COM packages side by side.
 
 **Linux** and **macOS** report that the section is unsupported, give the reason
 in that platform's own terms, and show only Lyre's own items. On Linux the

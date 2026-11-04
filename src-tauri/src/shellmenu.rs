@@ -31,8 +31,10 @@ pub struct Entry {
     pub source: String,
     /// `verb` for a registry command, `handler` for a menu extension.
     pub kind: String,
-    /// Whether the item shows before anyone has chosen anything. The items Lyre
-    /// already offers a better version of start off.
+    /// Whether the item shows before anyone has chosen anything. Lyre's own
+    /// items start on; everything another program registered starts off, and is
+    /// turned on one at a time in the customise list. Installing a program must
+    /// not silently change what a right-click does.
     pub default_on: bool,
     /// The items of a submenu. A parent with children is not itself invokable.
     pub children: Vec<Entry>,
@@ -43,7 +45,8 @@ pub struct Entry {
 pub struct Catalog {
     /// False where the platform has no such menu to read.
     pub supported: bool,
-    /// Why there is nothing to read, in that platform's own terms.
+    /// Why some part of the menu is missing, in that platform's own terms.
+    /// Present on Windows too: modern packaged commands are not readable yet.
     pub note: Option<String>,
     pub entries: Vec<Entry>,
     /// Registrations that were found but could not be read. An item that fails
@@ -122,32 +125,6 @@ mod win {
     const KEY_READ: u32 = 0x0002_0019;
     const REG_SZ: u32 = 1;
     const REG_EXPAND_SZ: u32 = 2;
-
-    /// The verbs the menu already offers a better version of. They stay in the
-    /// catalogue so the customise list can show them, but they arrive off.
-    const ALREADY_HANDLED: [&str; 16] = [
-        "open",
-        "opennew",
-        "openas",
-        "openwith",
-        // The shell's "Open in new tab" and Lyre's own read the same, and two
-        // identical rows in one menu is worse than one.
-        "opennewtab",
-        "print",
-        "printto",
-        "find",
-        "runas",
-        "explore",
-        "properties",
-        "cut",
-        "copy",
-        "paste",
-        "delete",
-        "rename",
-    ];
-
-    /// The menu handlers the menu already offers a better version of.
-    const ALREADY_HANDLED_HANDLERS: [&str; 2] = ["Open With", "Open with"];
 
     // -----------------------------------------------------------------------
     // The registry
@@ -519,9 +496,7 @@ mod win {
                     origin: origin.to_string(),
                     source: source_of(&key),
                     kind: "verb".to_string(),
-                    default_on: !ALREADY_HANDLED
-                        .iter()
-                        .any(|known| known.eq_ignore_ascii_case(&name)),
+                    default_on: false,
                     children: Vec::new(),
                 });
             }
@@ -1055,11 +1030,7 @@ mod win {
         }
 
         if tried.is_empty() {
-            Err(
-                "the handler speaks none of the initialisers Lyre knows; \
-                 Windows 11 IExplorerCommand handlers are not supported yet"
-                    .to_string(),
-            )
+            Err("the handler speaks none of the initialisers Lyre knows".to_string())
         } else {
             Err(format!(
                 "the handler refused the selection through {}",
@@ -1309,7 +1280,7 @@ mod win {
                 origin: origin.to_string(),
                 source: String::new(),
                 kind: "handler".to_string(),
-                default_on: true,
+                default_on: false,
                 children,
             });
         }
@@ -1321,12 +1292,6 @@ mod win {
     fn credit(entries: &mut [Entry], source: &str) {
         for entry in entries {
             entry.source = source.to_string();
-            if ALREADY_HANDLED_HANDLERS
-                .iter()
-                .any(|known| known.eq_ignore_ascii_case(source))
-            {
-                entry.default_on = false;
-            }
             credit(&mut entry.children, source);
         }
     }
@@ -1379,15 +1344,8 @@ mod win {
         });
         // This menu is drawn by the folder as a whole, so there is no honest way
         // to say which program owns which row. Crediting all of them to Windows
-        // used to make a third party's item look like a system one.
-        for entry in &mut entries {
-            if ALREADY_HANDLED_HANDLERS
-                .iter()
-                .any(|known| known.eq_ignore_ascii_case(&entry.label))
-            {
-                entry.default_on = false;
-            }
-        }
+        // used to make a third party's item look like a system one. Every row
+        // starts off, like the rest of what other programs registered.
         entries
     }
 
@@ -1440,7 +1398,17 @@ mod win {
 
         Catalog {
             supported: true,
-            note: None,
+            // This is the honest answer to "where is Scan with Bitdefender?".
+            // Windows 11 apps declare modern commands in an installed package
+            // and the shell's classic context menu does not expose them, so
+            // there is no verb or handler key to read. Naming the gap here is
+            // better than letting a person hunt for an item that cannot appear.
+            note: Some(
+                "Apps that use the Windows 11 modern context menu register their \
+                 items in a package rather than a verb or handler key. Those \
+                 items cannot be listed here yet."
+                    .to_string(),
+            ),
             entries,
             warnings,
         }
@@ -1720,18 +1688,18 @@ mod win {
         }
 
         #[test]
-        fn the_verbs_lyre_already_offers_are_listed_but_off() {
+        fn every_system_item_is_listed_but_starts_off() {
+            // Installing a program must not change what a right-click does.
+            // The catalogue stays complete so the customise list is the whole
+            // truth, but nothing in it is shown until it is asked for.
             let found = verbs(
                 "file",
                 "item",
                 Some(Path::new("C:\\Windows\\System32\\kernel32.dll")),
                 &mut Vec::new(),
             );
-            for entry in found {
-                if entry.label.eq_ignore_ascii_case("open") {
-                    assert!(!entry.default_on, "open is Lyre's own item");
-                }
-            }
+            assert!(!found.is_empty(), "the test needs at least one registration");
+            assert!(found.iter().all(|entry| !entry.default_on));
         }
 
         #[test]
@@ -1751,6 +1719,38 @@ mod win {
             assert!(run("handler|item|{23170F69-40C1-278A-1000-000100020000}|soon", &folder).is_err());
             assert!(run("background|soon", &folder).is_err());
             assert!(run("nonsense", &folder).is_err());
+        }
+
+        /// What the classic registry walk had to work with, and which installed
+        /// packages own COM classes of their own. Windows 11 apps that register
+        /// a modern context menu command are in the second list, not the first;
+        /// there is no classic verb or handler key to read for them. Run by hand:
+        /// `cargo test print_shell_verb_registrations -- --ignored --nocapture`.
+        #[test]
+        #[ignore]
+        fn print_shell_verb_registrations() {
+            for class in [
+                "*\\shell",
+                "AllFilesystemObjects\\shell",
+                "Directory\\shell",
+                "Directory\\Background\\shell",
+                "Folder\\shell",
+            ] {
+                println!("== {class}");
+                for name in subkeys(class) {
+                    let key = format!("{class}\\{name}");
+                    let text = value(&key, Some("MUIVerb"))
+                        .or_else(|| value(&key, None))
+                        .unwrap_or_default();
+                    let sub = value(&key, Some("SubCommands")).unwrap_or_default();
+                    let command = value(&format!("{key}\\command"), None).unwrap_or_default();
+                    println!("  {name}: label={text:?} sub={sub:?} command={command:?}");
+                }
+            }
+            println!("== PackagedCom packages");
+            for name in subkeys("PackagedCom\\Package") {
+                println!("  {name}");
+            }
         }
 
         /// Loading a real handler is the only way to know the COM side works,

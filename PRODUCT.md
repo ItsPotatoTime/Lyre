@@ -54,21 +54,35 @@ Explorer, so a Windows user is instantly at home on macOS and Linux.
 
 ## Capabilities and Constraints
 
-In scope now (first pass, confirmed with the user):
-- Real filesystem browsing with a fast Rust core.
-- Windows 11 Explorer shell: title bar, tabs, command bar, navigation rail, address bar,
-  breadcrumb, search field, details and grid views, sortable columns, status bar.
+Shipped in 0.1.0 and 0.2.0:
+- Real filesystem browsing with a fast Rust core that streams the first rows before
+  the scan finishes.
+- Windows 11 Explorer shell: title bar, tabs and per-tab history, command bar, navigation
+  rail, address bar, breadcrumb, search field, details and grid views, sortable columns,
+  status bar.
 - Keyboard navigation (arrows, Enter, Backspace, Home/End, type-ahead) and multi-select.
 - Light and dark themes following the OS, with a manual override.
-- Pinned folders and mounted drives in the navigation rail.
+- Pinned folders and mounted drives in the navigation rail, with safe eject.
+- Real file operations: copy, cut and paste with a conflict prompt, delete to the trash,
+  rename, new folder, properties, progress with cancel, and "open with" any registered
+  application.
+- Search by name: the folder on screen is answered from memory, then a breadth-first
+  walk streams deeper matches, with fuzzy and accent-insensitive matching.
+- Preview pane and thumbnails (images decoded in process, video and PDF from the
+  system's own providers), drag and drop including operating-system drags out of the
+  window, hidden and protected items, and the system's own context-menu items.
+- On Windows: folder-handler registration, Win+E, and a signed self-updater.
 
-Explicitly deferred: file operations (copy, move, delete, rename, new folder), search
-and indexing, drag and drop, thumbnail generation, preview pane, tabs persistence.
+Deliberately not implemented, and said so in the interface rather than failing silently:
+sharing, searching inside file contents rather than by name, undo history, a second
+window, and tab persistence. The current list is in `README.md` under "Status".
 
 Constraints:
-- No network calls, no telemetry, no accounts.
+- No telemetry, no accounts. The only network request is the optional update check
+  against this project's own signed releases.
 - Nothing may block the UI thread; a slow or unavailable volume must degrade, not freeze.
-- Cross-platform from one codebase: no Windows-only assumptions in the Rust core.
+- Cross-platform from one codebase. Platform-specific code sits behind `cfg` gates and
+  every other platform gets a working fallback, never a Windows-shaped error.
 
 ## Brand Commitments
 

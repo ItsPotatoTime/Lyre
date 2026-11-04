@@ -4,6 +4,51 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
+## [Unreleased]
+
+### Added
+
+- **The system's own context menu items, on Windows.** What other programs
+  register now appears in Lyre's menus: "Open in Windows Terminal", 7-Zip's
+  archive commands, and the rest. Verbs are read from the registry; a menu handler
+  is asked what it would draw, which is the same call the shell makes; and choosing
+  one runs it through the program that registered it. A new program is picked up
+  when its registration is there, with no list to maintain. Windows 11
+  `IExplorerCommand` handlers and cascading `SubCommands` verbs are not runnable
+  yet and are named as such rather than left out quietly.
+- **Customize this menu**, at the bottom of every right-click menu and in the More
+  menu. It lists everything that can appear in that menu, Lyre's own items and the
+  ones other programs added, with a tick per item and a count of how many are
+  shown. Turning something off is remembered. It also lists every registration
+  that exists but could not be read, with the reason.
+
+### Fixed
+
+- **A registration that failed to load no longer looks like one that does not
+  exist.** Loading a menu handler means loading someone else's DLL. A missing DLL,
+  a refused selection or an unsupported initialiser were all swallowed, so the
+  item simply was not there. "Customize this menu" now names the program, the
+  class id and the reason; the ignored test
+  `print_what_the_installed_handlers_offer` prints the same for a whole machine.
+- **Handlers written against the newer initialisers are read.** Only
+  `IShellExtInit` was asked for, so a handler implementing
+  `IInitializeWithItem` or `IInitializeWithFile` instead never drew anything.
+  All three are tried, in that order.
+- **Background menu items are no longer all credited to Windows.** The folder's
+  own menu arrives whole, so there is no honest way to say which program owns a
+  row. Lyre now says nothing rather than filing a third party's item as a system
+  one.
+- **Linux and macOS no longer show a message about the Windows registry.** Each
+  says why other programs' items are unavailable in its own terms, and both show
+  only Lyre's own items. A menu id can no longer name a registry key outside the
+  one it was read from.
+- **PRODUCT.md described the first-pass plan as shipped state.** File operations,
+  search, drag and drop, thumbnails and the preview pane had all shipped, and the
+  signed update check is the one network request.
+- **`bun buildit` clears older installers from `build/`.** A build from a previous
+  version used to leave its `.exe`/`.msi` beside the new ones. `.workbuddy-ai/` is
+  now ignored by git and left out of the Windows build copy.
+
 ## [0.2.0]
 
 ### Added

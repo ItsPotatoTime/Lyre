@@ -122,6 +122,39 @@ path.
 looks for `.desktop` entries, which macOS does not have, so the list comes back
 empty and opening a file goes to the system's own association through `open`.
 
+## Context menu items from other programs
+
+The "Other programs" section of a right-click menu is a platform feature, not a
+portable one. Each desktop keeps its own registry for these items, and Lyre can
+only read the Windows one today.
+
+**Windows** reads two kinds of registration. A *verb* is a key under
+`HKCR\<class>\shell` holding a command to run; a *handler* is a COM object under
+`HKCR\<class>\shellex\ContextMenuHandlers` that is asked, through
+`IContextMenu::QueryContextMenu`, what it would draw. Both are read off the
+thread that draws the window, and the answer is cached per file type for five
+minutes. A handler is third-party code loaded into this process, exactly as it is
+into Explorer: a broken one can take the window down. There is no way to ask a
+DLL what it would draw without loading it.
+
+A handler is told what is selected through one of `IShellExtInit`,
+`IInitializeWithItem` or `IInitializeWithFile`, and Lyre tries all three. Windows
+11 also has `IExplorerCommand` handlers, which are enumerated differently and are
+**not supported yet**; cascading `SubCommands` verbs are not runnable yet. None of
+these are silently dropped. Every registration that exists but could not be read
+is listed under "Customize this menu" as a warning naming the program, the class
+id and the reason. That list is where to look when an expected item is missing.
+`cargo test print_what_the_installed_handlers_offer -- --ignored --nocapture`
+prints the same information for the whole machine.
+
+**Linux** and **macOS** report that the section is unsupported, give the reason
+in that platform's own terms, and show only Lyre's own items. On Linux the
+equivalent registrations are `[Desktop Action ...]` blocks in `.desktop` files;
+reading them is a separate feature, not a fallback that can be improvised. On
+macOS, Finder keeps its menu extensions to itself and does not let another
+application enumerate them. Neither platform calls a Windows API, shows a
+Windows-shaped message, or offers an item that cannot run.
+
 ## Hidden and protected items
 
 Two different things keep an entry out of a listing, and they are two switches

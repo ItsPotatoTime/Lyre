@@ -18,6 +18,7 @@ mod ops;
 mod places;
 mod scan;
 mod search;
+mod shellmenu;
 
 
 
@@ -500,6 +501,22 @@ fn path_properties(path: String) -> Result<ops::Properties, String> {
     ops::properties(&path)
 }
 
+/// What the system's own menu would offer for this target.
+///
+/// A handler is asked what it would draw, which means loading it, so this runs
+/// off the thread that draws the window. It is also called before the menu
+/// opens, so the answer is usually already there when it is needed.
+#[tauri::command(async)]
+fn shell_menu(path: Option<String>, background: bool) -> shellmenu::Catalog {
+    shellmenu::catalog(path.as_deref(), background)
+}
+
+/// Run one of those items, through the program that registered it.
+#[tauri::command(async)]
+fn shell_menu_run(id: String, paths: Vec<String>) -> Result<(), String> {
+    shellmenu::run(&id, &paths)
+}
+
 /// Resolve the breadcrumb, parent and existence of a path in one round trip.
 #[tauri::command]
 fn path_info(path: String) -> places::PathInfo {
@@ -704,6 +721,8 @@ pub fn run() {
             create_folder,
             rename_path,
             path_properties,
+            shell_menu,
+            shell_menu_run,
             paste_into,
             paste_conflicts,
             delete_paths,

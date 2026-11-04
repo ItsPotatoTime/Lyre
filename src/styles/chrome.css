@@ -561,13 +561,18 @@
   color: var(--text-tertiary);
 }
 
-/* A context menu is positioned at the pointer, then clamped by the component. */
+/* A context menu is positioned at the pointer, then clamped by the component.
+   It scrolls when what other programs registered makes it taller than the
+   window, which is a shape Explorer also has. */
 .menu-context {
   position: fixed;
   top: 0;
   left: 0;
   z-index: 80;
   min-width: 232px;
+  max-height: calc(100vh - 16px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
   transform-origin: top left;
   animation: menu-in var(--dur-2) var(--ease-decel);
 }
@@ -597,3 +602,43 @@
   margin-left: 18px;
   padding-left: 4px;
 }
+
+/* A menu level. `contents` keeps the rows in their panel's own layout while the
+   level still owns the pointer-leave that closes the submenu it opened. */
+.menu-rows {
+  display: contents;
+}
+
+.menu-item[data-open="true"] {
+  background: var(--hover);
+}
+
+.menu-item-arrow {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 12px;
+  color: var(--text-secondary);
+}
+
+/* A submenu is drawn into the document, above the menu it belongs to and below
+   any dialog, and placed from its row by the component. It cannot live inside
+   the menu, because a long menu scrolls and would clip it. */
+.menu-submenu {
+  position: fixed;
+  z-index: 85;
+  transform-origin: top left;
+  animation: menu-sub-in var(--dur-2) var(--ease-decel);
+}
+
+@keyframes menu-sub-in {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+

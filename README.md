@@ -227,6 +227,11 @@ Platform differences are real and are described in
   verb, no administrator rights). macOS has no route: Finder is the shell.
 - Open with hands off to the system picker on Windows, and reads `.desktop`
   entries on Linux, where the default is set through `xdg-mime`.
+- The items other programs add to the system's context menu are a Windows
+  feature. Linux and macOS say so in their own words and show only Lyre's own
+  items. When a Windows registration exists but cannot be read, "Customize this
+  menu" names it instead of quietly leaving the item out.
+  [Platform detail](docs/platforms.md#context-menu-items-from-other-programs)
 - On Linux the webview itself tops out near 60 fps whatever the display does. The
   measurements are in [docs/performance.md](docs/performance.md).
 

@@ -668,3 +668,54 @@ function describe(error: unknown): string {
   if (error instanceof Error) return error.message;
   return "The folder could not be read.";
 }
+
+/**
+ * One item the system's own menu would offer.
+ *
+ * The id is the only part that is stored, so it names the registration rather
+ * than the text: a handler's labels change with the selection and with the
+ * language, and an item that was turned off has to stay off.
+ */
+export interface ShellMenuEntry {
+  id: string;
+  label: string;
+  /** `file`, `folder` or `background`. */
+  origin: string;
+  /** The program that registered it. */
+  source: string;
+  kind: string;
+  /** Whether it shows before anyone has chosen anything. */
+  defaultOn: boolean;
+  children: ShellMenuEntry[];
+}
+
+export interface ShellMenuCatalog {
+  supported: boolean;
+  note: string | null;
+  entries: ShellMenuEntry[];
+  /** Registrations that exist but could not be read, for the customise list. */
+  warnings: string[];
+}
+
+/** What the system's menu would offer for this target, or for a folder's own background. */
+export async function shellMenu(
+  path: string | null,
+  background: boolean,
+): Promise<ShellMenuCatalog> {
+  if (!isTauri) {
+    const { mockShellMenu } = await import("./mock");
+    return mockShellMenu(background);
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  return invoke<ShellMenuCatalog>("shell_menu", { path, background });
+}
+
+/** Run one of those items, through the program that registered it. */
+export async function runShellMenuItem(id: string, paths: string[]): Promise<void> {
+  if (!isTauri) {
+    throw new Error("The system's own menu items need the desktop app.");
+  }
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("shell_menu_run", { id, paths });
+}
+

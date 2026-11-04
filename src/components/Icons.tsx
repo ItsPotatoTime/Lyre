@@ -206,6 +206,13 @@ const GLYPHS = {
   filter: (
     <path d="M3.6 5.2h12.8l-4.9 5.9v4.4l-3 1.4v-5.8z" />
   ),
+  sliders: (
+    <>
+      <path d="M3.4 7h3.4M10.2 7h6.4M3.4 13h1.2M8 13h8.6" />
+      <circle cx="8.5" cy="7" r="1.7" />
+      <circle cx="6.3" cy="13" r="1.7" />
+    </>
+  ),
   network: (
     <>
       <circle cx="10" cy="10" r="6.6" />

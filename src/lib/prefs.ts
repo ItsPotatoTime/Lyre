@@ -29,6 +29,12 @@ export interface Prefs {
   promptDefaultManager: boolean;
   /** Whether the preview pane is shown. On by default. */
   previewOpen: boolean;
+  /**
+   * Menu items the person turned off, and the ones they turned on that start
+   * off. Two lists rather than one because an item can default either way.
+   */
+  menuHidden: string[];
+  menuShown: string[];
 }
 
 const KEY = "lyre.prefs.v1";
@@ -45,9 +51,17 @@ export const DEFAULT_PREFS: Prefs = {
   columns: DEFAULT_COLUMNS,
   promptDefaultManager: true,
   previewOpen: true,
+  menuHidden: [],
+  menuShown: [],
 };
 
 const SORT_KEYS = new Set(["name", "modified", "type", "size"]);
+
+function ids(value: unknown): string[] {
+  return Array.isArray(value)
+    ? value.filter((item): item is string => typeof item === "string")
+    : [];
+}
 
 function storage(): Storage | null {
   try {
@@ -106,6 +120,8 @@ export function loadPrefs(): Prefs {
         : true,
     previewOpen:
       typeof saved.previewOpen === "boolean" ? saved.previewOpen : true,
+    menuHidden: ids(saved.menuHidden),
+    menuShown: ids(saved.menuShown),
   };
 }
 

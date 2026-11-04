@@ -8,7 +8,13 @@
  */
 
 import type { Entry, EntryKind, Hit, PathInfo, Place } from "@/types";
-import type { ScanHandlers, ScanHandle, SearchHandlers } from "./ipc";
+import type {
+  ScanHandlers,
+  ScanHandle,
+  SearchHandlers,
+  ShellMenuCatalog,
+  ShellMenuEntry,
+} from "./ipc";
 
 const HOME = "/home/you";
 
@@ -595,4 +601,97 @@ function toHit(entry: Entry, query: string): Hit | null {
 
   score += Math.max(0, 24 - entry.name.length);
   return { ...entry, score, indices };
+}
+
+/**
+ * What a real Windows machine reports for its own menu items.
+ *
+ * The browser preview has no registry to read, and the customise list is a
+ * screen people have to judge by looking at it: how a submenu reads, how a long
+ * label behaves, whether a program name is useful beside the item it added.
+ * These are the shapes that actually occur on a desktop with 7-Zip, Bitdefender
+ * and a modern Windows installed.
+ */
+export function mockShellMenu(background: boolean): ShellMenuCatalog {
+  if (background) {
+    return {
+      supported: true,
+      note: null,
+      warnings: [],
+      entries: [
+        entry("verb|background|WarpTab", "Open Warp in new tab", "warp"),
+        entry("verb|background|cmd", "Open command window here", "Windows"),
+        entry("verb|background|Powershell", "Open PowerShell window here", "powershell"),
+        entry("background|2", "New", "Windows", [
+          entry("background|12", "Folder", "Windows"),
+          entry("background|13", "Shortcut", "Windows"),
+          entry("background|14", "Text document", "Windows"),
+          entry("background|15", "Compressed (zipped) folder", "Windows"),
+        ]),
+        entry("background|1", "Properties", "Windows"),
+      ],
+    };
+  }
+  return {
+    supported: true,
+    note: null,
+    // A registration that exists but cannot be read is shown in the list, so
+    // the browser preview has to be able to draw that state too.
+    warnings: [
+      "ABBYY.FineReader16.ContextMenu ({DCACA03D-01CA-410C-8F35-FBEB05CA8BF0}): The menu handler could not be used: the handler speaks none of the initialisers Lyre knows; Windows 11 IExplorerCommand handlers are not supported yet.",
+    ],
+    entries: [
+      {
+        ...entry("verb|file|open", "Open", "Lyre"),
+        defaultOn: false,
+      },
+      entry("verb|file|AddToArchive", "Add to archive…", "7-Zip Shell Extension"),
+      {
+        ...entry("verb|file|Bitdefender", "Scan with Bitdefender", "Bitdefender", []),
+      },
+      entry("verb|file|pintohomefile", "Add to Favorites", "Windows"),
+      entry("handler|file|{f3d06e7c}|1", "Copy as path", "Copy as Path Menu"),
+      entry("handler|file|{e2bf9676}|1", "Share", "Ribbon Modern Share Verb"),
+      entry(
+        "handler|file|{23170F69-40C1-278A-1000-000100020000}|4",
+        "7-Zip",
+        "7-Zip Shell Extension",
+        [
+          entry(
+            "handler|file|{23170F69-40C1-278A-1000-000100020000}|1",
+            "Open archive",
+            "7-Zip Shell Extension",
+          ),
+          entry(
+            "handler|file|{23170F69-40C1-278A-1000-000100020000}|2",
+            'Extract to "photos\\"',
+            "7-Zip Shell Extension",
+          ),
+          entry(
+            "handler|file|{23170F69-40C1-278A-1000-000100020000}|3",
+            "Add to archive…",
+            "7-Zip Shell Extension",
+          ),
+        ],
+      ),
+      entry("handler|file|{470C0EBD}|2", "Pin to Start", "Pin To Start Screen verb handler"),
+    ],
+  };
+}
+
+function entry(
+  id: string,
+  label: string,
+  source: string,
+  children: ShellMenuEntry[] = [],
+): ShellMenuEntry {
+  return {
+    id,
+    label,
+    origin: id.startsWith("verb|background") || id.startsWith("background") ? "background" : "file",
+    source,
+    kind: id.startsWith("verb") ? "verb" : "handler",
+    defaultOn: true,
+    children,
+  };
 }

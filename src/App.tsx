@@ -38,6 +38,7 @@ import {
   checkForUpdate,
   installUpdate,
   restartApp,
+  runShellMenuItem,
   type UpdateOffer,
   graphicsSettings,
   setGraphicsSettings,
@@ -45,6 +46,8 @@ import {
   type ManagerState,
   type OpenWith,
   type PathProperties,
+  type ShellMenuCatalog,
+  type ShellMenuEntry,
 } from "@/lib/ipc";
 import { useDirectory } from "@/lib/useDirectory";
 import { matchIndex, useSearch } from "@/lib/useSearch";
@@ -85,6 +88,15 @@ import { HomeView } from "@/components/HomeView";
 import { ThisPcView } from "@/components/ThisPcView";
 import { StatusBar } from "@/components/StatusBar";
 import { ContextMenu, type ContextItem } from "@/components/ContextMenu";
+import { CustomizeMenuDialog } from "@/components/CustomizeMenuDialog";
+import {
+  filterMenu,
+  insertMenuBlock,
+  menuItemShown,
+  shellMenuItems,
+  type MenuScope,
+} from "@/lib/menuItems";
+import { loadShellMenu, shellMenuKey } from "@/lib/shellMenuCache";
 import { PropertiesDialog } from "@/components/PropertiesDialog";
 import { OpenWithDialog } from "@/components/OpenWithDialog";
 import { UpdateDialog } from "@/components/UpdateDialog";
@@ -243,6 +255,21 @@ function Browser({
   const [ejecting, setEjecting] = useState<string | null>(null);
   const [reducedMemory, setReducedMemory] = useState(false);
   const [previewOpen, setPreviewOpen] = useState(prefs.previewOpen);
+  const [menuHidden, setMenuHidden] = useState<string[]>(prefs.menuHidden);
+  const [menuShown, setMenuShown] = useState<string[]>(prefs.menuShown);
+  /** The customize list, and which menu it is describing. */
+  const [customize, setCustomize] = useState<{
+    scope: MenuScope;
+    key: string;
+  } | null>(null);
+  /**
+   * What the system's own menu offers, by file type. Filled before the menu is
+   * opened, because reading it means loading every handler that wants a say and
+   * that is not something to do while the pointer is waiting.
+   */
+  const [shellCatalogs, setShellCatalogs] = useState<
+    Record<string, ShellMenuCatalog>
+  >({});
   const [pendingPaste, setPendingPaste] = useState<{
     destination: string;
     sources: string[];
@@ -453,6 +480,8 @@ function Browser({
       columns,
       promptDefaultManager: promptDefault,
       previewOpen,
+      menuHidden,
+      menuShown,
     });
   }, [
     active.sort,
@@ -466,6 +495,8 @@ function Browser({
     columns,
     promptDefault,
     previewOpen,
+    menuHidden,
+    menuShown,
   ]);
 
   useEffect(() => {
@@ -631,6 +662,73 @@ function Browser({
     // `dir.version` advances when the streamed array is mutated in place.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [searching, search.items, dir.entries, dir.version, active.filter]);
+
+  /**
+   * The two catalogues the menus read: one for the item that would be
+   * right-clicked, one for the folder's own empty space. They are keyed by what
+   * decides the answer, which is the file type or the folder itself.
+   */
+  const itemEntry = useMemo(() => {
+    const path = selection.focused ?? visible[0]?.path ?? null;
+    return path ? (visible.find((entry) => entry.path === path) ?? null) : null;
+  }, [selection.focused, visible]);
+  const itemTarget = itemEntry?.path ?? null;
+  const itemShellKey = shellMenuKey(itemTarget, false, itemEntry?.isDir === true);
+  const backgroundShellKey = shellMenuKey(location.path, true);
+
+  useEffect(() => {
+    const wanted: { key: string; path: string; background: boolean }[] = [];
+    // A background menu belongs to a real folder, and there is none while a
+    // search is what is being looked at.
+    if (showsFiles) {
+      wanted.push({
+        key: backgroundShellKey,
+        path: location.path,
+        background: true,
+      });
+    }
+    if (itemTarget) {
+      wanted.push({
+        key: itemShellKey,
+        path: itemTarget,
+        background: false,
+      });
+    }
+    if (wanted.length === 0) return;
+
+    let cancelled = false;
+    for (const want of wanted) {
+      void loadShellMenu(want.key, want.path, want.background).then((catalog) => {
+        if (cancelled) return;
+        setShellCatalogs((prev) =>
+          prev[want.key] ? prev : { ...prev, [want.key]: catalog },
+        );
+      });
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [backgroundShellKey, itemShellKey, itemTarget, location.path, showsFiles]);
+
+  // The list can be asked for a menu that was never prefetched, which happens
+  // when it is opened from the command bar on a page with no listing.
+  useEffect(() => {
+    if (!customize || shellCatalogs[customize.key]) return;
+    const background = customize.scope === "background";
+    if (customize.scope === "place") return;
+    const path = background ? location.path : itemTarget;
+    if (!path) return;
+    let cancelled = false;
+    void loadShellMenu(customize.key, path, background).then((catalog) => {
+      if (cancelled) return;
+      setShellCatalogs((prev) =>
+        prev[customize.key] ? prev : { ...prev, [customize.key]: catalog },
+      );
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [customize, itemTarget, location.path, shellCatalogs]);
 
   const onOpen = useCallback(
     (entry: Entry) => {
@@ -1257,6 +1355,90 @@ function Browser({
     [flash],
   );
 
+  // --- what the menus are allowed to show ---------------------------------
+  const hiddenIds = useMemo(() => new Set(menuHidden), [menuHidden]);
+  const restoredIds = useMemo(() => new Set(menuShown), [menuShown]);
+  const isMenuShown = useCallback(
+    (id: string, defaultOn: boolean) =>
+      menuItemShown(id, defaultOn, hiddenIds, restoredIds),
+    [hiddenIds, restoredIds],
+  );
+
+  const toggleMenuItem = useCallback(
+    (id: string, defaultOn: boolean, next: boolean) => {
+      setMenuHidden((prev) =>
+        next
+          ? prev.filter((item) => item !== id)
+          : prev.includes(id)
+            ? prev
+            : [...prev, id],
+      );
+      setMenuShown((prev) => {
+        // An item that starts on needs no record of being on, and one that
+        // starts off needs one only while it is on.
+        if (!next || defaultOn) return prev.filter((item) => item !== id);
+        return prev.includes(id) ? prev : [...prev, id];
+      });
+    },
+    [],
+  );
+
+  const resetMenu = useCallback(() => {
+    setMenuHidden([]);
+    setMenuShown([]);
+    flash("Context menus are back to their defaults");
+  }, [flash]);
+
+  /** The last item of every menu: the way into the list that shapes it. */
+  const customizeEntry = useCallback(
+    (scope: MenuScope): ContextItem => ({
+      kind: "item",
+      id: "customize-menu",
+      label: "Customize this menu…",
+      icon: "sliders",
+      onSelect: () =>
+        setCustomize({
+          scope,
+          key: scope === "background" ? backgroundShellKey : itemShellKey,
+        }),
+    }),
+    [backgroundShellKey, itemShellKey],
+  );
+
+  /** Hand an item back to the program that registered it. */
+  const runShellEntry = useCallback(
+    (entry: ShellMenuEntry, paths: string[]) => {
+      void runShellMenuItem(entry.id, paths).catch((error: unknown) =>
+        flash(
+          error instanceof Error ? error.message : "That item could not be run.",
+        ),
+      );
+    },
+    [flash],
+  );
+
+  /**
+   * The system's own items for one target, already filtered. Empty when the
+   * catalogue has not been read yet, which is why the menus are rebuilt whenever
+   * one arrives rather than being fixed when they open.
+   */
+  const shellBlock = useCallback(
+    (key: string, target: string, background: boolean): ContextItem[] => {
+      const catalog = shellCatalogs[key];
+      if (!catalog?.supported) return [];
+      // A background command is written for the folder, so it is handed the
+      // folder; an item's handler is handed the selection it will act on.
+      const paths =
+        background || selection.selected.size === 0
+          ? [target]
+          : [...selection.selected];
+      return shellMenuItems(catalog.entries, isMenuShown, (entry) =>
+        runShellEntry(entry, paths),
+      );
+    },
+    [isMenuShown, runShellEntry, selection.selected, shellCatalogs],
+  );
+
   /** Menu for a place: a rail row, a tile, or a drive card. */
   const placeItems = useCallback(
     (
@@ -1271,7 +1453,7 @@ function Browser({
       const isHidden = library.hiddenPins.includes(place.path);
       const isFolder = place.kind === "folder";
 
-      return [
+      const items: ContextItem[] = [
         {
           kind: "item",
           id: "place-open",
@@ -1341,8 +1523,26 @@ function Browser({
           },
         },
       ];
+
+      return [
+        ...filterMenu(items, isMenuShown),
+        { kind: "sep" },
+        customizeEntry("place"),
+      ];
     },
-    [eject, flash, forgetFavorite, library, navigate, pinToRail, places, rememberFavorite, unpinFromRail],
+    [
+      customizeEntry,
+      eject,
+      flash,
+      forgetFavorite,
+      isMenuShown,
+      library,
+      navigate,
+      pinToRail,
+      places,
+      rememberFavorite,
+      unpinFromRail,
+    ],
   );
 
   const contextItems = useCallback(
@@ -1376,7 +1576,7 @@ function Browser({
       ];
 
       if (!entry) {
-        return [
+        const items: ContextItem[] = [
           {
             kind: "item",
             id: "new-folder",
@@ -1451,9 +1651,21 @@ function Browser({
               }),
           },
         ];
+
+        // The folder's own menu ends with what other programs put there, then
+        // the way into this list.
+        return [
+          ...insertMenuBlock(
+            filterMenu(items, isMenuShown),
+            null,
+            shellBlock(backgroundShellKey, location.path, true),
+          ),
+          { kind: "sep" },
+          customizeEntry("background"),
+        ];
       }
 
-      return [
+      const items: ContextItem[] = [
         {
           kind: "item",
           id: "open",
@@ -1538,18 +1750,34 @@ function Browser({
           onSelect: () => showProperties(entry.path),
         },
       ];
+
+      // Windows puts what other programs registered just above Properties, and
+      // so does this.
+      return [
+        ...insertMenuBlock(
+          filterMenu(items, isMenuShown),
+          "properties",
+          shellBlock(itemShellKey, entry.path, false),
+        ),
+        { kind: "sep" },
+        customizeEntry("item"),
+      ];
     },
     [
       active.sort.dir,
       active.sort.key,
       active.view,
+      backgroundShellKey,
       beginOpenWith,
       beginRename,
       clipboard,
       copyPath,
       copySelection,
+      customizeEntry,
       deleteSelection,
       forgetFavorite,
+      isMenuShown,
+      itemShellKey,
       library.favorites,
       library.extraPins,
       library.hiddenPins,
@@ -1565,6 +1793,7 @@ function Browser({
       refresh,
       setSort,
       setView,
+      shellBlock,
       showProperties,
       visible,
     ],
@@ -1942,6 +2171,13 @@ function Browser({
         onRestorePins={restorePins}
         frameRate={showFrameRate}
         onToggleFrameRate={() => setShowFrameRate((value) => !value)}
+        onCustomizeMenu={() =>
+          setCustomize(
+            itemTarget
+              ? { scope: "item", key: itemShellKey }
+              : { scope: "background", key: backgroundShellKey },
+          )
+        }
         notice={flash}
       />
 
@@ -2157,6 +2393,22 @@ function Browser({
         <PropertiesDialog
           properties={properties}
           onClose={() => setProperties(null)}
+        />
+      ) : null}
+
+      {customize ? (
+        <CustomizeMenuDialog
+          scope={customize.scope}
+          shell={
+            customize.scope === "place"
+              ? null
+              : (shellCatalogs[customize.key] ?? null)
+          }
+          hidden={menuHidden}
+          shown={menuShown}
+          onToggle={toggleMenuItem}
+          onReset={resetMenu}
+          onClose={() => setCustomize(null)}
         />
       ) : null}
 

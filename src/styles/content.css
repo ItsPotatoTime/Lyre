@@ -1148,6 +1148,209 @@
   background: var(--bg-field-hover);
 }
 
+/* Customize context menu ---------------------------------------------------- */
+/* Two inventories of the same menu, so the list is the dialog: it scrolls, and
+   the heading and the tally stay where they are. */
+.dialog-menu {
+  width: min(520px, calc(100vw - 48px));
+  display: flex;
+  flex-direction: column;
+  max-height: min(76vh, 640px);
+}
+
+/* Only the list gives up space when the window is short. */
+.dialog-menu > .dialog-head,
+.dialog-menu > .dialog-note,
+.dialog-menu > .dialog-foot {
+  flex: none;
+}
+
+.dialog-titles {
+  display: grid;
+  flex: 1;
+  min-width: 0;
+}
+
+.dialog-subtitle {
+  font-size: var(--text-caption);
+  line-height: var(--leading-caption);
+  color: var(--text-secondary);
+}
+
+.menu-settings {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  margin: 0 -6px;
+  padding: 2px 0 10px;
+  scrollbar-gutter: stable;
+}
+
+.menu-settings-section {
+  padding-top: 8px;
+}
+
+.menu-settings-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 4px 6px 6px 8px;
+}
+
+.menu-settings-head > span:first-child {
+  font-size: var(--text-caption);
+  font-weight: var(--weight-semi);
+  color: var(--text-secondary);
+}
+
+.menu-settings-rule {
+  flex: 1;
+  height: 1px;
+  background: var(--line-soft);
+}
+
+.menu-settings-group-title {
+  padding: 6px 8px 2px;
+  font-size: var(--text-caption);
+  color: var(--text-tertiary);
+}
+
+.menu-settings-empty {
+  padding: 4px 10px 10px;
+  font-size: var(--text-caption);
+  line-height: var(--leading-caption);
+  color: var(--text-tertiary);
+}
+
+/* A registration that exists but could not be read is not the same as one that
+   is not there. It stays in the list, under a hairline, without a card or a
+   coloured edge: the caption does the separating. */
+.menu-settings-warnings {
+  padding: 10px 8px 4px;
+}
+
+.menu-settings-warnings-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: var(--text-caption);
+  font-weight: var(--weight-semi);
+  color: var(--text-secondary);
+}
+
+.menu-settings-warnings-head::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--line-soft);
+}
+
+.menu-settings-warning {
+  padding: 6px 0 0;
+  font-size: var(--text-caption);
+  line-height: var(--leading-caption);
+  color: var(--text-tertiary);
+  overflow-wrap: anywhere;
+}
+
+/* A row is a box and a name. The box is painted rather than native so it takes
+   the accent and the theme, but the input stays real, so the keyboard and a
+   screen reader see a checkbox. */
+.menu-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  height: 32px;
+  padding: 0 8px;
+  border-radius: var(--radius-control);
+}
+
+.menu-row:hover {
+  background: var(--hover);
+}
+
+.menu-row-input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.menu-row-box {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 16px;
+  height: 16px;
+  border: 1px solid var(--text-tertiary);
+  border-radius: 3px;
+  color: transparent;
+}
+
+.menu-row-input:checked + .menu-row-box {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--text-on-accent);
+}
+
+.menu-row-input:focus-visible + .menu-row-box {
+  outline: 2px solid var(--stroke-focus, var(--accent));
+  outline-offset: 2px;
+}
+
+.menu-row-label {
+  flex: 0 1 auto;
+  min-width: 0;
+  font-size: var(--text-body);
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The hint sits with its label rather than at the far edge: most rows have
+   none, and a column of empty space reads as a broken table. */
+.menu-row-detail {
+  flex: none;
+  margin-left: 2px;
+  font-size: var(--text-caption);
+  color: var(--text-tertiary);
+}
+
+.dialog-foot-split {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.dialog-gap {
+  flex: 1;
+}
+
+.dialog-link {
+  height: 30px;
+  padding: 0 10px;
+  border-radius: var(--radius-control);
+  font-size: var(--text-caption);
+  color: var(--text-secondary);
+}
+
+.dialog-link:hover:not(:disabled) {
+  background: var(--hover);
+  color: var(--text-primary);
+}
+
+.dialog-link:disabled {
+  color: var(--text-disabled);
+}
+
+.dialog-count {
+  font-size: var(--text-caption);
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+
 /* Open with ---------------------------------------------------------------- */
 .dialog-wide {
   width: min(520px, calc(100vw - 48px));

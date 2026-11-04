@@ -139,6 +139,30 @@ No gradients, no glass as decoration, no shadows except on flyouts, no cards, no
 icon-plus-heading-plus-text blocks, no coloured left borders, no rounded chunk
 standing in for content. Explorer has none of them and neither does this.
 
+## Context menus
+
+One menu, built from three sources: Lyre's own items, the ones other programs
+registered with the system, and the way into the list that decides which of them
+appear.
+
+The system's items sit above Properties, where Explorer puts them. A program that
+adds a whole group keeps its group: the row carries a chevron and the panel opens
+beside it, at the same raised tone and radius as the menu. Nothing about another
+program's item is invented: its label is the text it drew, and its source is the
+program its command names.
+
+A menu is allowed to be longer than the window, because the registrations on a
+real machine are. It scrolls, and its submenus are drawn into the document rather
+than inside it, so scrolling cannot clip them.
+
+"Customize this menu…" is always the last row, after its own separator. The list
+it opens holds two inventories, each under a caption and a hairline rule: Lyre's
+items, then the ones other programs added. Rows are 32 px, the box is painted in
+the accent rather than left to the platform, and the hint beside a name is the
+program that added the item or the targets it appears for. An item Lyre already
+offers a better version of starts off but stays listed, so the list is always the
+whole truth rather than only the visible part of it.
+
 ## Search
 
 Results replace the listing in place: the same rows, the same columns, the same

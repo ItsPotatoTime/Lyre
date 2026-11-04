@@ -59,6 +59,7 @@ export function CommandBar({
   onToggleReducedMemory,
   canRestorePins,
   onRestorePins,
+  onCustomizeMenu,
   notice,
 }: {
   view: ViewMode;
@@ -104,6 +105,8 @@ export function CommandBar({
   onToggleReducedMemory: () => void;
   canRestorePins: boolean;
   onRestorePins: () => void;
+  /** Opens the list that decides what the right-click menus contain. */
+  onCustomizeMenu: () => void;
   notice: (text: string) => void;
 }) {
   const hasSelection = selectedCount > 0;
@@ -206,6 +209,13 @@ export function CommandBar({
       onSelect: onCopyPath,
     },
     { kind: "sep" },
+    {
+      kind: "item",
+      id: "customize-menu",
+      label: "Customize context menu…",
+      icon: "sliders",
+      onSelect: onCustomizeMenu,
+    },
     {
       kind: "item",
       id: "default-manager",

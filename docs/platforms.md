@@ -237,3 +237,42 @@ never walks into subfolders: Lyre lists immediate children, and a change deep in
 a tree is not a change to the listing on screen. Search results are not re-run
 automatically, because repeating a recursive walk on every change is far more
 expensive than the folder listing it would refresh.
+
+## Dragging out of an archive
+
+An archiver's drag is not a file drag. 7-Zip and WinRAR extract the selected
+members into a throwaway folder (`%TEMP%\7zE9A2F\`, `%TEMP%\Rar$EXa0.123\`),
+describe them with `CF_HDROP`, and delete that folder as soon as `DoDragDrop`
+returns. Two things then go wrong for a webview-based file manager:
+
+- The drag can name the *parent* extraction folder instead of its members, so a
+  twenty-file extraction arrives as one folder.
+- wry reads `CF_HDROP` inside `IDropTarget::Drop`, but Tauri queues the event to
+  the app with `PostMessageW`. By the time the interface asks to paste, the
+  source has often removed every path it just named.
+
+Lyre snapshots the paths on the first `DragEnter`, which carries the same
+`CF_HDROP` paths but arrives while the pointer is still over the window and the
+archiver is still holding its files. `Drop` is a second chance for a platform
+that sends no `Enter` paths, and the window stages what it can when it collects
+the drop if both hooks are missed. A drag described by one extraction folder is
+expanded into its members, and each member is held in a `lyre-drop-*` folder with
+a hard link, so the bytes survive the archiver's cleanup without a second copy.
+A rename and then a copy cover volumes that cannot link. The interface pastes
+from those stable paths, and the staging folder is removed when the paste
+finishes. A drag that leaves without a drop is released after a short grace
+period, in case `leave` was sent just after `drop`.
+
+**All platforms.** Detection is by path name and the system temp directory, not a
+Windows API, and the snapshot is `std::fs` throughout. Linux and macOS archivers
+that extract to a temp folder with one of the recognised names get the same
+treatment; a normal file drag is never copied or moved through staging. Folders
+left behind by a crashed run, or by a paste dismissed at the conflict prompt,
+are swept at the next startup once they are six hours old. A folder already
+handed to a paste is never reclaimed by a later drop, however long the copy
+takes.
+
+**Known limit.** An archiver using an unrecognised temp-folder name, or one that
+deletes its files before the event loop receives `DragEnter`, still sees the old
+behaviour. Closing the gap entirely means replacing wry's `IDropTarget`, which
+would also replace every other native drop; that trade is not worth making.

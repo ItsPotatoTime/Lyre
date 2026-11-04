@@ -5,6 +5,7 @@
 //! and never block the thread the window is waiting on.
 
 mod defaultmanager;
+mod dropstage;
 mod eject;
 mod fileops;
 mod fold;
@@ -214,6 +215,7 @@ fn rename_path(
 #[tauri::command]
 fn paste_into(
     state: State<'_, AppState>,
+    drop_state: State<'_, dropstage::DropState>,
     destination: String,
     sources: Vec<String>,
     mode: fileops::Mode,
@@ -224,6 +226,8 @@ fn paste_into(
     let index = Arc::clone(&state.index);
     let destination_for_cache = destination.clone();
     let sources_for_cache = sources.clone();
+    // `State` is a borrow of the app; the paste thread needs an owned handle.
+    let drop_state = (*drop_state).clone();
 
     std::thread::Builder::new()
         .name("lyre-paste".into())
@@ -231,6 +235,9 @@ fn paste_into(
             fileops::paste(&destination, &sources, mode, conflict, &cancel, |event| {
                 on_event.send(event).is_ok()
             });
+            // A staged extraction drop has now been read; nothing else needs
+            // the hard links that kept it alive.
+            dropstage::release_after_paste(&sources, &drop_state);
             // Both ends changed: the destination gained rows and, when moving,
             // the source folders lost them.
             index.forget(std::path::Path::new(&destination_for_cache));
@@ -599,6 +606,14 @@ fn watch_folder(
     watch::set_folder(path, app, &state);
 }
 
+/// Exchange a drop's original paths for the snapshot taken on the event loop.
+/// An archiver deletes its extraction folder before the webview can paste, so
+/// this is the only safe set of paths to hand to `paste_into`.
+#[tauri::command]
+fn staged_drop_paths(paths: Vec<String>, state: State<'_, dropstage::DropState>) -> Vec<String> {
+    dropstage::take(paths, &state)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Before the webview exists: WebKit reads this once, at initialisation.
@@ -681,7 +696,28 @@ pub fn run() {
         })
         .manage(AppState::default())
         .manage(watch::WatchState::default())
-        .on_window_event(move |_window, event| {
+        .manage(dropstage::DropState::default())
+        .on_window_event(move |window, event| {
+            // wry's `IDropTarget::Drop` only posts a message to this loop; by
+            // the time it is read, an archiver may already have deleted its
+            // extraction folder. `DragEnter` carries the same paths while the
+            // drag is still live, so snapshot there first and keep `Drop` as a
+            // second chance for a platform that sends no `Enter` paths.
+            if let tauri::WindowEvent::DragDrop(drag) = event {
+                match drag {
+                    tauri::DragDropEvent::Enter { paths, .. }
+                    | tauri::DragDropEvent::Drop { paths, .. } => {
+                        let state = window.state::<dropstage::DropState>();
+                        dropstage::stage_early(paths.clone(), &state);
+                    }
+                    tauri::DragDropEvent::Leave => {
+                        let state = window.state::<dropstage::DropState>();
+                        dropstage::cancel(&state);
+                    }
+                    _ => {}
+                }
+                return;
+            }
             let tauri::WindowEvent::CloseRequested { api, .. } = event else {
                 return;
             };
@@ -715,6 +751,7 @@ pub fn run() {
             places,
             home_dir,
             watch_folder,
+            staged_drop_paths,
             open_path,
             create_folder,
             rename_path,
@@ -747,6 +784,9 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building Lyre");
+    // Closing calls process::exit, so a staging folder dropped at a cancelled
+    // conflict dialog has no destructor to clean it up. Sweep the old ones.
+    dropstage::sweep();
     app.run(move |_app, event| {
         if tracing && matches!(event, tauri::RunEvent::Exit) {
             eprintln!("[lyre] exit");

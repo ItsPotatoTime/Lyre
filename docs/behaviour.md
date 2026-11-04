@@ -92,6 +92,19 @@ cross-application drag itself still wants a real try on each platform.
 Drops *from* the operating system work and are always copies, since the source may
 be on another volume or another machine.
 
+**Dragging out of an archive works.** 7-Zip and WinRAR do not hand over an archive:
+they extract the selected members into a folder such as `%TEMP%\7zE9A2F`, name
+those paths in the drag, and delete the folder as soon as the drag ends. The drag
+can also be described by that one parent folder rather than its members, which is
+why twenty files sometimes arrived as a single folder, and the paths can already
+be gone by the time the window asks to paste. Lyre snapshots the paths on the
+Rust event loop as soon as the drag enters the window — while the archiver is
+still holding them — expands the parent folder into its members, and pastes from
+a folder Lyre owns. Ordinary drops from a file manager
+are left exactly as they were, and the snapshot uses hard links rather than a
+second copy wherever the volume supports them.
+[Platform detail](platforms.md#dragging-out-of-an-archive)
+
 ## Paste conflicts
 
 A paste that would land on an existing name asks first: keep both, which numbers

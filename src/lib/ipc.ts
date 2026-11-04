@@ -211,6 +211,25 @@ export async function watchFolder(path: string | null): Promise<void> {
 }
 
 /**
+ * Exchange the paths from a native drop for their staged counterparts.
+ *
+ * Archivers such as 7-Zip extract to a folder they delete the moment the drag
+ * ends, and can describe the whole extraction as that one folder. Rust takes a
+ * snapshot on the event loop and expands the folder into its members; this
+ * returns paths that are safe to paste from. An ordinary drop comes back
+ * unchanged, and a failure at the bridge does the same rather than losing it.
+ */
+export async function stagedDropPaths(paths: string[]): Promise<string[]> {
+  if (!isTauri) return paths;
+  try {
+    const { invoke } = await import("@tauri-apps/api/core");
+    return await invoke<string[]>("staged_drop_paths", { paths });
+  } catch {
+    return paths;
+  }
+}
+
+/**
  * Hand a file to whatever the operating system opens that type with.
  * Directories are navigated instead, so this is only ever called for files.
  */

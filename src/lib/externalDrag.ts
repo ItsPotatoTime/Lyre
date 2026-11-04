@@ -1,4 +1,4 @@
-import { isTauri } from "./ipc";
+import { isTauri, stagedDropPaths } from "./ipc";
 
 /**
  * Drops coming from outside the window: Explorer, Finder, a file manager on the
@@ -9,6 +9,11 @@ import { isTauri } from "./ipc";
  * object with no path on it. The cost is that Tauri's handler replaces WebView2's
  * HTML5 drag/drop on Windows, which is why dragging *inside* the window is
  * driven by pointer events instead of HTML5.
+ *
+ * The paths are exchanged for their staged counterparts before the drop is
+ * handed on. An archiver can delete the files it named between the native drop
+ * and this callback, so Rust takes the snapshot earlier and this is only the
+ * handover.
  *
  * Positions arrive in physical pixels; they are divided by the device pixel
  * ratio to land where the pointer actually is in CSS space.
@@ -34,8 +39,12 @@ export function clearDropHighlight(): void {
 export interface ExternalDropHandlers {
   /** A drag entered or moved; `x`/`y` are CSS pixels. */
   onOver: (x: number, y: number) => void;
-  /** Files were released. */
-  onDrop: (x: number, y: number, paths: string[]) => void;
+  /**
+   * Files were released. The paths arrive as a promise because collecting
+   * Rust's snapshot takes an IPC round trip; resolve the drop target where the
+   * pointer was released before awaiting it, since the listing may repaint.
+   */
+  onDrop: (x: number, y: number, paths: Promise<string[]>) => void;
   onLeave: () => void;
 }
 
@@ -62,7 +71,11 @@ export async function watchExternalDrops(
     const y = payload.position.y / ratio;
     if (payload.type === "drop") {
       clearDropHighlight();
-      handlers.onDrop(x, y, payload.paths);
+      // An archiver's extraction folder may already be gone by now. Rust took
+      // a snapshot on the event loop; handing the promise over lets the caller
+      // resolve the target synchronously while the snapshot is collected, so
+      // the paste never reads a path the source has deleted.
+      handlers.onDrop(x, y, stagedDropPaths(payload.paths));
     } else {
       handlers.onOver(x, y);
     }

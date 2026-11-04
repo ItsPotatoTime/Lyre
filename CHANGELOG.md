@@ -42,6 +42,16 @@ release notes rather than a second copy of them.
 
 ### Fixed
 
+- **Dragging out of 7-Zip or WinRAR no longer loses most of the archive.** An
+  archiver extracts the selected members into a temp folder (`7zE…`, `Rar$…`),
+  can describe the whole drag as that one parent folder, and deletes it when
+  `DoDragDrop` returns — after wry has read the paths but before Tauri's queued
+  event reaches the webview. That showed up as one folder arriving out of twenty,
+  or nothing at all. The paths are now snapshotted when the drag first enters the
+  window, while the archiver is still holding them; the parent folder is expanded
+  into its members, and the paste reads hard links in a Lyre-owned staging
+  folder. Ordinary file drops are untouched, and the staging folder is released
+  when the paste ends.
 - **"Add to favorites" appeared twice in Customize this menu.** Windows registers
   an "Add to Favorites" verb that duplicates Lyre's own row. A system entry whose
   name matches one of Lyre's items in that menu is now left out, and each submenu

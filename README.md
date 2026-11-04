@@ -48,6 +48,8 @@ shell, React 19 interface.
   or the rail: a move within one volume, a copy across volumes, Shift inverts it,
   and the badge says which. Dragging past the window edge becomes a real
   operating-system drag, so files can be dropped into other applications.
+  Dragging *out of* an archive survives the archiver deleting its temporary
+  extraction folder, and a drag described as one folder arrives as every member.
   [How it works](docs/behaviour.md#drag-and-drop)
 - **Volumes, pins and safe eject.** This PC lists devices rather than mounts, a
   removable volume can be ejected without unplugging it, and folders can be
@@ -237,6 +239,10 @@ Platform differences are real and are described in
   a Windows registration exists but cannot be read, or belongs to the Windows 11
   modern menu, the customise list names it instead of quietly leaving it out.
   [Platform detail](docs/platforms.md#context-menu-items-from-other-programs)
+- Dragging files out of an archive is snapshotted on every platform, but only
+  the temp-folder names Lyre recognises are treated as extractions. Those names
+  and the remaining limit are in
+  [docs/platforms.md](docs/platforms.md#dragging-out-of-an-archive).
 - On Linux the webview itself tops out near 60 fps whatever the display does. The
   measurements are in [docs/performance.md](docs/performance.md).
 
@@ -247,9 +253,14 @@ bun run typecheck
 bun run build
 cd src-tauri && cargo test
 cd src-tauri && cargo clippy
+cd src-tauri && cargo test --lib dropstage
 # Real Windows change notification, run by hand on a desktop:
 cd src-tauri && cargo test a_saved_file_wakes_the_watcher -- --ignored --nocapture
 ```
+
+The real drag-out path still wants a hand on a desktop: open an archive with
+twenty members in 7-Zip, select them all, and drag them into a Lyre folder. All
+twenty should land there, not one folder and not nothing.
 
 ## Project layout
 
@@ -267,6 +278,7 @@ src-tauri/
   src/search.rs         matching, ranking, the walk
   src/places.rs         known folders, volumes, breadcrumbs
   src/watch.rs          change notifications for the folder on screen
+  src/dropstage.rs      snapshots of drops a source is about to delete
   src/lib.rs            commands, scan registry
 docs/                   performance, platforms, building, behaviour
 PRODUCT.md              who this is for and what it is

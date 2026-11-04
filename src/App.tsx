@@ -973,10 +973,14 @@ function Browser({
     void watchExternalDrops({
       onOver: (x, y) => setDropHighlight(x, y),
       onLeave: () => clearDropHighlight(),
-      onDrop: (x, y, paths) => {
+      onDrop: (x, y, pathsPromise) => {
+        // Where the files were released must not depend on a later repaint.
         const target = targetAt(x, y);
-        if (!target || paths.length === 0) return;
-        handleDrop(target, "copy", paths);
+        if (!target) return;
+        void pathsPromise.then((paths) => {
+          if (paths.length === 0) return;
+          handleDrop(target, "copy", paths);
+        });
       },
     })
       .then((disposeFn) => {

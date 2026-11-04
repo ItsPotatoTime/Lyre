@@ -70,7 +70,8 @@ Shipped in 0.1.0 and 0.2.0:
   walk streams deeper matches, with fuzzy and accent-insensitive matching.
 - Preview pane and thumbnails (images decoded in process, video and PDF from the
   system's own providers), drag and drop including operating-system drags out of the
-  window, hidden and protected items, and the system's own context-menu items.
+  window and drags out of archives whose temporary extraction folder is deleted,
+  hidden and protected items, and the system's own context-menu items.
 - On Windows: folder-handler registration, Win+E, and a signed self-updater.
 
 Deliberately not implemented, and said so in the interface rather than failing silently:

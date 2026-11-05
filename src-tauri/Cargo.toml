@@ -33,6 +33,15 @@ tauri-plugin-drag = "2.1.1"
 unicode-normalization = "0.1.26"
 image = { version = "0.25.6", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp", "tiff"] }
 tauri-plugin-updater = "2"
+# Local crate, no external dependencies. Shared with the patched wry so a
+# native drop can be snapshotted synchronously inside IDropTarget::Drop.
+lyre-drophook = { path = "vendor/lyre-drophook" }
+
+# Two small, documented local patches. Bump the vendored copy whenever wry or
+# drag is upgraded; see docs/platforms.md#dragging-out-of-an-archive.
+[patch.crates-io]
+wry = { path = "vendor/wry" }
+drag = { path = "vendor/drag" }
 
 # A file manager's start-up time is a feature. Optimise hard for binary size
 # and code locality rather than peak throughput.

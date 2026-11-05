@@ -736,8 +736,6 @@ dependencies = [
 [[package]]
 name = "drag"
 version = "2.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e90b4a25ace5ce0561534b073943594cbcd21af936e64d09aec444568411f8c"
 dependencies = [
  "core-graphics 0.24.0",
  "dunce",
@@ -1966,6 +1964,7 @@ name = "lyre"
 version = "0.2.0"
 dependencies = [
  "image",
+ "lyre-drophook",
  "nucleo-matcher",
  "serde",
  "serde_json",
@@ -1976,6 +1975,10 @@ dependencies = [
  "tauri-plugin-updater",
  "unicode-normalization",
 ]
+
+[[package]]
+name = "lyre-drophook"
+version = "0.1.0"
 
 [[package]]
 name = "markup5ever"
@@ -5102,8 +5105,6 @@ checksum = "3ad82d2a33cdc9674dc7465672f271e096168fcdbe0f799d9e6db8c5892679dc"
 [[package]]
 name = "wry"
 version = "0.57.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "759c50ddad0ef9913bb5496cb9d509a50433a3b78cb0238d61105526589cf0e9"
 dependencies = [
  "base64 0.23.1",
  "block2",
@@ -5119,6 +5120,7 @@ dependencies = [
  "javascriptcore-rs",
  "jni 0.21.1",
  "libc",
+ "lyre-drophook",
  "ndk",
  "objc2",
  "objc2-app-kit",

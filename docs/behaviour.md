@@ -83,27 +83,32 @@ everywhere except Windows.
 
 **Dragging out of Lyre works.** Keep dragging past the window edge and the drag
 becomes a real operating-system drag, so it can be dropped into Discord, a mail
-client, LocalSend or another file manager. The copy-or-move mode goes with it, so
-the platform shows the same cursor the badge was showing. This uses
-`tauri-plugin-drag`, whose Linux implementation is GTK-based and therefore
-backend-agnostic; it has been type-checked for Windows but the
-cross-application drag itself still wants a real try on each platform.
+client, LocalSend, Firefox or another file manager. The drag advertises both copy
+and move, so a browser that can only copy and Explorer that can move each accept
+it; the target decides. This uses `tauri-plugin-drag`, whose Linux implementation
+is GTK-based and therefore backend-agnostic. The plugin module and the drag icon
+are loaded when the window opens, because `DoDragDrop` has to start while the
+button is still down; a release that beats the handoff abandons the drag instead
+of dropping the files on the wrong window. The cross-application drag itself
+still wants a real try on each platform.
 
 Drops *from* the operating system work and are always copies, since the source may
 be on another volume or another machine.
 
 **Dragging out of an archive works.** 7-Zip and WinRAR do not hand over an archive:
 they extract the selected members into a folder such as `%TEMP%\7zE9A2F`, name
-those paths in the drag, and delete the folder as soon as the drag ends. The drag
-can also be described by that one parent folder rather than its members, which is
-why twenty files sometimes arrived as a single folder, and the paths can already
-be gone by the time the window asks to paste. Lyre snapshots the paths on the
-Rust event loop as soon as the drag enters the window — while the archiver is
-still holding them — expands the parent folder into its members, and pastes from
-a folder Lyre owns. Ordinary drops from a file manager
-are left exactly as they were, and the snapshot uses hard links rather than a
-second copy wherever the volume supports them.
-[Platform detail](platforms.md#dragging-out-of-an-archive)
+those paths in `CF_HDROP`, and delete the folder as soon as the drag ends. 7-Zip
+names only that empty folder until the button is released, then extracts inside
+`IDropTarget::Drop`. By the time Tauri's queued event reaches the webview the
+files are often gone, which is why twenty members sometimes arrived as one folder
+and sometimes not at all. A patched wry calls back into Rust synchronously at
+that exact moment, and every path under the system temp directory is held by
+hard link in a folder Lyre owns. A lone `7zE…` or `Rar$…` container is expanded
+into its members; the paste reads the stable paths and the staging folder is
+released afterwards. The rule is generic, so a browser attachment, a mail client
+or an archiver nobody has heard of gets the same treatment. Ordinary drops from a
+file manager are left exactly as they were, and a source file is never renamed
+away. [Platform detail](platforms.md#dragging-out-of-an-archive)
 
 ## Paste conflicts
 

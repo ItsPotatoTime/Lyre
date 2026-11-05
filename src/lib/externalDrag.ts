@@ -1,4 +1,5 @@
 import { isTauri, stagedDropPaths } from "./ipc";
+import { isNativeDragActive } from "./nativeDrag";
 
 /**
  * Drops coming from outside the window: Explorer, Finder, a file manager on the
@@ -71,10 +72,13 @@ export async function watchExternalDrops(
     const y = payload.position.y / ratio;
     if (payload.type === "drop") {
       clearDropHighlight();
+      // While Lyre is the drag *source*, OLE can deliver the release to this
+      // same window if the pointer never made it out. That is not an import.
+      if (isNativeDragActive()) return;
       // An archiver's extraction folder may already be gone by now. Rust took
-      // a snapshot on the event loop; handing the promise over lets the caller
-      // resolve the target synchronously while the snapshot is collected, so
-      // the paste never reads a path the source has deleted.
+      // a snapshot inside IDropTarget::Drop; handing the promise over lets the
+      // caller resolve the target synchronously while the snapshot is
+      // collected, so the paste never reads a path the source has deleted.
       handlers.onDrop(x, y, stagedDropPaths(payload.paths));
     } else {
       handlers.onOver(x, y);

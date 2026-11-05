@@ -251,28 +251,71 @@ returns. Two things then go wrong for a webview-based file manager:
   the app with `PostMessageW`. By the time the interface asks to paste, the
   source has often removed every path it just named.
 
-Lyre snapshots the paths on the first `DragEnter`, which carries the same
-`CF_HDROP` paths but arrives while the pointer is still over the window and the
-archiver is still holding its files. `Drop` is a second chance for a platform
-that sends no `Enter` paths, and the window stages what it can when it collects
-the drop if both hooks are missed. A drag described by one extraction folder is
-expanded into its members, and each member is held in a `lyre-drop-*` folder with
-a hard link, so the bytes survive the archiver's cleanup without a second copy.
-A rename and then a copy cover volumes that cannot link. The interface pastes
-from those stable paths, and the staging folder is removed when the paste
-finishes. A drag that leaves without a drop is released after a short grace
-period, in case `leave` was sent just after `drop`.
+There is a third problem, and it rules out an event-loop-only fix: 7-Zip offers
+two different `CF_HDROP` payloads. At `DragEnter` it names only the *empty* temp
+folder, and the extraction happens lazily inside the first `GetData` after the
+button is released — that is, inside `IDropTarget::Drop`. The files exist for a
+few milliseconds, between wry reading the final paths and the source's cleanup.
 
-**All platforms.** Detection is by path name and the system temp directory, not a
-Windows API, and the snapshot is `std::fs` throughout. Linux and macOS archivers
-that extract to a temp folder with one of the recognised names get the same
-treatment; a normal file drag is never copied or moved through staging. Folders
-left behind by a crashed run, or by a paste dismissed at the conflict prompt,
-are swept at the next startup once they are six hours old. A folder already
-handed to a paste is never reclaimed by a later drop, however long the copy
-takes.
+**A small patched wry closes the gap.** `vendor/wry` calls a process-global,
+dependency-free hook synchronously from `IDropTarget::Drop`, after the paths are
+collected and before `DragFinish`. At that point the files are present and the
+source still owns them. Rust hard-links every dropped path that lives under the
+system temp directory into a `lyre-drop-*` folder, expands a lone `7zE…` or
+`Rar$…` container into its members, and hands those stable paths to the paste.
+Detection is generic: any temp path counts, so an unrecognised archiver, a
+browser attachment or a mail client works without another special case. A byte
+copy covers volumes that cannot link; the source file is never renamed away,
+since it may still be open. Files outside temp are never staged. Because this
+runs on the drop target's thread the walk is bounded at 4096 items, so a source
+that names a huge temp tree cannot freeze the window. The staging folder is
+removed when the paste finishes, and a drag that leaves without a drop is
+released after a short grace period.
 
-**Known limit.** An archiver using an unrecognised temp-folder name, or one that
-deletes its files before the event loop receives `DragEnter`, still sees the old
-behaviour. Closing the gap entirely means replacing wry's `IDropTarget`, which
-would also replace every other native drop; that trade is not worth making.
+Linux and macOS have no such hook, so they use `WindowEvent::DragDrop` and the
+window's own collection as fallbacks. Both are still correct for a source that
+keeps its files until the drop, and the whole snapshot is `std::fs` throughout.
+Folders left behind by a crashed run, or by a paste dismissed at the conflict
+prompt, are swept at the next startup once they are six hours old. A folder
+already handed to a paste is never reclaimed by a later drop, however long the
+copy takes.
+
+## Dragging out of Lyre
+
+The patched `vendor/drag` advertises `DROPEFFECT_COPY | DROPEFFECT_MOVE` instead
+of a single effect. Upstream offered only the requested mode, and Lyre defaulted
+to *move* for a same-volume drag; a browser's drop target wants a copy, the two
+sets did not intersect, and the drop was refused. Explorer still moves when it
+moves, and a web page can copy. Lyre never deletes the source itself: an
+optimised move belongs to the target.
+
+`DoDragDrop` is a modal loop that must start while the button is down. The
+plugin module and the drag icon are now warmed at startup, leaving one IPC call
+on the handoff path; a pointer release that arrives first abandons the drag
+instead of dropping the files onto whatever window is under the cursor. A drop
+delivered to Lyre's own window while it is the drag source is ignored.
+
+## Maintaining the vendored patches
+
+`src-tauri/Cargo.toml` has a `[patch.crates-io]` section pointing at
+`vendor/wry` (0.57.1) and `vendor/drag` (2.1.1), plus the local
+`vendor/lyre-drophook` crate that both wry and Lyre share. The changes are
+marked with `Lyre patch` comments:
+
+- `vendor/wry/src/webview2/drag_drop.rs` — invoke the hook on `Enter`, `Drop`
+  and `Leave`; the `Drop` call is the important one.
+- `vendor/drag/src/platform_impl/windows/mod.rs` — offer both drop effects.
+
+When either dependency is upgraded, copy the fresh source into `vendor/` and
+reapply those comments; `cargo check` will fail loudly if the hook is missing,
+because `dropstage::install()` registers the callback.
+
+**Known limits.** A source that offers only `CFSTR_FILEDESCRIPTOR` /
+`CFSTR_FILECONTENTS` (Outlook attachments are the usual example) and no
+`CF_HDROP` is still invisible to wry; materialising those virtual files is a
+separate patch. A desktop drag that starts too late to be handed over before
+the button comes up is abandoned rather than misdirected. And a *folder* dropped
+onto a web page depends on that page: Firefox exposes directories through
+`webkitGetAsEntry()`, and Seafile's web interface reads only
+`dataTransfer.files`, so it cannot traverse an external folder in any browser.
+Lyre cannot change what the receiving page asks for.

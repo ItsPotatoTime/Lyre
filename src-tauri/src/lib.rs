@@ -696,17 +696,17 @@ pub fn run() {
         })
         .manage(AppState::default())
         .manage(watch::WatchState::default())
-        .manage(dropstage::DropState::default())
+        .manage(dropstage::install())
         .on_window_event(move |window, event| {
-            // wry's `IDropTarget::Drop` only posts a message to this loop; by
-            // the time it is read, an archiver may already have deleted its
-            // extraction folder. `DragEnter` carries the same paths while the
-            // drag is still live, so snapshot there first and keep `Drop` as a
-            // second chance for a platform that sends no `Enter` paths.
+            // On Windows the patched wry snapshots the drop synchronously,
+            // inside IDropTarget::Drop, while the source still holds its temp
+            // files. This queued event is only a fallback for platforms without
+            // that hook, and a no-op when the hook already did the work.
+            // `Enter` is deliberately not staged: 7-Zip names an empty temp
+            // folder there and extracts the members later.
             if let tauri::WindowEvent::DragDrop(drag) = event {
                 match drag {
-                    tauri::DragDropEvent::Enter { paths, .. }
-                    | tauri::DragDropEvent::Drop { paths, .. } => {
+                    tauri::DragDropEvent::Drop { paths, .. } => {
                         let state = window.state::<dropstage::DropState>();
                         dropstage::stage_early(paths.clone(), &state);
                     }

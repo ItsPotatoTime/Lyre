@@ -64,7 +64,7 @@ import {
 } from "@/lib/library";
 import { targetAt, useDrag, type DragTarget, type DropMode } from "@/lib/dragAndDrop";
 import { sameVolume } from "@/lib/volumes";
-import { startNativeDrag } from "@/lib/nativeDrag";
+import { startNativeDrag, warmNativeDrag } from "@/lib/nativeDrag";
 import {
   clearDropHighlight,
   setDropHighlight,
@@ -969,6 +969,10 @@ function Browser({
   useEffect(() => {
     let dispose: (() => void) | null = null;
     let cancelled = false;
+
+    // DoDragDrop has to start while the button is down; load its modules now,
+    // not on the first drag to the window edge.
+    warmNativeDrag();
 
     void watchExternalDrops({
       onOver: (x, y) => setDropHighlight(x, y),

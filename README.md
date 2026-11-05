@@ -50,6 +50,9 @@ shell, React 19 interface.
   operating-system drag, so files can be dropped into other applications.
   Dragging *out of* an archive survives the archiver deleting its temporary
   extraction folder, and a drag described as one folder arrives as every member.
+  Any app that drags files out of a temp folder — 7-Zip, WinRAR, a browser, a
+  mail client — gets the same treatment, and an outgoing drag offers both copy
+  and move so browsers accept it too.
   [How it works](docs/behaviour.md#drag-and-drop)
 - **Volumes, pins and safe eject.** This PC lists devices rather than mounts, a
   removable volume can be ejected without unplugging it, and folders can be
@@ -239,10 +242,13 @@ Platform differences are real and are described in
   a Windows registration exists but cannot be read, or belongs to the Windows 11
   modern menu, the customise list names it instead of quietly leaving it out.
   [Platform detail](docs/platforms.md#context-menu-items-from-other-programs)
-- Dragging files out of an archive is snapshotted on every platform, but only
-  the temp-folder names Lyre recognises are treated as extractions. Those names
-  and the remaining limit are in
-  [docs/platforms.md](docs/platforms.md#dragging-out-of-an-archive).
+- A synchronous snapshot inside `IDropTarget::Drop` needs a small, documented
+  patch to wry, and the outgoing drag needs one to `drag`. Both live under
+  `src-tauri/vendor/`; upgrading either dependency means reapplying the
+  `Lyre patch` comments. Sources that offer only virtual file descriptors
+  instead of `CF_HDROP`, and web pages that cannot traverse a dropped folder,
+  remain limited by the other side.
+  [Platform detail](docs/platforms.md#dragging-out-of-an-archive)
 - On Linux the webview itself tops out near 60 fps whatever the display does. The
   measurements are in [docs/performance.md](docs/performance.md).
 
@@ -254,13 +260,16 @@ bun run build
 cd src-tauri && cargo test
 cd src-tauri && cargo clippy
 cd src-tauri && cargo test --lib dropstage
+cd src-tauri && cargo test -p lyre-drophook
 # Real Windows change notification, run by hand on a desktop:
 cd src-tauri && cargo test a_saved_file_wakes_the_watcher -- --ignored --nocapture
 ```
 
-The real drag-out path still wants a hand on a desktop: open an archive with
-twenty members in 7-Zip, select them all, and drag them into a Lyre folder. All
-twenty should land there, not one folder and not nothing.
+The real drag paths still want a hand on a desktop. Open an archive with twenty
+members in 7-Zip, select them all, and drag them into a Lyre folder: all twenty
+should land there. Then drag a file (and a folder) from Lyre into Explorer,
+Firefox and a Seafile tab. A folder into a web page depends on that page's own
+`webkitGetAsEntry()` support; Seafile's web interface does not have it.
 
 ## Project layout
 
@@ -280,6 +289,9 @@ src-tauri/
   src/watch.rs          change notifications for the folder on screen
   src/dropstage.rs      snapshots of drops a source is about to delete
   src/lib.rs            commands, scan registry
+  vendor/wry/           patched wry: a synchronous hook in IDropTarget::Drop
+  vendor/drag/          patched drag: advertise copy and move together
+  vendor/lyre-drophook/ the local, dependency-free bridge between them
 docs/                   performance, platforms, building, behaviour
 PRODUCT.md              who this is for and what it is
 DESIGN.md               the visual system, as built

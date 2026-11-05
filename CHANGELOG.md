@@ -42,16 +42,22 @@ release notes rather than a second copy of them.
 
 ### Fixed
 
-- **Dragging out of 7-Zip or WinRAR no longer loses most of the archive.** An
-  archiver extracts the selected members into a temp folder (`7zE…`, `Rar$…`),
-  can describe the whole drag as that one parent folder, and deletes it when
-  `DoDragDrop` returns — after wry has read the paths but before Tauri's queued
-  event reaches the webview. That showed up as one folder arriving out of twenty,
-  or nothing at all. The paths are now snapshotted when the drag first enters the
-  window, while the archiver is still holding them; the parent folder is expanded
-  into its members, and the paste reads hard links in a Lyre-owned staging
-  folder. Ordinary file drops are untouched, and the staging folder is released
-  when the paste ends.
+- **Dragging out of 7-Zip, WinRAR or any other app now arrives intact.** An
+  archiver extracts into a temp folder and deletes it when `DoDragDrop` returns —
+  after wry has read `CF_HDROP` but before Tauri's queued event reaches the
+  webview. Worse, 7-Zip names only the *empty* temp folder at `DragEnter` and
+  extracts the members inside `IDropTarget::Drop`. A small documented patch to
+  wry calls back into Rust at exactly that moment, while the bytes exist; every
+  path under the system temp directory is held by hard link in a Lyre-owned
+  folder until the paste finishes. Detection is generic, so an unrecognised
+  archiver, browser or mail client works without a special case. Files outside
+  temp are never touched, and a source file is never renamed away.
+- **Dragging out of Lyre works with browsers and other copy-only targets.** The
+  drag source now advertises both copy and move rather than a single effect, so
+  the target picks the one it supports. Its plugin module and icon are warmed at
+  startup, because `DoDragDrop` has to begin while the button is still down; a
+  release that arrives first abandons the drag instead of dropping the files on
+  whatever window is under the cursor.
 - **"Add to favorites" appeared twice in Customize this menu.** Windows registers
   an "Add to Favorites" verb that duplicates Lyre's own row. A system entry whose
   name matches one of Lyre's items in that menu is now left out, and each submenu

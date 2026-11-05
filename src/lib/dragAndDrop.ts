@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef } from "react";
+import { notePointerRelease } from "./nativeDrag";
 
 /**
  * Dragging, driven by pointer events rather than HTML5 drag and drop.
@@ -10,9 +11,10 @@ import { useCallback, useEffect, useRef } from "react";
  * events are ours on every platform, and they let us draw the move/copy badge
  * and the drop highlight exactly.
  *
- * What is not covered, because it needs an operating-system drag source that
- * Tauri does not provide: dragging an item *out* of Lyre, into Explorer, the
- * desktop, or another Lyre window.
+ * A drag that reaches the window edge is handed to the operating system so it
+ * can finish in Explorer, a browser or another Lyre window. That handoff has to
+ * happen while the button is still down: `nativeDrag` warms its modules at
+ * startup and refuses to start an OS drag after the pointer was released.
  */
 
 export type DragTarget =
@@ -175,6 +177,7 @@ export function useDrag(
   }, []);
 
   const cancel = useCallback(() => {
+    notePointerRelease();
     release();
     clearHighlight();
     hideBadge();
@@ -247,6 +250,9 @@ export function useDrag(
     };
 
     const onUp = (event: PointerEvent) => {
+      // Count the release even when the session has already been handed to the
+      // operating system, so a late DoDragDrop cannot fire at the wrong target.
+      notePointerRelease();
       const current = session.current;
       if (!current) return;
       // Clear the highlight while the session still knows which element it

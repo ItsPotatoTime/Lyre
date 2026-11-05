@@ -12,6 +12,7 @@
     "preview": "vite preview",
     "app:build": "tauri build",
     "typecheck": "tsc --noEmit",
+    "test:dropzone": "bun run src/lib/backgroundDropZone.test.ts",
     "tauri": "tauri",
     "buildit": "bun run scripts/buildit.ts"
   },

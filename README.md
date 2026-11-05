@@ -257,6 +257,7 @@ Platform differences are real and are described in
 ```bash
 bun run typecheck
 bun run build
+bun run test:dropzone
 cd src-tauri && cargo test
 cd src-tauri && cargo clippy
 cd src-tauri && cargo test --lib dropstage
@@ -266,10 +267,12 @@ cd src-tauri && cargo test a_saved_file_wakes_the_watcher -- --ignored --nocaptu
 ```
 
 The real drag paths still want a hand on a desktop. Open an archive with twenty
-members in 7-Zip, select them all, and drag them into a Lyre folder: all twenty
-should land there. Then drag a file (and a folder) from Lyre into Explorer,
-Firefox and a Seafile tab. A folder into a web page depends on that page's own
-`webkitGetAsEntry()` support; Seafile's web interface does not have it.
+members in 7-Zip, select them all, and drag them onto a folder row; then open
+that folder — empty or not — and drop onto its background, column header and
+preview pane. All twenty should land there every time. Then drag a file (and a
+folder) from Lyre into Explorer, Firefox and a Seafile tab. A folder into a web
+page depends on that page's own `webkitGetAsEntry()` support; Seafile's web
+interface does not have it.
 
 ## Project layout
 

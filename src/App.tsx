@@ -62,7 +62,13 @@ import {
   saveLibrary,
   type Library,
 } from "@/lib/library";
-import { targetAt, useDrag, type DragTarget, type DropMode } from "@/lib/dragAndDrop";
+import {
+  backgroundDropZone,
+  targetAt,
+  useDrag,
+  type DragTarget,
+  type DropMode,
+} from "@/lib/dragAndDrop";
 import { sameVolume } from "@/lib/volumes";
 import { startNativeDrag, warmNativeDrag } from "@/lib/nativeDrag";
 import {
@@ -360,6 +366,9 @@ function Browser({
   );
 
   const showsFiles = location.kind === "folder" || location.kind === "gallery";
+  // Any point in the content area that is not a specific row or breadcrumb is
+  // a drop into this folder. Home and This PC are deliberately excluded.
+  const contentDropZone = backgroundDropZone(location.path, showsFiles);
   const dir = useDirectory(
     showsFiles ? location.path : "",
     showHidden,
@@ -2295,7 +2304,7 @@ function Browser({
             }}
           />
         ) : null}
-        <main className="content">
+        <main className="content" {...contentDropZone}>
           {location.kind === "home" && !searching ? (
             <HomeView
               places={quickAccess}
@@ -2389,6 +2398,7 @@ function Browser({
           <PreviewPane
             entry={previewEntry}
             onClose={() => setPreviewOpen(false)}
+            dropZone={contentDropZone}
           />
         ) : null}
 

@@ -93,7 +93,10 @@ of dropping the files on the wrong window. The cross-application drag itself
 still wants a real try on each platform.
 
 Drops *from* the operating system work and are always copies, since the source may
-be on another volume or another machine.
+be on another volume or another machine. A drop on a row goes into that folder;
+a drop anywhere else in the content area — including an empty folder, the column
+header or the preview pane — goes into the folder currently on screen. Home and
+This PC have no directory of their own, so their empty space is not a drop zone.
 
 **Dragging out of an archive works.** 7-Zip and WinRAR do not hand over an archive:
 they extract the selected members into a folder such as `%TEMP%\7zE9A2F`, name

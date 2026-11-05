@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import type { Entry } from "@/types";
+import type { BackgroundDropZone } from "@/lib/dragAndDrop";
 import { previewInfo, previewThumbnail, type PreviewInfo } from "@/lib/ipc";
 import { formatDate, formatSize, typeLabel } from "@/lib/format";
 import { Icon } from "./Icons";
@@ -15,10 +16,13 @@ import { Icon } from "./Icons";
 export function PreviewPane({
   entry,
   onClose,
+  dropZone,
 }: {
   entry: Entry | null;
   /** Hides the pane; the More menu puts it back. */
   onClose: () => void;
+  /** Makes the pane part of the folder's background drop area. */
+  dropZone?: BackgroundDropZone;
 }) {
   const [info, setInfo] = useState<PreviewInfo | null>(null);
   const [picture, setPicture] = useState<string | null>(null);
@@ -62,7 +66,7 @@ export function PreviewPane({
   const modified = info?.modifiedMs ? formatDate(info.modifiedMs) : null;
 
   return (
-    <aside className="preview" aria-label="Preview">
+    <aside className="preview" aria-label="Preview" {...dropZone}>
       <div className="preview-header">
         <span className="preview-heading">Preview</span>
         <button

@@ -64,6 +64,48 @@ interface DragSession {
 const EMPTY: DragTarget | null = null;
 
 /**
+ * The attributes that make a region stand for "the folder on screen".
+ *
+ * The file-list scroller carries these only while it has rows to render. An
+ * empty folder shows a status panel instead, and the column header and status
+ * bar are siblings of the scroller, so a drop on any of them used to find no
+ * `data-drop` ancestor at all and was silently discarded. Putting the zone on
+ * the content area itself covers all of them; a nearer zone (a folder row, a
+ * breadcrumb, a tab) still wins because `closest` walks from the hit element.
+ *
+ * Home and This PC have no directory of their own, so they must not be given a
+ * paste destination — their path is a label, not a filesystem path.
+ */
+export interface BackgroundDropZone {
+  "data-drop"?: "background";
+  "data-path"?: string;
+}
+
+export function backgroundDropZone(
+  path: string,
+  enabled: boolean,
+): BackgroundDropZone {
+  return enabled && path ? { "data-drop": "background", "data-path": path } : {};
+}
+
+/**
+ * Turn a resolved `data-drop` element into a target. Kept separate from the
+ * hit test so the attribute contract can be checked without a DOM.
+ */
+export function zoneTarget(
+  zone: { dataset: DOMStringMap } | null,
+): DragTarget | null {
+  const kind = zone?.dataset.drop;
+  const path = zone?.dataset.path ?? "";
+  if (kind === "folder" && path) return { kind: "folder", path };
+  if (kind === "tab" && path) {
+    return { kind: "tab", id: zone?.dataset.tab ?? "", path };
+  }
+  if (kind === "background" && path) return { kind: "background", path };
+  return null;
+}
+
+/**
  * Decide what a point is over, from the `data-drop` attributes the interface
  * puts on its drop zones. One mechanism covers rows, breadcrumbs, tabs, the
  * navigation rail and the empty area behind them.
@@ -71,16 +113,7 @@ const EMPTY: DragTarget | null = null;
 export function targetAt(x: number, y: number): DragTarget | null {
   const element = document.elementFromPoint(x, y);
   const zone = element?.closest("[data-drop]") as HTMLElement | null;
-  if (!zone) return null;
-
-  const kind = zone.dataset.drop;
-  const path = zone.dataset.path ?? "";
-  if (kind === "folder" && path) return { kind: "folder", path };
-  if (kind === "tab" && path) {
-    return { kind: "tab", id: zone.dataset.tab ?? "", path };
-  }
-  if (kind === "background" && path) return { kind: "background", path };
-  return null;
+  return zoneTarget(zone);
 }
 
 export function useDrag(

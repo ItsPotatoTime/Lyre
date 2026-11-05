@@ -58,6 +58,14 @@ release notes rather than a second copy of them.
   startup, because `DoDragDrop` has to begin while the button is still down; a
   release that arrives first abandons the drag instead of dropping the files on
   whatever window is under the cursor.
+- **Dropping onto the background of an open folder now works.** The background
+  drop zone used to live only on the file-list scroller, which is not rendered
+  for an empty folder; the column header and status bar are its siblings. A drop
+  on any of them found no target and was silently discarded, while dropping on a
+  folder row worked because rows carry their own zone. The content area and the
+  preview pane now stand for the folder on screen, and nearer zones still win.
+  Home and This PC are deliberately excluded: their paths are labels, not
+  directories.
 - **"Add to favorites" appeared twice in Customize this menu.** Windows registers
   an "Add to Favorites" verb that duplicates Lyre's own row. A system entry whose
   name matches one of Lyre's items in that menu is now left out, and each submenu

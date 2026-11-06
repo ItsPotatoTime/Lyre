@@ -177,12 +177,14 @@ if (flag("rune")) {
   if (!existsSync(join(root, "rune-ui", "Cargo.toml"))) {
     fail("rune-ui/Cargo.toml is missing; this checkout has no native crate.");
   }
-  requireTool("cargo", "Install Rust from https://rustup.rs.");
-  const { runeCargo } = await import("./rune-toolchain.ts");
+  // The Rune launcher resolves the rustup shim itself; `requireTool` would
+  // only re-check the caller's PATH and reject a terminal opened before Rust
+  // was installed, which is exactly the case the launcher works around.
+  const { runeCargo, cargoBin } = await import("./rune-toolchain.ts");
   if (dryRun) {
     console.log(
       colour.dim(
-        `  would run: cargo build${debug ? "" : " --release"} --manifest-path rune-ui/Cargo.toml`,
+        `  would run: ${cargoBin()} build${debug ? "" : " --release"} --manifest-path rune-ui/Cargo.toml`,
       ),
     );
   } else {

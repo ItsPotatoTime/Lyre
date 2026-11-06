@@ -5,27 +5,24 @@
 //! Tauri webview. The default window reads a real directory; named scenes
 //! reproduce the four reference views so a headless PNG can be compared to them.
 //!
-//!   cargo run
+//!   bun dev:rune
+//!   bun buildit --rune
 //!   cargo run -- --snap downloads.png --scene downloads --size 1076x600 --scale 1
-//!   cargo run -- --snap home.png      --scene home
-//!   cargo run -- --snap pictures.png  --scene pictures
-//!   cargo run -- --snap thispc.png    --scene thispc
-//!   cargo run -- --snap light.png     --scene light
-//!   LYRE_RUNE_PATH=... cargo run
 //!
-//! Out of scope for this slice: independent tab history, real search, sorting,
-//! file operations, OS drag-and-drop, system context menus, thumbnails, the
-//! reveal highlight, and the Segoe UI Variable face (Rune ships Inter).
+//! Out of scope for this slice: independent tab history, file operations, OS
+//! drag-and-drop, system context menus, thumbnails, the reveal highlight, and
+//! the Segoe UI Variable face (Rune ships Inter).
 
 use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Instant, UNIX_EPOCH};
 
 use rune::color::hex;
 use rune::{
-    Align, AppSpec, Color, Cx, El, GrowthSpec, LineCap, ScrollSpec, Shape, TextStyle, canvas, col,
-    el, row, text,
+    Align, AppSpec, Color, Cx, El, GrowthSpec, LineCap, ScrollSpec, Shape, Spring, TextEdit,
+    TextStyle, Tx, WindowOptions, WindowSpec, canvas, col, el, row, run_windows, text, text_input,
 };
 
 // Metrics sampled from the reference captures (1076x600 window).
@@ -77,33 +74,43 @@ struct Paint {
 fn paint(dark: bool, scale: f32) -> Paint {
     let hair = 1.0 / scale;
     if dark {
+        // DESIGN.md: Mica is faked here with a 2–3% accent wash over the
+        // chrome tones. The work area gets half as much, so the whole window
+        // reads blue-grey rather than neutral grey, the way Explorer does on a
+        // tinted wallpaper. Nothing else in the shell is tinted.
+        let accent = c("#60cdff");
+        let accent_fill = c("#0078d4");
+        let chrome = c("#1f1f1f").mix(accent, 0.030);
         Paint {
-            title: c("#0a0a0a"),
-            chrome: c("#1f1f1f"),
-            tab: c("#1f1f1f"),
-            content: c("#191919"),
-            status: c("#1c1c1c"),
-            field: c("#2c2c2c"),
+            title: c("#0a0a0a").mix(accent, 0.020),
+            chrome,
+            tab: chrome,
+            content: c("#191919").mix(accent, 0.014),
+            status: c("#1c1c1c").mix(accent, 0.024),
+            field: c("#2c2c2c").mix(accent, 0.018),
             line: c("#3a3a3a"),
             soft_line: c("#2b2b2b"),
             text: c("#ffffff"),
             secondary: c("#c8c8c8"),
             tertiary: c("#9a9a9a"),
             disabled: c("#6b6b6b"),
-            accent: c("#60cdff"),
-            accent_fill: c("#0078d4"),
+            accent,
+            accent_fill,
             hover: Color::WHITE.alpha(0.055),
-            rail_sel: c("#333333"),
-            row_sel: c("#60cdff").alpha(0.16),
+            rail_sel: c("#333333").mix(accent, 0.07),
+            row_sel: accent.alpha(0.16),
             hair,
         }
     } else {
+        let accent = c("#005fb8");
+        let accent_fill = c("#0078d4");
+        let chrome = c("#f5f5f5").mix(accent, 0.025);
         Paint {
-            title: c("#e8e8e8"),
-            chrome: c("#f5f5f5"),
+            title: c("#e8e8e8").mix(accent, 0.018),
+            chrome,
             tab: c("#ffffff"),
             content: c("#ffffff"),
-            status: c("#f5f5f5"),
+            status: chrome,
             field: c("#ffffff"),
             line: c("#dcdcdc"),
             soft_line: c("#ebebeb"),
@@ -111,11 +118,11 @@ fn paint(dark: bool, scale: f32) -> Paint {
             secondary: c("#5c5d5e"),
             tertiary: c("#767778"),
             disabled: c("#9a9b9c"),
-            accent: c("#005fb8"),
-            accent_fill: c("#0078d4"),
+            accent,
+            accent_fill,
             hover: Color::BLACK.alpha(0.045),
-            rail_sel: c("#e4e4e4"),
-            row_sel: c("#005fb8").alpha(0.11),
+            rail_sel: c("#e4e4e4").mix(accent, 0.07),
+            row_sel: accent.alpha(0.11),
             hair,
         }
     }
@@ -214,6 +221,25 @@ fn app_color(name: &str) -> &'static str {
     PALETTE[(h as usize) % PALETTE.len()]
 }
 
+/// Wayfinding colour for the navigation rail. Each place owns a hue, muted so
+/// it reads as a mark rather than decoration; the accent itself stays reserved
+/// for selection and action.
+fn place_color(index: usize) -> &'static str {
+    match index {
+        0 => "#60cdff", // Home
+        1 => "#4fb8a8", // Gallery
+        2 => "#3b82c4", // OneDrive
+        3 => "#5b8fd6", // Desktop
+        4 => "#1f9e6e", // Downloads
+        5 => "#2f6fd0", // Documents
+        6 => "#1f9e6e", // Pictures
+        7 => "#e0518c", // Music
+        8 => "#8b5cf6", // Videos
+        9 => "#60cdff", // This PC
+        _ => "#4a90d9", // Network
+    }
+}
+
 #[derive(Clone)]
 struct Entry {
     name: String,
@@ -262,11 +288,26 @@ struct App {
     entries: Vec<Entry>,
     /// (row index where the group starts, label).
     groups: Vec<(usize, String)>,
+    /// Row indices into `entries` after search and sort. Never built rows.
+    visible: Vec<usize>,
     selected: Option<usize>,
     focused: Option<usize>,
     nav: usize,
     count: usize,
     selection_detail: String,
+    notice: String,
+    search_edit: TextEdit,
+    last_query: String,
+    history: Vec<PathBuf>,
+    forward: Vec<PathBuf>,
+    sort: u8,
+    /// Fixture views arrive in the authored order of the reference captures;
+    /// only a real directory scan is sorted by the active column.
+    keep_order: bool,
+    /// Home/This PC report the authored item count, not just the rows drawn.
+    count_override: Option<usize>,
+    zoom: bool,
+    zoom_size: (f32, f32),
     scan_ms: f64,
 }
 
@@ -369,6 +410,145 @@ fn make_entry(name: &str, modified: &str, type_label: &str, size: &str, kind: Ki
     }
 }
 
+/// Primary display work area in points. A borderless window has no system zoom
+/// button, so the drawn one needs a size to grow into.
+static WORK_AREA: OnceLock<(f32, f32)> = OnceLock::new();
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)
+}
+
+fn place_path(index: usize) -> Option<PathBuf> {
+    let home = home_dir()?;
+    let sub = match index {
+        1 | 6 => "Pictures",
+        2 => return std::env::var_os("OneDrive").map(PathBuf::from),
+        3 => "Desktop",
+        4 => "Downloads",
+        5 => "Documents",
+        7 => "Music",
+        8 => "Videos",
+        _ => return None,
+    };
+    Some(home.join(sub))
+}
+
+/// Recompute the row order after a scan, a search keystroke, or a sort click.
+/// The list stays virtualised: this only holds indices, never built rows.
+fn refresh_visible(s: &mut App) {
+    let q = s.search_edit.text.to_lowercase();
+    let mut order: Vec<usize> = (0..s.entries.len())
+        .filter(|&i| q.is_empty() || s.entries[i].name.to_lowercase().contains(&q))
+        .collect();
+    if !s.keep_order {
+        match s.sort {
+            1 => order.sort_by(|&a, &b| s.entries[a].modified.cmp(&s.entries[b].modified)),
+            2 => order.sort_by(|&a, &b| s.entries[a].type_label.cmp(&s.entries[b].type_label)),
+            3 => order.sort_by_key(|&i| s.entries[i].size),
+            _ => order.sort_by(|&a, &b| {
+                (!s.entries[a].is_dir, s.entries[a].name.to_lowercase())
+                    .cmp(&(!s.entries[b].is_dir, s.entries[b].name.to_lowercase()))
+            }),
+        }
+    }
+    s.count = s.count_override.unwrap_or(order.len());
+    s.visible = order;
+}
+
+/// Rune calls this before each frame. Search edits land in `TextEdit` through
+/// `on_edit`, which only binds the field, so the row order is recomputed here.
+fn poll(s: &mut App, _t: f64, _tx: &mut Tx) -> bool {
+    if s.search_edit.text == s.last_query {
+        return false;
+    }
+    s.last_query = s.search_edit.text.clone();
+    refresh_visible(s);
+    true
+}
+
+fn set_location(s: &mut App, path: PathBuf) {
+    let (entries, scan_ms) = scan(&path);
+    let crumbs: Vec<String> = path
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy().into_owned())
+        .filter(|part| part != "\\" && part != "/")
+        .collect();
+    let tab = crumbs.last().cloned().unwrap_or_else(|| "Lyre".into());
+    s.root = path;
+    s.entries = entries;
+    s.scan_ms = scan_ms;
+    s.crumbs = crumbs;
+    s.tab = tab.clone();
+    s.search = format!("Search {tab}");
+    s.search_edit.text.clear();
+    s.view = View::Files;
+    s.mode = Mode::Details;
+    s.preview = false;
+    s.contextual = false;
+    s.groups.clear();
+    s.selected = None;
+    s.focused = None;
+    s.selection_detail.clear();
+    s.notice.clear();
+    s.sort = 0;
+    s.keep_order = false;
+    s.count_override = None;
+    refresh_visible(s);
+}
+
+fn go(s: &mut App, path: PathBuf) {
+    if path == s.root {
+        return;
+    }
+    s.history.push(s.root.clone());
+    s.forward.clear();
+    set_location(s, path);
+}
+
+fn go_back(s: &mut App) {
+    if let Some(previous) = s.history.pop() {
+        s.forward.push(s.root.clone());
+        set_location(s, previous);
+    } else {
+        s.notice = "Nothing to go back to".into();
+    }
+}
+
+fn go_forward(s: &mut App) {
+    if let Some(next) = s.forward.pop() {
+        s.history.push(s.root.clone());
+        set_location(s, next);
+    } else {
+        s.notice = "Nothing to go forward to".into();
+    }
+}
+
+fn go_up(s: &mut App) {
+    if let Some(parent) = s.root.parent().map(Path::to_path_buf) {
+        go(s, parent);
+    } else {
+        s.notice = "Already at the root".into();
+    }
+}
+
+fn navigate(s: &mut App, index: usize) {
+    match index {
+        0 => load(s, Fixture::Home),
+        9 => load(s, Fixture::ThisPc),
+        10 => s.notice = "Network browsing is not implemented in this slice".into(),
+        i => {
+            s.nav = i;
+            match place_path(i) {
+                Some(path) if path.is_dir() => go(s, path),
+                Some(path) => s.notice = format!("{} is not available here", path.display()),
+                None => s.notice = "This place is not available here".into(),
+            }
+        }
+    }
+}
+
 fn load(s: &mut App, f: Fixture) {
     s.groups.clear();
     s.preview = false;
@@ -376,6 +556,8 @@ fn load(s: &mut App, f: Fixture) {
     s.mode = Mode::Details;
     s.selected = None;
     s.focused = None;
+    s.notice.clear();
+    s.search_edit.text.clear();
     match f {
         Fixture::Home => {
             s.view = View::Home;
@@ -598,6 +780,11 @@ fn load(s: &mut App, f: Fixture) {
             )];
         }
     }
+    let authored_count = s.count;
+    s.keep_order = true;
+    s.count_override = Some(authored_count);
+    s.sort = 0;
+    refresh_visible(s);
 }
 
 fn init() -> App {
@@ -612,7 +799,7 @@ fn init() -> App {
         .collect();
     let tab = crumbs.last().cloned().unwrap_or_else(|| "Lyre".into());
     let count = entries.len();
-    App {
+    let mut app = App {
         dark: true,
         view: View::Files,
         mode: Mode::Details,
@@ -624,13 +811,26 @@ fn init() -> App {
         tab,
         entries,
         groups: Vec::new(),
+        visible: Vec::new(),
         selected: None,
         focused: None,
         nav: 9,
         count,
         selection_detail: String::new(),
+        notice: String::new(),
+        search_edit: TextEdit::default(),
+        last_query: String::new(),
+        history: Vec::new(),
+        forward: Vec::new(),
+        sort: 0,
+        keep_order: false,
+        count_override: None,
+        zoom: false,
+        zoom_size: WORK_AREA.get().copied().unwrap_or((1600.0, 900.0)),
         scan_ms,
-    }
+    };
+    refresh_visible(&mut app);
+    app
 }
 
 // ---------------------------------------------------------------- icons ----
@@ -1128,7 +1328,7 @@ fn tab_strip(s: &App, p: Paint) -> El {
         .px(10.0)
         .gap(8.0)
         .items_center()
-        .child(ico(p, Ico::Home, 14.0, c(kind_hex(Kind::Folder))))
+        .child(ico(p, Ico::Home, 14.0, c(place_color(s.nav))))
         .child(text(s.tab.as_str()).font(CAPTION).color(p.text).truncate())
         .child(el().grow(1.0))
         .child(text("×").font(CAPTION).color(p.tertiary));
@@ -1140,6 +1340,9 @@ fn tab_strip(s: &App, p: Paint) -> El {
         .items_end()
         .px(8.0)
         .gap(4.0)
+        // A borderless window has no system titlebar. This band is it: drag to
+        // move, double press to zoom, and the drawn controls below to close.
+        .window_drag()
         .child(tab)
         .child(
             el().key("new-tab")
@@ -1147,31 +1350,55 @@ fn tab_strip(s: &App, p: Paint) -> El {
                 .radius(4.0)
                 .hover(p.hover)
                 .center()
-                .child(text("+").font(BODY).color(p.secondary)),
+                .child(text("+").font(BODY).color(p.secondary))
+                .on_press(|s: &mut App| {
+                    s.notice = "New tabs are not implemented in this slice".into()
+                }),
         )
         .child(el().grow(1.0));
-    for (i, w) in [Ico::Minimize, Ico::Maximize, Ico::Close]
-        .iter()
-        .enumerate()
-    {
+    let controls = [
+        (Ico::Minimize, "win-min"),
+        (Ico::Maximize, "win-max"),
+        (Ico::Close, "win-close"),
+    ];
+    for (i, (which, key)) in controls.iter().enumerate() {
         strip = strip.child(
-            el().key(format!("win-{i}"))
+            el().key(*key)
                 .size(46.0, 32.0)
                 .hover(p.hover)
                 .center()
-                .child(ico(p, *w, 14.0, p.secondary)),
+                .child(ico(p, *which, 14.0, p.secondary))
+                .on_press_tx(move |s: &mut App, tx: &mut Tx| match i {
+                    0 => tx.minimize(),
+                    1 => {
+                        s.zoom = !s.zoom;
+                        let size = if s.zoom { s.zoom_size } else { (1076.0, 600.0) };
+                        tx.resize_window(size);
+                        tx.center_window();
+                    }
+                    _ => tx.close_window(),
+                }),
         );
     }
     strip
 }
 
-fn nav_button(p: Paint, which: Ico, key: &str) -> El {
+fn nav_button(p: Paint, which: Ico, key: &str, action: usize) -> El {
     el().key(key)
         .size(30.0, 30.0)
         .radius(4.0)
         .hover(p.hover)
         .center()
         .child(ico(p, which, 15.0, p.secondary))
+        .on_press(move |s: &mut App| match action {
+            0 => go_back(s),
+            1 => go_forward(s),
+            2 => go_up(s),
+            _ => {
+                let path = s.root.clone();
+                set_location(s, path);
+            }
+        })
 }
 
 fn address_row(s: &App, p: Paint) -> El {
@@ -1203,10 +1430,10 @@ fn address_row(s: &App, p: Paint) -> El {
         .px(8.0)
         .gap(2.0)
         .items_center()
-        .child(nav_button(p, Ico::Back, "back"))
-        .child(nav_button(p, Ico::Forward, "forward"))
-        .child(nav_button(p, Ico::Up, "up"))
-        .child(nav_button(p, Ico::Refresh, "refresh"))
+        .child(nav_button(p, Ico::Back, "back", 0))
+        .child(nav_button(p, Ico::Forward, "forward", 1))
+        .child(nav_button(p, Ico::Up, "up", 2))
+        .child(nav_button(p, Ico::Refresh, "refresh", 3))
         .child(el().w(8.0))
         .child(crumb)
         .child(
@@ -1218,10 +1445,19 @@ fn address_row(s: &App, p: Paint) -> El {
                 .fill(p.field)
                 .border(p.hair, p.line)
                 .px(10.0)
+                .gap(6.0)
                 .items_center()
-                .child(text(s.search.as_str()).font(CAPTION).color(p.tertiary))
-                .child(el().grow(1.0))
-                .child(ico(p, Ico::Search, 14.0, p.tertiary)),
+                .child(
+                    text_input(&s.search_edit, CAPTION)
+                        .key("search-field")
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .single_line()
+                        .color(p.text)
+                        .placeholder(s.search.as_str(), p.tertiary)
+                        .on_edit(|s: &mut App| &mut s.search_edit),
+                )
+                .child(ico(p, Ico::Search, 14.0, p.accent)),
         )
 }
 
@@ -1255,6 +1491,18 @@ fn text_button(p: Paint, which: Ico, label: &str, chevron: bool, dim: bool) -> E
     b
 }
 
+fn accent_button(p: Paint, which: Ico, label: &str) -> El {
+    row()
+        .h(32.0)
+        .px(8.0)
+        .gap(6.0)
+        .radius(4.0)
+        .hover(p.hover)
+        .items_center()
+        .child(ico(p, which, 16.0, p.accent))
+        .child(text(label).font(CAPTION).color(p.text))
+}
+
 fn command_bar(s: &App, p: Paint) -> El {
     let mut bar = row()
         .key("command")
@@ -1264,45 +1512,80 @@ fn command_bar(s: &App, p: Paint) -> El {
         .px(8.0)
         .gap(2.0)
         .items_center()
-        .child(text_button(p, Ico::New, "New", true, false))
+        .child(accent_button(p, Ico::New, "New").on_press(|s: &mut App| {
+            s.notice = "New is not implemented in this slice".into();
+        }))
         .child(el().w(p.hair).h(20.0).fill(p.line));
-    for w in [
-        Ico::Cut,
-        Ico::Copy,
-        Ico::Paste,
-        Ico::Rename,
-        Ico::Share,
-        Ico::Delete,
+    for (which, label) in [
+        (Ico::Cut, "Cut"),
+        (Ico::Copy, "Copy"),
+        (Ico::Paste, "Paste"),
+        (Ico::Rename, "Rename"),
+        (Ico::Share, "Share"),
+        (Ico::Delete, "Delete"),
     ] {
-        bar = bar.child(icon_button(p, w, true));
+        bar = bar.child(icon_button(p, which, true).on_press(move |s: &mut App| {
+            s.notice = format!("{label} is not implemented in this slice");
+        }));
     }
     bar = bar
         .child(el().w(p.hair).h(20.0).fill(p.line))
-        .child(text_button(p, Ico::Sort, "Sort", true, false))
-        .child(text_button(p, Ico::View, "View", true, false))
-        .child(text_button(p, Ico::Filter, "Filter", true, false));
+        .child(
+            text_button(p, Ico::Sort, "Sort", true, false).on_press(|s: &mut App| {
+                s.sort = (s.sort + 1) % 4;
+                s.groups.clear();
+                s.keep_order = false;
+                refresh_visible(s);
+                s.notice = format!(
+                    "Sorted by {}",
+                    ["name", "date", "type", "size"][s.sort as usize]
+                );
+            }),
+        )
+        .child(
+            text_button(p, Ico::View, "View", true, false).on_press(|s: &mut App| {
+                s.mode = if s.mode == Mode::Details {
+                    Mode::Grid
+                } else {
+                    Mode::Details
+                };
+            }),
+        )
+        .child(
+            text_button(p, Ico::Filter, "Filter", true, false).on_press(|s: &mut App| {
+                s.notice = "Filter is not implemented in this slice".into();
+            }),
+        );
     if s.contextual {
         bar = bar
-            .child(text_button(
-                p,
-                Ico::SetBackground,
-                "Set as background",
-                false,
-                false,
-            ))
-            .child(text_button(p, Ico::RotateLeft, "Rotate left", false, false))
-            .child(text_button(
-                p,
-                Ico::RotateRight,
-                "Rotate right",
-                false,
-                false,
-            ));
+            .child(
+                accent_button(p, Ico::SetBackground, "Set as background").on_press(
+                    |s: &mut App| {
+                        s.notice = "Set as background is not implemented in this slice".into();
+                    },
+                ),
+            )
+            .child(
+                accent_button(p, Ico::RotateLeft, "Rotate left").on_press(|s: &mut App| {
+                    s.notice = "Rotate left is not implemented in this slice".into();
+                }),
+            )
+            .child(
+                accent_button(p, Ico::RotateRight, "Rotate right").on_press(|s: &mut App| {
+                    s.notice = "Rotate right is not implemented in this slice".into();
+                }),
+            );
     }
     bar = bar
-        .child(icon_button(p, Ico::More, false))
+        .child(icon_button(p, Ico::More, false).on_press(|s: &mut App| {
+            s.notice = "More commands are not implemented in this slice".into();
+        }))
         .child(el().grow(1.0));
-    bar.child(text_button(p, Ico::Details, "Details", false, false))
+    bar.child(
+        text_button(p, Ico::Details, "Details", false, false).on_press(|s: &mut App| {
+            s.preview = !s.preview;
+        }),
+    )
 }
 
 fn rail_item(
@@ -1329,23 +1612,27 @@ fn rail_item(
         .hover(p.hover)
         .px(8.0)
         .gap(8.0)
-        .items_center();
-    if active {
-        item = item.child(
+        .items_center()
+        // Explorer's rail selection is a state, not a transition. Rune gives
+        // every element a default opacity entrance and springs colour changes;
+        // both read as a jump here, so this subtree lands immediately.
+        .motion(Spring::NONE)
+        .instant_changes()
+        // Always mounted: a bar that appears and disappears would fade in.
+        .child(
             el().w(3.0)
                 .h(16.0)
                 .radius(1.5)
-                .fill(p.accent)
+                .fill(if active { p.accent } else { Color::TRANSPARENT })
                 .absolute(0.0, 7.0),
         );
-    }
     if chevron {
         item = item.child(ico(p, Ico::ChevronRight, 10.0, p.tertiary));
     } else {
         item = item.child(el().w(10.0));
     }
     item = item
-        .child(ico(p, which, 16.0, ink))
+        .child(ico(p, which, 16.0, c(place_color(index))))
         .child(text(label).font(BODY).color(ink));
     if pin {
         item = item
@@ -1354,7 +1641,10 @@ fn rail_item(
     } else {
         item = item.child(el().grow(1.0));
     }
-    item.on_press(move |s: &mut App| s.nav = index)
+    item.on_press_tx(move |s: &mut App, tx: &mut Tx| {
+        navigate(s, index);
+        tx.instant();
+    })
 }
 
 fn nav_rail(s: &App, p: Paint) -> El {
@@ -1366,6 +1656,8 @@ fn nav_rail(s: &App, p: Paint) -> El {
         .px(4.0)
         .pt(4.0)
         .gap(1.0)
+        .motion(Spring::NONE)
+        .instant_changes()
         .child(rail_item(s, p, 0, "Home", Ico::Home, false, false))
         .child(rail_item(s, p, 1, "Gallery", Ico::Gallery, false, false))
         .child(rail_item(s, p, 2, "OneDrive", Ico::Cloud, true, false))
@@ -1417,9 +1709,10 @@ fn group_header(p: Paint, label: &str) -> El {
 }
 
 fn file_row(s: &App, i: usize, p: Paint) -> El {
-    let e = &s.entries[i];
-    let selected = s.selected == Some(i);
-    let focused = s.focused == Some(i);
+    let ei = s.visible.get(i).copied().unwrap_or(i);
+    let e = &s.entries[ei];
+    let selected = s.selected == Some(ei);
+    let focused = s.focused == Some(ei);
     let fill = if selected {
         p.row_sel
     } else if focused {
@@ -1434,57 +1727,68 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
         .h(ROW_H)
         .items_center()
         .fill(fill)
-        .hover(p.hover);
+        .hover(p.hover)
+        .motion(Spring::NONE);
     if focused && selected {
         line = line.border(p.hair, p.accent);
     }
-    line.child(
-        row()
-            .w(NAME_W)
-            .pl(12.0)
-            .pr(8.0)
-            .gap(8.0)
-            .items_center()
-            .child(file_glyph(e, p, 20.0))
-            .child(
-                text(e.name.as_str())
+    let line = line
+        .child(
+            row()
+                .w(NAME_W)
+                .pl(12.0)
+                .pr(8.0)
+                .gap(8.0)
+                .items_center()
+                .child(file_glyph(e, p, 20.0))
+                .child(
+                    text(e.name.as_str())
+                        .font(ROW_TEXT)
+                        .color(p.text)
+                        .truncate(),
+                ),
+        )
+        .child(el().w(p.hair).h(16.0).fill(p.soft_line))
+        .child(
+            col()
+                .w(DATE_W)
+                .pl(12.0)
+                .child(text(e.modified.as_str()).font(ROW_TEXT).color(p.secondary)),
+        )
+        .child(el().w(p.hair).h(16.0).fill(p.soft_line))
+        .child(
+            col().w(TYPE_W).pl(12.0).pr(8.0).child(
+                text(e.type_label.as_str())
                     .font(ROW_TEXT)
-                    .color(p.text)
+                    .color(p.secondary)
+                    .w_full()
                     .truncate(),
             ),
-    )
-    .child(el().w(p.hair).h(16.0).fill(p.soft_line))
-    .child(
-        col()
-            .w(DATE_W)
-            .pl(12.0)
-            .child(text(e.modified.as_str()).font(ROW_TEXT).color(p.secondary)),
-    )
-    .child(el().w(p.hair).h(16.0).fill(p.soft_line))
-    .child(
-        col().w(TYPE_W).pl(12.0).pr(8.0).child(
-            text(e.type_label.as_str())
-                .font(ROW_TEXT)
-                .color(p.secondary)
-                .w_full()
-                .truncate(),
-        ),
-    )
-    .child(el().w(p.hair).h(16.0).fill(p.soft_line))
-    .child(
-        col().w(SIZE_W).pl(8.0).pr(12.0).child(
-            text(e.size_label())
-                .font(ROW_TEXT)
-                .color(p.secondary)
-                .w_full()
-                .align(Align::End),
-        ),
-    )
-    .child(el().grow(1.0))
-    .on_press(move |s: &mut App| {
+        )
+        .child(el().w(p.hair).h(16.0).fill(p.soft_line))
+        .child(
+            col().w(SIZE_W).pl(8.0).pr(12.0).child(
+                text(e.size_label())
+                    .font(ROW_TEXT)
+                    .color(p.secondary)
+                    .w_full()
+                    .align(Align::End),
+            ),
+        )
+        .child(el().grow(1.0));
+    let double_path = path.clone();
+    line.on_press(move |s: &mut App| {
         if let Some(at) = s.entries.iter().position(|entry| entry.path == path) {
             s.selected = Some(at);
             s.focused = Some(at);
+        }
+    })
+    .on_double_press(move |s: &mut App| {
+        if let Some(at) = s.entries.iter().position(|entry| entry.path == double_path) {
+            if s.entries[at].is_dir {
+                let next = PathBuf::from(&s.entries[at].path);
+                go(s, next);
+            }
         }
     })
 }
@@ -1500,7 +1804,7 @@ fn details_rows(s: &App, p: Paint) -> El {
         });
     if !s.groups.is_empty() {
         let mut list = col().key("rows").w_full();
-        for i in 0..s.entries.len() {
+        for i in 0..s.visible.len() {
             if let Some((_, label)) = s.groups.iter().find(|(start, _)| *start == i) {
                 list = list.child(group_header(p, label));
             }
@@ -1514,17 +1818,18 @@ fn details_rows(s: &App, p: Paint) -> El {
             .w_full()
             .growth(GrowthSpec::default())
             .virtual_rows(
-                s.entries.len(),
+                s.visible.len(),
                 ROW_H,
-                |s: &App, i| Cow::Borrowed(s.entries[i].path.as_str()),
+                |s: &App, i| Cow::Borrowed(s.entries[s.visible[i]].path.as_str()),
                 move |s: &App, i| file_row(s, i, p),
             ),
     )
 }
 
 fn grid_tile(s: &App, i: usize, p: Paint) -> El {
-    let e = &s.entries[i];
-    let selected = s.selected == Some(i);
+    let ei = s.visible.get(i).copied().unwrap_or(i);
+    let e = &s.entries[ei];
+    let selected = s.selected == Some(ei);
     let path = e.path.clone();
     col()
         .key(format!("tile-{i}"))
@@ -1582,7 +1887,7 @@ fn grid_rows(s: &App, p: Paint) -> El {
                 .pt(16.0)
                 .px(12.0)
                 .gap(8.0)
-                .children((0..s.entries.len()).map(|i| grid_tile(s, i, p))),
+                .children((0..s.visible.len()).map(|i| grid_tile(s, i, p))),
         )
 }
 
@@ -1662,7 +1967,8 @@ fn home_content(s: &App, p: Paint) -> El {
         ],
         false,
     ));
-    for (i, e) in s.entries.iter().enumerate() {
+    for &ei in s.visible.iter() {
+        let e = &s.entries[ei];
         table = table.child(
             row()
                 .w_full()
@@ -1695,7 +2001,7 @@ fn home_content(s: &App, p: Paint) -> El {
                             .color(p.secondary),
                     ),
                 )
-                .on_press(move |st: &mut App| st.selected = Some(i)),
+                .on_press(move |st: &mut App| st.selected = Some(ei)),
         );
     }
     col()
@@ -1939,6 +2245,11 @@ fn body(s: &App, p: Paint) -> El {
 }
 
 fn status_bar(s: &App, p: Paint) -> El {
+    let middle = if s.notice.is_empty() {
+        s.selection_detail.as_str()
+    } else {
+        s.notice.as_str()
+    };
     row()
         .key("status")
         .w_full()
@@ -1957,11 +2268,11 @@ fn status_bar(s: &App, p: Paint) -> El {
             .color(p.secondary),
         )
         .child(el().w(p.hair).h(12.0).fill(p.line))
-        .child(
-            text(s.selection_detail.as_str())
-                .font(CAPTION)
-                .color(p.secondary),
-        )
+        .child(text(middle).font(CAPTION).color(if s.notice.is_empty() {
+            p.secondary
+        } else {
+            p.accent
+        }))
         .child(el().grow(1.0))
         .child(ico(p, Ico::View, 14.0, p.tertiary))
         .child(ico(p, Ico::Details, 14.0, p.tertiary))
@@ -1983,6 +2294,7 @@ fn main() {
             ("pictures", |s| load(s, Fixture::Screenshots)),
             ("thispc", |s| load(s, Fixture::ThisPc)),
         ],
+        poll: Some(poll),
         ..AppSpec::new("Lyre", (1076.0, 600.0), init, view)
     };
     let probe = init();
@@ -1992,5 +2304,25 @@ fn main() {
         probe.root.display(),
         probe.scan_ms
     );
-    rune::run(spec);
+    // One window, no system frame. The tab strip is the titlebar now, so the
+    // drawn minimize/maximize/close controls and window_drag own that job;
+    // leaving decorations on would stack a second, native bar above it.
+    run_windows(|displays| {
+        if let Some(display) = displays
+            .iter()
+            .find(|d| d.primary)
+            .or_else(|| displays.first())
+        {
+            let scale = display.scale.max(1.0) as f32;
+            let width = display.size.0 as f32 / scale - 16.0;
+            let height = display.size.1 as f32 / scale - 48.0;
+            let _ = WORK_AREA.set((width.max(1076.0), height.max(600.0)));
+        }
+        [WindowSpec::new("main", spec)
+            .options(WindowOptions {
+                borderless: true,
+                ..Default::default()
+            })
+            .boxed()]
+    });
 }

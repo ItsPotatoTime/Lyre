@@ -19,6 +19,7 @@
  *
  * Usage:
  *   bun buildit                build for this OS, release
+ *   bun buildit --rune         build the native Rune binary for this OS
  *   bun buildit --debug        debug build (faster, for testing the pipeline)
  *   bun buildit --clean        throw away the build cache first
  *   bun buildit --dry-run      print the commands without running them
@@ -166,6 +167,32 @@ function has(command: string): boolean {
 
 function requireTool(command: string, hint: string) {
   if (!has(command)) fail(`${command} is not on PATH. ${hint}`);
+}
+
+// ---------------------------------------------------------------------------
+// Native Rune crate: one command on every OS, no Tauri or frontend involved.
+// ---------------------------------------------------------------------------
+if (flag("rune")) {
+  stage(1, `Building lyre-rune for ${detected}${debug ? " (debug)" : " (release)"}`);
+  if (!existsSync(join(root, "rune-ui", "Cargo.toml"))) {
+    fail("rune-ui/Cargo.toml is missing; this checkout has no native crate.");
+  }
+  requireTool("cargo", "Install Rust from https://rustup.rs.");
+  const { runeCargo } = await import("./rune-toolchain.ts");
+  if (dryRun) {
+    console.log(
+      colour.dim(
+        `  would run: cargo build${debug ? "" : " --release"} --manifest-path rune-ui/Cargo.toml`,
+      ),
+    );
+  } else {
+    const code = runeCargo(debug ? ["build"] : ["build", "--release"]);
+    if (code !== 0) fail(`cargo build exited with ${code}`);
+    console.log(
+      `\n${colour.green("done")} rune-ui/target/${debug ? "debug" : "release"}/lyre-rune`,
+    );
+  }
+  process.exit(0);
 }
 
 // ---------------------------------------------------------------------------

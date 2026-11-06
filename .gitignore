@@ -5,6 +5,7 @@ dist-ssr
 .DS_Store
 src-tauri/target
 src-tauri/gen
+rune-ui/target
 .cairn
 .playwright-mcp
 .reference

@@ -1,0 +1,15 @@
+[package]
+name = "lyre-rune"
+version = "0.1.0"
+edition = "2024"
+description = "Experimental native Rune rendering of Lyre's Explorer shell"
+
+[dependencies]
+# Pre-release: pin a rev of dev, as Rune's README requires. dev is never rewritten.
+rune = { git = "https://github.com/anomalyco/rune", rev = "781e2b6d87cd5f32d6f4365956fad4baaf24ee50", default-features = false }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2

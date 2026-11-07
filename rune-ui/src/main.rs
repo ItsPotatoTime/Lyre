@@ -421,7 +421,6 @@ fn place_path(index: usize) -> Option<PathBuf> {
     let home = home_dir()?;
     let sub = match index {
         1 | 6 => "Pictures",
-        2 => return std::env::var_os("OneDrive").map(PathBuf::from),
         3 => "Desktop",
         4 => "Downloads",
         5 => "Documents",
@@ -1007,33 +1006,23 @@ fn ico(p: Paint, which: Ico, size: f32, ink: Color) -> El {
             W,
             ink,
         ),
-        Ico::Refresh => Shape::new()
-            .stroke_with(
-                vec![[19.0, 9.0], [19.0, 5.0], [15.0, 5.0]],
-                false,
-                W,
-                LineCap::Round,
+        Ico::Refresh => {
+            let arc: Vec<[f32; 2]> = (0..=24)
+                .map(|k| {
+                    let a = (-60.0 + 330.0 * k as f32 / 24.0).to_radians();
+                    [12.0 + 7.0 * a.cos(), 12.0 + 7.0 * a.sin()]
+                })
+                .collect();
+            let tip = arc[arc.len() - 1];
+            Shape::new().stroke(arc, W, ink).fill(
+                vec![
+                    [tip[0] + 3.4, tip[1] + 0.6],
+                    [tip[0] - 1.2, tip[1] - 2.9],
+                    [tip[0] - 0.4, tip[1] + 3.0],
+                ],
                 ink,
             )
-            .stroke(
-                vec![
-                    [5.0, 12.0],
-                    [5.0, 16.0],
-                    [8.0, 19.0],
-                    [12.0, 19.0],
-                    [17.0, 19.0],
-                    [19.0, 15.0],
-                    [19.0, 12.0],
-                    [19.0, 8.0],
-                    [16.0, 5.0],
-                    [12.0, 5.0],
-                    [8.0, 5.0],
-                    [5.0, 8.0],
-                    [5.0, 12.0],
-                ],
-                W,
-                ink,
-            ),
+        }
         Ico::Search => closed(circle(10.5, 10.5, 6.0), ink).line(
             [15.0, 15.0],
             [20.0, 20.0],
@@ -2080,7 +2069,6 @@ fn nav_rail(s: &App, p: Paint) -> El {
         .instant_changes()
         .child(rail_item(s, p, 0, "Home", false, false))
         .child(rail_item(s, p, 1, "Gallery", false, false))
-        .child(rail_item(s, p, 2, "OneDrive", true, false))
         .child(el().w_full().h(p.hair).fill(p.soft_line).my(5.0).key("rail-sep-1"))
         .child(rail_item(s, p, 3, "Desktop", false, true))
         .child(rail_item(s, p, 4, "Downloads", false, true))

@@ -10,8 +10,8 @@
 //!   cargo run -- --snap downloads.png --scene downloads --size 1076x600 --scale 1
 //!
 //! Out of scope for this slice: independent tab history, file operations, OS
-//! drag-and-drop, system context menus, thumbnails, the reveal highlight, and
-//! the Segoe UI Variable face (Rune ships Inter).
+//! drag-and-drop, system context menus, real shell thumbnails, the reveal
+//! highlight, and true OS maximize.
 
 use std::borrow::Cow;
 use std::fs;
@@ -21,29 +21,35 @@ use std::time::{Instant, UNIX_EPOCH};
 
 use rune::color::hex;
 use rune::{
-    Align, AppSpec, Color, Cx, El, GrowthSpec, LineCap, ScrollSpec, Shape, Spring, TextEdit,
-    TextStyle, Tx, WindowOptions, WindowSpec, canvas, col, el, row, run_windows, text, text_input,
+    Align, AppSpec, Color, Cx, El, GrowthSpec, LineCap, Live, Phase, ScrollSpec, Shape, Spring,
+    TextEdit, TextStyle, Tx, WindowOptions, WindowSpec, canvas, col, el, row, run_windows, text,
+    text_input,
 };
 
-// Metrics sampled from the reference captures (1076x600 window).
-const TAB_H: f32 = 40.0;
-const ADDRESS_H: f32 = 44.0;
+// Metrics and colours sampled from the four reference captures. The chrome is
+// three distinct bands, not one surface: a near-black tab strip, a Mica-tinted
+// address row, and a command bar that shares the work area's neutral charcoal.
+const TAB_H: f32 = 38.0;
+const TAB_ITEM_H: f32 = 30.0;
+const ADDRESS_H: f32 = 46.0;
 const COMMAND_H: f32 = 44.0;
 const STATUS_H: f32 = 24.0;
 const RAIL_W: f32 = 155.0;
 const HEADER_H: f32 = 32.0;
-const ROW_H: f32 = 30.0;
-const FIELD_H: f32 = 28.0;
-const PREVIEW_W: f32 = 286.0;
-const NAME_W: f32 = 262.0;
-const DATE_W: f32 = 136.0;
-const TYPE_W: f32 = 114.0;
-const SIZE_W: f32 = 81.0;
+const GROUP_H: f32 = 28.0;
+const ROW_H: f32 = 28.0;
+const FIELD_H: f32 = 30.0;
+const PREVIEW_W: f32 = 300.0;
+const GUTTER_W: f32 = 12.0;
+const NAME_W: f32 = 260.0;
+const DATE_W: f32 = 140.0;
+const TYPE_W: f32 = 120.0;
+const SIZE_W: f32 = 80.0;
 
 const CAPTION: TextStyle = TextStyle::new(12.0, 400.0).lh(16.0);
-const ROW_TEXT: TextStyle = TextStyle::new(13.0, 400.0).lh(18.0);
-const BODY: TextStyle = TextStyle::new(14.0, 400.0).lh(20.0);
-const TILE_TEXT: TextStyle = TextStyle::new(14.0, 600.0).lh(18.0);
+const ROW_TEXT: TextStyle = TextStyle::new(12.0, 400.0).lh(16.0);
+const TILE_TEXT: TextStyle = TextStyle::new(12.0, 600.0).lh(16.0);
+const GROUP_TEXT: TextStyle = TextStyle::new(12.0, 600.0).lh(16.0);
 
 fn c(s: &str) -> Color {
     hex(s).expect("authored hex literal")
@@ -52,11 +58,13 @@ fn c(s: &str) -> Color {
 #[derive(Clone, Copy)]
 struct Paint {
     title: Color,
-    chrome: Color,
     tab: Color,
+    toolbar: Color,
+    command: Color,
     content: Color,
     status: Color,
     field: Color,
+    field_line: Color,
     line: Color,
     soft_line: Color,
     text: Color,
@@ -65,64 +73,82 @@ struct Paint {
     disabled: Color,
     accent: Color,
     accent_fill: Color,
+    accent_ink: Color,
     hover: Color,
+    press: Color,
     rail_sel: Color,
     row_sel: Color,
+    sel_line: Color,
+    focus_line: Color,
+    scroll_thumb: Color,
+    thumb_bg: Color,
+    pill_off: Color,
+    close_hover: Color,
     hair: f32,
 }
 
 fn paint(dark: bool, scale: f32) -> Paint {
     let hair = 1.0 / scale;
     if dark {
-        // DESIGN.md: Mica is faked here with a 2–3% accent wash over the
-        // chrome tones. The work area gets half as much, so the whole window
-        // reads blue-grey rather than neutral grey, the way Explorer does on a
-        // tinted wallpaper. Nothing else in the shell is tinted.
-        let accent = c("#60cdff");
-        let accent_fill = c("#0078d4");
-        let chrome = c("#1f1f1f").mix(accent, 0.030);
         Paint {
-            title: c("#0a0a0a").mix(accent, 0.020),
-            chrome,
-            tab: chrome,
-            content: c("#191919").mix(accent, 0.014),
-            status: c("#1c1c1c").mix(accent, 0.024),
-            field: c("#2c2c2c").mix(accent, 0.018),
+            title: c("#000d17"),
+            tab: c("#202429"),
+            toolbar: c("#1a2127"),
+            command: c("#191919"),
+            content: c("#191919"),
+            status: c("#1c1c1c"),
+            field: c("#272e33"),
+            field_line: c("#3a4148"),
             line: c("#3a3a3a"),
             soft_line: c("#2b2b2b"),
             text: c("#ffffff"),
-            secondary: c("#c8c8c8"),
+            secondary: c("#c9c9c9"),
             tertiary: c("#9a9a9a"),
-            disabled: c("#6b6b6b"),
-            accent,
-            accent_fill,
+            disabled: c("#6e6e6e"),
+            accent: c("#4cc2ff"),
+            accent_fill: c("#0078d4"),
+            accent_ink: c("#003048"),
             hover: Color::WHITE.alpha(0.055),
-            rail_sel: c("#333333").mix(accent, 0.07),
-            row_sel: accent.alpha(0.16),
+            press: Color::WHITE.alpha(0.028),
+            rail_sel: c("#2d2d2d"),
+            row_sel: c("#2a2d31"),
+            sel_line: c("#454545"),
+            focus_line: c("#505050"),
+            scroll_thumb: c("#6e6e6e"),
+            thumb_bg: c("#222222"),
+            pill_off: c("#272727"),
+            close_hover: c("#c42b1c"),
             hair,
         }
     } else {
-        let accent = c("#005fb8");
-        let accent_fill = c("#0078d4");
-        let chrome = c("#f5f5f5").mix(accent, 0.025);
         Paint {
-            title: c("#e8e8e8").mix(accent, 0.018),
-            chrome,
+            title: c("#e9edf2"),
             tab: c("#ffffff"),
+            toolbar: c("#f4f6f8"),
+            command: c("#fbfbfb"),
             content: c("#ffffff"),
-            status: chrome,
+            status: c("#f3f3f3"),
             field: c("#ffffff"),
-            line: c("#dcdcdc"),
-            soft_line: c("#ebebeb"),
-            text: c("#191a1a"),
-            secondary: c("#5c5d5e"),
-            tertiary: c("#767778"),
-            disabled: c("#9a9b9c"),
-            accent,
-            accent_fill,
+            field_line: c("#dfe3e8"),
+            line: c("#e2e2e2"),
+            soft_line: c("#ededed"),
+            text: c("#1b1b1b"),
+            secondary: c("#5d5d5d"),
+            tertiary: c("#8a8a8a"),
+            disabled: c("#a2a2a2"),
+            accent: c("#005fb8"),
+            accent_fill: c("#0067c0"),
+            accent_ink: c("#ffffff"),
             hover: Color::BLACK.alpha(0.045),
-            rail_sel: c("#e4e4e4").mix(accent, 0.07),
-            row_sel: accent.alpha(0.11),
+            press: Color::BLACK.alpha(0.025),
+            rail_sel: c("#eaeaea"),
+            row_sel: c("#e9f2fc"),
+            sel_line: c("#c8dcef"),
+            focus_line: c("#909090"),
+            scroll_thumb: c("#b4b4b4"),
+            thumb_bg: c("#f0f0f0"),
+            pill_off: c("#f0f0f0"),
+            close_hover: c("#c42b1c"),
             hair,
         }
     }
@@ -190,25 +216,6 @@ fn kind_label(k: Kind) -> &'static str {
     }
 }
 
-fn kind_hex(k: Kind) -> &'static str {
-    match k {
-        Kind::Folder => "#f0b429",
-        Kind::Drive => "#4a90d9",
-        Kind::Image => "#1f9e6e",
-        Kind::Video => "#8b5cf6",
-        Kind::Audio => "#e0518c",
-        Kind::Pdf => "#d94848",
-        Kind::Document => "#2f6fd0",
-        Kind::Sheet => "#1f8f4e",
-        Kind::Slides => "#e0642a",
-        Kind::Text => "#6b7280",
-        Kind::Code => "#4f6ef7",
-        Kind::Archive => "#c2861f",
-        Kind::App => "#3b82c4",
-        Kind::Other => "#8f9296",
-    }
-}
-
 /// Installers are the one place Explorer shows a different mark per file; a
 /// stable name hash stands in for each application's own icon.
 fn app_color(name: &str) -> &'static str {
@@ -219,25 +226,6 @@ fn app_color(name: &str) -> &'static str {
         .bytes()
         .fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
     PALETTE[(h as usize) % PALETTE.len()]
-}
-
-/// Wayfinding colour for the navigation rail. Each place owns a hue, muted so
-/// it reads as a mark rather than decoration; the accent itself stays reserved
-/// for selection and action.
-fn place_color(index: usize) -> &'static str {
-    match index {
-        0 => "#60cdff", // Home
-        1 => "#4fb8a8", // Gallery
-        2 => "#3b82c4", // OneDrive
-        3 => "#5b8fd6", // Desktop
-        4 => "#1f9e6e", // Downloads
-        5 => "#2f6fd0", // Documents
-        6 => "#1f9e6e", // Pictures
-        7 => "#e0518c", // Music
-        8 => "#8b5cf6", // Videos
-        9 => "#60cdff", // This PC
-        _ => "#4a90d9", // Network
-    }
 }
 
 #[derive(Clone)]
@@ -309,6 +297,15 @@ struct App {
     zoom: bool,
     zoom_size: (f32, f32),
     scan_ms: f64,
+    /// Home's Recent/Favorites pill pair.
+    home_tab: u8,
+    /// The drawn scrollbar rides Live bindings so a scroll never re-runs the
+    /// view: the viewport reports its offset, the thumb follows in-frame.
+    scroll_track: Live<[f32; 4]>,
+    scroll_thumb: Live<[f32; 4]>,
+    scroll_vis: Live<f32>,
+    scroll_max: Live<f32>,
+    scroll_off: Live<f32>,
 }
 
 fn format_size(n: u64) -> String {
@@ -828,6 +825,12 @@ fn init() -> App {
         zoom: false,
         zoom_size: WORK_AREA.get().copied().unwrap_or((1600.0, 900.0)),
         scan_ms,
+        home_tab: 0,
+        scroll_track: Live::new([0.0; 4]),
+        scroll_thumb: Live::new([0.0; 4]),
+        scroll_vis: Live::new(0.0),
+        scroll_max: Live::new(0.0),
+        scroll_off: Live::new(0.0),
     };
     refresh_visible(&mut app);
     app
@@ -845,11 +848,11 @@ fn circle(cx: f32, cy: f32, r: f32) -> Vec<[f32; 2]> {
 }
 
 fn stroke(points: Vec<[f32; 2]>, ink: Color) -> Shape {
-    Shape::new().stroke(points, 1.5, ink)
+    Shape::new().stroke(points, 1.3, ink)
 }
 
 fn closed(points: Vec<[f32; 2]>, ink: Color) -> Shape {
-    Shape::new().stroke_with(points, true, 1.5, LineCap::Round, ink)
+    Shape::new().stroke_with(points, true, 1.3, LineCap::Round, ink)
 }
 
 #[derive(Clone, Copy)]
@@ -874,9 +877,6 @@ enum Ico {
     ChevronRight,
     ChevronDown,
     Pin,
-    Home,
-    Gallery,
-    Cloud,
     Desktop,
     Downloads,
     Documents,
@@ -884,7 +884,6 @@ enum Ico {
     Music,
     Videos,
     ThisPc,
-    Network,
     Monitor,
     Minimize,
     Maximize,
@@ -894,10 +893,14 @@ enum Ico {
     SetBackground,
     RotateLeft,
     RotateRight,
+    Star,
+    Clock,
+    Grid,
+    List,
 }
 
 fn ico(p: Paint, which: Ico, size: f32, ink: Color) -> El {
-    const W: f32 = 1.5;
+    const W: f32 = 1.3;
     let sh = match which {
         Ico::New => closed(circle(12.0, 12.0, 8.0), ink)
             .line([12.0, 8.0], [12.0, 16.0], W, LineCap::Round, ink)
@@ -1042,54 +1045,16 @@ fn ico(p: Paint, which: Ico, size: f32, ink: Color) -> El {
         Ico::ChevronDown => stroke(vec![[6.0, 9.0], [12.0, 15.0], [18.0, 9.0]], ink),
         Ico::Pin => Shape::new().fill(
             vec![
-                [8.0, 3.0],
-                [16.0, 3.0],
-                [17.0, 8.0],
+                [6.0, 3.0],
+                [18.0, 3.0],
+                [16.0, 9.0],
                 [13.0, 11.0],
-                [13.0, 20.0],
-                [11.0, 20.0],
+                [13.0, 17.0],
+                [12.0, 21.0],
+                [11.0, 17.0],
                 [11.0, 11.0],
-                [7.0, 8.0],
+                [8.0, 9.0],
             ],
-            ink,
-        ),
-        Ico::Home => Shape::new().fill(
-            vec![
-                [3.0, 12.0],
-                [12.0, 4.0],
-                [21.0, 12.0],
-                [19.0, 12.0],
-                [19.0, 20.0],
-                [13.0, 20.0],
-                [13.0, 14.0],
-                [11.0, 14.0],
-                [11.0, 20.0],
-                [5.0, 20.0],
-                [5.0, 12.0],
-            ],
-            ink,
-        ),
-        Ico::Gallery => closed(
-            vec![[3.0, 5.0], [21.0, 5.0], [21.0, 19.0], [3.0, 19.0]],
-            ink,
-        )
-        .fill(circle(8.0, 10.0, 1.6), ink)
-        .fill(vec![[4.0, 18.0], [10.0, 12.0], [16.0, 18.0]], ink),
-        Ico::Cloud => Shape::new().stroke_with(
-            vec![
-                [6.0, 18.0],
-                [4.0, 14.0],
-                [6.0, 10.0],
-                [10.0, 9.0],
-                [12.0, 5.0],
-                [17.0, 6.0],
-                [20.0, 10.0],
-                [19.0, 14.0],
-                [20.0, 18.0],
-            ],
-            true,
-            W,
-            LineCap::Round,
             ink,
         ),
         Ico::Desktop => closed(
@@ -1137,19 +1102,6 @@ fn ico(p: Paint, which: Ico, size: f32, ink: Color) -> El {
         )
         .line([12.0, 16.0], [12.0, 20.0], W, LineCap::Round, ink)
         .line([8.0, 20.0], [16.0, 20.0], W, LineCap::Round, ink),
-        Ico::Network => closed(circle(12.0, 12.0, 8.0), ink)
-            .line([4.0, 12.0], [20.0, 12.0], W, LineCap::Round, ink)
-            .stroke(
-                vec![
-                    [12.0, 4.0],
-                    [9.0, 12.0],
-                    [12.0, 20.0],
-                    [15.0, 12.0],
-                    [12.0, 4.0],
-                ],
-                W,
-                ink,
-            ),
         Ico::Monitor => Shape::new()
             .fill(
                 vec![[2.0, 3.0], [22.0, 3.0], [22.0, 17.0], [2.0, 17.0]],
@@ -1213,92 +1165,474 @@ fn ico(p: Paint, which: Ico, size: f32, ink: Color) -> El {
             W,
             ink,
         ),
+        Ico::Star => closed(
+            vec![
+                [12.0, 3.5],
+                [14.7, 9.0],
+                [20.5, 9.6],
+                [16.2, 13.6],
+                [17.6, 19.5],
+                [12.0, 16.4],
+                [6.4, 19.5],
+                [7.8, 13.6],
+                [3.5, 9.6],
+                [9.3, 9.0],
+            ],
+            ink,
+        ),
+        Ico::Clock => closed(circle(12.0, 12.0, 8.5), ink)
+            .stroke(vec![[12.0, 7.0], [12.0, 12.0], [15.5, 14.0]], W, ink),
+        Ico::Grid => Shape::new()
+            .stroke_with(
+                vec![[4.0, 4.0], [10.0, 4.0], [10.0, 10.0], [4.0, 10.0]],
+                true,
+                W,
+                LineCap::Round,
+                ink,
+            )
+            .stroke_with(
+                vec![[14.0, 4.0], [20.0, 4.0], [20.0, 10.0], [14.0, 10.0]],
+                true,
+                W,
+                LineCap::Round,
+                ink,
+            )
+            .stroke_with(
+                vec![[4.0, 14.0], [10.0, 14.0], [10.0, 20.0], [4.0, 20.0]],
+                true,
+                W,
+                LineCap::Round,
+                ink,
+            )
+            .stroke_with(
+                vec![[14.0, 14.0], [20.0, 14.0], [20.0, 20.0], [14.0, 20.0]],
+                true,
+                W,
+                LineCap::Round,
+                ink,
+            ),
+        Ico::List => Shape::new()
+            .fill(circle(5.0, 6.0, 1.2), ink)
+            .fill(circle(5.0, 12.0, 1.2), ink)
+            .fill(circle(5.0, 18.0, 1.2), ink)
+            .line([9.0, 6.0], [20.0, 6.0], W, LineCap::Round, ink)
+            .line([9.0, 12.0], [20.0, 12.0], W, LineCap::Round, ink)
+            .line([9.0, 18.0], [20.0, 18.0], W, LineCap::Round, ink),
     };
     let _ = p;
     canvas(sh.view_box(24.0, 24.0)).size(size, size)
 }
 
-fn file_glyph(e: &Entry, _p: Paint, size: f32) -> El {
-    let color = c(if e.kind == Kind::App {
-        app_color(&e.name)
-    } else {
-        kind_hex(e.kind)
-    });
-    if e.is_dir {
-        let sh = Shape::new()
-            .fill(
-                vec![
-                    [1.0, 4.0],
-                    [1.0, 3.0],
-                    [9.0, 3.0],
-                    [11.0, 6.0],
-                    [23.0, 6.0],
-                    [23.0, 21.0],
-                    [1.0, 21.0],
-                ],
-                color,
-            )
-            .fill(
-                vec![[1.0, 10.0], [23.0, 10.0], [23.0, 21.0], [1.0, 21.0]],
-                color.mix(Color::BLACK, 0.22),
-            );
-        return canvas(sh.view_box(24.0, 24.0)).size(size, size);
-    }
-    let sh = Shape::new()
+/// A Windows 11 folder: a darker back panel with a raised tab, then a gradient
+/// front face. `mark` is the white place glyph pinned to the front, if any.
+fn folder(size: f32, top: &str, bottom: &str, back: &str, mark: Option<Ico>, p: Paint) -> El {
+    let silhouette = Shape::new()
         .fill(
             vec![
-                [4.0, 1.0],
-                [15.0, 1.0],
-                [20.0, 6.0],
-                [20.0, 23.0],
-                [4.0, 23.0],
+                [1.0, 7.0],
+                [1.0, 4.0],
+                [8.5, 4.0],
+                [10.5, 6.5],
+                [23.0, 6.5],
+                [23.0, 20.0],
+                [1.0, 20.0],
             ],
-            color,
+            c(back),
         )
-        .fill(
-            vec![[15.0, 1.0], [15.0, 6.0], [20.0, 6.0]],
-            Color::WHITE.alpha(0.5),
+        .view_box(24.0, 24.0);
+    let mut front = el()
+        .absolute(0.0, size * 0.34)
+        .size(size, size * 0.58)
+        .radius(size * 0.09)
+        .gradient(c(top), c(bottom));
+    if let Some(which) = mark {
+        front = front.center().child(ico(p, which, size * 0.42, Color::WHITE));
+    }
+    el().size(size, size)
+        .child(canvas(silhouette).absolute(0.0, 0.0).size(size, size))
+        .child(front)
+}
+
+fn yellow_folder(size: f32, p: Paint) -> El {
+    folder(size, "#ffd66b", "#f0b232", "#d89427", None, p)
+}
+
+/// The compressed-archive folder: a yellow folder with a zipper down its face.
+fn archive_folder(size: f32, p: Paint) -> El {
+    let mut teeth = Shape::new();
+    for i in 0..6 {
+        let y = 9.5 + i as f32 * 1.6;
+        let x = if i % 2 == 0 { 10.6 } else { 12.2 };
+        teeth = teeth.fill(
+            vec![[x, y], [x + 1.3, y], [x + 1.3, y + 1.1], [x, y + 1.1]],
+            c("#a5761f"),
         );
-    let mark = e
-        .name
-        .rsplit_once('.')
-        .and_then(|(_, ext)| ext.chars().next())
-        .unwrap_or('?')
-        .to_ascii_uppercase();
-    el().key("glyph")
-        .size(size, size)
-        .center()
-        .child(
-            canvas(sh.view_box(24.0, 24.0))
-                .absolute(0.0, 0.0)
-                .size(size, size),
+    }
+    teeth = teeth
+        .fill(
+            vec![[10.9, 18.6], [13.1, 18.6], [13.1, 20.6], [10.9, 20.6]],
+            c("#8a6118"),
         )
+        .view_box(24.0, 24.0);
+    el().size(size, size)
+        .child(yellow_folder(size, p))
+        .child(canvas(teeth).absolute(0.0, 0.0).size(size, size))
+}
+
+/// Installers carry each application's own mark in Explorer; these are drawn
+/// stand-ins keyed off the names in the reference captures, with a stable
+/// geometric fallback for anything else.
+fn app_glyph(name: &str, size: f32, p: Paint) -> El {
+    let n = name.to_ascii_lowercase();
+    let sh = if n.contains("firefox") {
+        Shape::new()
+            .fill(circle(12.0, 12.0, 9.5), c("#f08c1e"))
+            .fill(circle(12.5, 12.5, 5.2), c("#3b6fd4"))
+            .fill(circle(10.0, 9.0, 2.6), c("#ffd24d"))
+    } else if n.contains("discord") {
+        Shape::new()
+            .fill(
+                vec![[3.0, 4.0], [21.0, 4.0], [21.0, 20.0], [3.0, 20.0]],
+                c("#5865f2"),
+            )
+            .fill(circle(9.0, 12.0, 1.8), Color::WHITE)
+            .fill(circle(15.0, 12.0, 1.8), Color::WHITE)
+            .fill(
+                vec![[6.0, 15.0], [18.0, 15.0], [17.0, 18.0], [7.0, 18.0]],
+                Color::WHITE,
+            )
+    } else if n.contains("git-") {
+        Shape::new()
+            .fill(
+                vec![[12.0, 2.0], [22.0, 12.0], [12.0, 22.0], [2.0, 12.0]],
+                c("#f05033"),
+            )
+            .line([9.0, 8.0], [9.0, 15.0], 1.4, LineCap::Round, Color::WHITE)
+            .line([9.0, 11.0], [15.0, 11.0], 1.4, LineCap::Round, Color::WHITE)
+            .line([15.0, 11.0], [15.0, 14.0], 1.4, LineCap::Round, Color::WHITE)
+            .fill(circle(9.0, 7.0, 1.7), Color::WHITE)
+            .fill(circle(15.0, 15.5, 1.7), Color::WHITE)
+    } else if n.contains("node") {
+        Shape::new()
+            .fill(
+                vec![[12.0, 2.0], [21.0, 7.0], [21.0, 17.0], [12.0, 22.0], [3.0, 17.0], [3.0, 7.0]],
+                c("#3c873a"),
+            )
+            .stroke_with(
+                vec![[12.0, 6.0], [17.5, 9.0], [17.5, 15.0], [12.0, 18.0], [6.5, 15.0], [6.5, 9.0]],
+                true,
+                1.4,
+                LineCap::Round,
+                Color::WHITE,
+            )
+    } else if n.contains("warp") {
+        Shape::new()
+            .fill(circle(12.0, 12.0, 9.5), c("#f2f2f2"))
+            .fill(
+                vec![[7.0, 16.0], [13.0, 7.0], [17.0, 7.0], [11.0, 16.0]],
+                c("#1b1b1b"),
+            )
+    } else if n.contains("brisk") {
+        Shape::new()
+            .fill(circle(12.0, 12.0, 9.5), c("#1fae9b"))
+            .fill(
+                vec![[13.5, 5.0], [8.0, 13.0], [11.5, 13.0], [10.5, 19.0], [16.0, 11.0], [12.5, 11.0]],
+                Color::WHITE,
+            )
+    } else if n.contains("workbuddy") {
+        Shape::new()
+            .fill(
+                vec![[3.0, 3.0], [21.0, 3.0], [21.0, 21.0], [3.0, 21.0]],
+                c("#22b07d"),
+            )
+            .stroke(
+                vec![[6.5, 8.0], [9.0, 16.0], [12.0, 10.0], [15.0, 16.0], [17.5, 8.0]],
+                1.8,
+                Color::WHITE,
+            )
+    } else if n.contains("vencord") {
+        Shape::new()
+            .fill(circle(12.0, 12.0, 9.5), c("#b48cf2"))
+            .stroke(vec![[7.5, 8.0], [12.0, 16.0], [16.5, 8.0]], 2.0, Color::WHITE)
+    } else if n.contains("windowsdesktop") {
+        Shape::new()
+            .fill(vec![[3.0, 3.0], [11.0, 3.0], [11.0, 11.0], [3.0, 11.0]], c("#0078d4"))
+            .fill(vec![[13.0, 3.0], [21.0, 3.0], [21.0, 11.0], [13.0, 11.0]], c("#0078d4"))
+            .fill(vec![[3.0, 13.0], [11.0, 13.0], [11.0, 21.0], [3.0, 21.0]], c("#0078d4"))
+            .fill(vec![[13.0, 13.0], [21.0, 13.0], [21.0, 21.0], [13.0, 21.0]], c("#0078d4"))
+    } else if n.contains("bootstrap") || n.contains("bloxstrap") {
+        Shape::new()
+            .fill(
+                vec![[3.0, 3.0], [21.0, 3.0], [21.0, 21.0], [3.0, 21.0]],
+                c("#7952b3"),
+            )
+            .fill(vec![[8.0, 7.0], [13.0, 7.0], [13.0, 11.0], [8.0, 11.0]], Color::WHITE)
+            .fill(vec![[8.0, 13.0], [15.0, 13.0], [15.0, 17.0], [8.0, 17.0]], Color::WHITE)
+    } else if n.contains("heroic") {
+        Shape::new()
+            .fill(circle(12.0, 12.0, 9.5), c("#8b5cf6"))
+            .fill(vec![[12.0, 5.0], [16.0, 15.0], [12.0, 13.0], [8.0, 15.0]], Color::WHITE)
+            .fill(vec![[10.5, 16.0], [13.5, 16.0], [12.0, 19.5]], c("#ffd24d"))
+    } else if n.contains("anker") {
+        Shape::new()
+            .fill(circle(12.0, 12.0, 9.5), c("#2fa8e0"))
+            .stroke_with(circle(12.0, 8.0, 2.2), true, 1.5, LineCap::Round, Color::WHITE)
+            .line([12.0, 10.0], [12.0, 17.0], 1.5, LineCap::Round, Color::WHITE)
+            .stroke(vec![[7.5, 13.0], [7.5, 17.0], [16.5, 17.0], [16.5, 13.0]], 1.5, Color::WHITE)
+    } else if n.contains("fdm") {
+        Shape::new()
+            .fill(circle(12.0, 12.0, 9.5), c("#3b82c4"))
+            .line([12.0, 6.0], [12.0, 14.0], 1.8, LineCap::Round, Color::WHITE)
+            .stroke(vec![[8.5, 11.0], [12.0, 14.5], [15.5, 11.0]], 1.8, Color::WHITE)
+            .line([7.5, 17.5], [16.5, 17.5], 1.8, LineCap::Round, Color::WHITE)
+    } else {
+        let base = c(app_color(name));
+        let h = name.bytes().fold(0u32, |a, b| a.wrapping_mul(31).wrapping_add(b as u32));
+        let body = Shape::new().fill(
+            vec![[3.0, 3.0], [21.0, 3.0], [21.0, 21.0], [3.0, 21.0]],
+            base,
+        );
+        match h % 3 {
+            0 => body.fill(circle(12.0, 12.0, 4.0), Color::WHITE),
+            1 => body.fill(vec![[12.0, 6.0], [18.0, 17.0], [6.0, 17.0]], Color::WHITE),
+            _ => body
+                .fill(vec![[7.0, 7.0], [17.0, 7.0], [17.0, 10.0], [7.0, 10.0]], Color::WHITE)
+                .fill(vec![[7.0, 13.0], [14.0, 13.0], [14.0, 16.0], [7.0, 16.0]], Color::WHITE),
+        }
+    };
+    let _ = p;
+    canvas(sh.view_box(24.0, 24.0)).size(size, size)
+}
+
+/// A generic document page with a folded corner and a kind-coloured mark.
+fn page_glyph(kind: Kind, size: f32) -> El {
+    let paper = c("#f4f4f4");
+    let fold = c("#c9c9c9");
+    let mut sh = Shape::new()
+        .fill(
+            vec![[5.0, 1.0], [14.0, 1.0], [19.0, 6.0], [19.0, 23.0], [5.0, 23.0]],
+            paper,
+        )
+        .fill(vec![[14.0, 1.0], [14.0, 6.0], [19.0, 6.0]], fold);
+    sh = match kind {
+        Kind::Pdf => sh
+            .fill(vec![[5.0, 14.0], [19.0, 14.0], [19.0, 20.0], [5.0, 20.0]], c("#d94848"))
+            .line([7.0, 9.0], [15.0, 9.0], 1.2, LineCap::Round, c("#9a9a9a"))
+            .line([7.0, 11.5], [17.0, 11.5], 1.2, LineCap::Round, c("#9a9a9a")),
+        Kind::Code => sh
+            .stroke(vec![[10.0, 10.0], [7.5, 13.0], [10.0, 16.0]], 1.4, c("#2f6fd0"))
+            .stroke(vec![[14.0, 10.0], [16.5, 13.0], [14.0, 16.0]], 1.4, c("#2f6fd0")),
+        Kind::Sheet => sh
+            .fill(vec![[7.0, 9.0], [17.0, 9.0], [17.0, 18.0], [7.0, 18.0]], c("#1f8f4e"))
+            .line([10.5, 9.0], [10.5, 18.0], 1.0, LineCap::Butt, paper)
+            .line([14.0, 9.0], [14.0, 18.0], 1.0, LineCap::Butt, paper)
+            .line([7.0, 12.5], [17.0, 12.5], 1.0, LineCap::Butt, paper)
+            .line([7.0, 15.5], [17.0, 15.5], 1.0, LineCap::Butt, paper),
+        Kind::Slides => sh
+            .fill(circle(12.0, 13.0, 4.5), c("#e0642a"))
+            .fill(vec![[12.0, 13.0], [12.0, 8.5], [16.5, 13.0]], paper),
+        Kind::Image => sh
+            .fill(circle(9.5, 9.5, 1.6), c("#f0b232"))
+            .fill(vec![[6.0, 18.0], [10.5, 12.0], [14.0, 16.0], [16.0, 13.5], [18.0, 18.0]], c("#2fa8e0")),
+        Kind::Video => sh
+            .fill(vec![[7.0, 9.0], [17.0, 9.0], [17.0, 18.0], [7.0, 18.0]], c("#3a3f4a"))
+            .fill(vec![[10.5, 11.0], [14.5, 13.5], [10.5, 16.0]], c("#8b5cf6")),
+        Kind::Audio => sh
+            .fill(circle(9.0, 16.0, 2.4), c("#e0518c"))
+            .line([11.4, 16.0], [11.4, 8.0], 1.4, LineCap::Round, c("#e0518c"))
+            .line([11.4, 8.0], [16.0, 9.5], 1.4, LineCap::Round, c("#e0518c")),
+        Kind::Document => sh
+            .line([7.0, 9.0], [17.0, 9.0], 1.2, LineCap::Round, c("#2f6fd0"))
+            .line([7.0, 12.0], [17.0, 12.0], 1.2, LineCap::Round, c("#9a9a9a"))
+            .line([7.0, 15.0], [17.0, 15.0], 1.2, LineCap::Round, c("#9a9a9a"))
+            .line([7.0, 18.0], [13.0, 18.0], 1.2, LineCap::Round, c("#9a9a9a")),
+        _ => sh
+            .line([7.0, 9.0], [17.0, 9.0], 1.2, LineCap::Round, c("#9a9a9a"))
+            .line([7.0, 12.0], [17.0, 12.0], 1.2, LineCap::Round, c("#9a9a9a"))
+            .line([7.0, 15.0], [14.0, 15.0], 1.2, LineCap::Round, c("#9a9a9a")),
+    };
+    canvas(sh.view_box(24.0, 24.0)).size(size, size)
+}
+
+/// The 7-Zip shell mark the captures show for ZIP files: a white page, black 7z.
+fn seven_zip(size: f32) -> El {
+    let sh = Shape::new()
+        .fill(
+            vec![[4.0, 1.0], [15.0, 1.0], [20.0, 6.0], [20.0, 23.0], [4.0, 23.0]],
+            c("#f4f4f4"),
+        )
+        .fill(vec![[15.0, 1.0], [15.0, 6.0], [20.0, 6.0]], c("#c9c9c9"))
+        .view_box(24.0, 24.0);
+    el().size(size, size)
+        .child(canvas(sh).absolute(0.0, 0.0).size(size, size))
         .child(
-            text(mark.to_string())
-                .font(TextStyle::new(8.0, 600.0))
-                .color(Color::WHITE),
+            text("7z")
+                .font(TextStyle::new(size * 0.42, 700.0))
+                .color(c("#1b1b1b"))
+                .absolute(size * 0.22, size * 0.34),
         )
 }
 
+/// Synthetic stand-ins for the five screenshot thumbnails in the reference
+/// capture, drawn as tiny scenes so the grid and preview read as real previews.
+fn screenshot_thumb(index: usize, w: f32, h: f32) -> El {
+    let mut sh = Shape::new();
+    match index % 5 {
+        0 => {
+            sh = sh
+                .fill(vec![[0.0, 0.0], [90.0, 0.0], [90.0, 72.0], [0.0, 72.0]], c("#c9ccd1"))
+                .fill(vec![[10.0, 12.0], [80.0, 12.0], [80.0, 62.0], [10.0, 62.0]], c("#f4f5f7"))
+                .fill(vec![[10.0, 12.0], [80.0, 12.0], [80.0, 20.0], [10.0, 20.0]], c("#e2e5ea"))
+                .fill(circle(15.0, 16.0, 1.6), c("#d94848"))
+                .fill(vec![[16.0, 28.0], [60.0, 28.0], [60.0, 31.0], [16.0, 31.0]], c("#b9bec7"))
+                .fill(vec![[16.0, 36.0], [72.0, 36.0], [72.0, 39.0], [16.0, 39.0]], c("#cdd2d9"))
+                .fill(vec![[16.0, 44.0], [50.0, 44.0], [50.0, 47.0], [16.0, 47.0]], c("#cdd2d9"));
+        }
+        1 => {
+            sh = sh
+                .fill(vec![[0.0, 0.0], [90.0, 0.0], [90.0, 72.0], [0.0, 72.0]], c("#0d1015"))
+                .fill(vec![[62.0, 0.0], [90.0, 0.0], [90.0, 72.0], [62.0, 72.0]], c("#151b26"))
+                .fill(circle(76.0, 20.0, 9.0), c("#1e2735"))
+                .fill(vec![[8.0, 8.0], [56.0, 8.0], [56.0, 12.0], [8.0, 12.0]], c("#e8ecf2"))
+                .fill(vec![[8.0, 16.0], [40.0, 16.0], [40.0, 18.5], [8.0, 18.5]], c("#5d6672"));
+            for i in 0..4 {
+                let y = 24.0 + i as f32 * 8.0;
+                sh = sh
+                    .fill(circle(10.0, y + 1.5, 1.8), c("#3fbf6f"))
+                    .fill(vec![[15.0, y], [48.0, y], [48.0, y + 2.5], [15.0, y + 2.5]], c("#8b93a0"))
+                    .fill(vec![[15.0, y + 3.5], [36.0, y + 3.5], [36.0, y + 5.0], [15.0, y + 5.0]], c("#4a525e"));
+            }
+            sh = sh.fill(vec![[24.0, 60.0], [52.0, 60.0], [52.0, 67.0], [24.0, 67.0]], c("#2f6fd0"));
+        }
+        2 => {
+            sh = sh
+                .fill(vec![[0.0, 0.0], [90.0, 0.0], [90.0, 72.0], [0.0, 72.0]], c("#101318"))
+                .fill(vec![[10.0, 26.0], [80.0, 26.0], [80.0, 46.0], [10.0, 46.0]], c("#1c222c"))
+                .fill(vec![[16.0, 32.0], [56.0, 32.0], [56.0, 35.0], [16.0, 35.0]], c("#d5dae2"))
+                .fill(vec![[16.0, 39.0], [44.0, 39.0], [44.0, 41.5], [16.0, 41.5]], c("#5d6672"));
+        }
+        3 => {
+            sh = sh
+                .fill(vec![[0.0, 0.0], [90.0, 0.0], [90.0, 72.0], [0.0, 72.0]], c("#0e1218"))
+                .fill(vec![[0.0, 0.0], [18.0, 0.0], [18.0, 72.0], [0.0, 72.0]], c("#161c26"))
+                .fill(circle(26.0, 10.0, 2.2), c("#2fa8e0"))
+                .fill(circle(34.0, 10.0, 2.2), c("#8b5cf6"))
+                .fill(circle(42.0, 10.0, 2.2), c("#3fbf6f"));
+            for i in 0..6 {
+                let y = 20.0 + i as f32 * 7.0;
+                let w = 30.0 + ((i * 17) % 26) as f32;
+                sh = sh.fill(vec![[24.0, y], [24.0 + w, y], [24.0 + w, y + 2.4], [24.0, y + 2.4]], c("#6b7482"));
+            }
+        }
+        _ => {
+            sh = sh.fill(vec![[0.0, 0.0], [90.0, 0.0], [90.0, 72.0], [0.0, 72.0]], c("#0c0f14"));
+            for i in 0..8 {
+                let y = 8.0 + i as f32 * 7.0;
+                let w = 24.0 + ((i * 23) % 40) as f32;
+                let ink = if i % 3 == 0 { c("#3fbf6f") } else { c("#7d8590") };
+                sh = sh.fill(vec![[8.0, y], [8.0 + w, y], [8.0 + w, y + 2.4], [8.0, y + 2.4]], ink);
+            }
+        }
+    }
+    canvas(sh.view_box(90.0, 72.0)).size(w, h)
+}
+
+fn file_glyph(e: &Entry, p: Paint, size: f32) -> El {
+    if e.is_dir {
+        return yellow_folder(size, p);
+    }
+    match e.kind {
+        Kind::App => app_glyph(&e.name, size, p),
+        Kind::Archive => {
+            if e.type_label == "ZIP File" {
+                seven_zip(size)
+            } else {
+                archive_folder(size, p)
+            }
+        }
+        Kind::Image if e.fixture => {
+            let idx = e.name.rsplit(' ').next().and_then(|t| t.parse::<usize>().ok());
+            match idx {
+                Some(_) => {
+                    let at = ["095523", "103957", "104522", "111606", "111619"]
+                        .iter()
+                        .position(|t| e.name.ends_with(t))
+                        .unwrap_or(0);
+                    screenshot_thumb(at, size, size * 0.8)
+                }
+                None => page_glyph(Kind::Image, size),
+            }
+        }
+        kind => page_glyph(kind, size),
+    }
+}
+
+/// The Windows 11 local-disk mark: the four-square logo over a grey drive.
 fn drive_glyph(p: Paint, size: f32) -> El {
     let sh = Shape::new()
-        .fill(
-            vec![[1.0, 3.0], [23.0, 3.0], [23.0, 17.0], [1.0, 17.0]],
-            c("#4a90d9"),
-        )
-        .fill(
-            vec![[1.0, 14.0], [23.0, 14.0], [23.0, 17.0], [1.0, 17.0]],
-            c("#2f6ca8"),
-        )
-        .fill(
-            vec![[3.0, 5.0], [10.0, 5.0], [10.0, 9.0], [3.0, 9.0]],
-            Color::WHITE.alpha(0.85),
-        )
-        .fill(
-            vec![[3.0, 18.0], [21.0, 18.0], [21.0, 20.0], [3.0, 20.0]],
-            c("#8f9296"),
-        );
+        .fill(vec![[2.0, 1.0], [9.0, 1.0], [9.0, 8.0], [2.0, 8.0]], c("#0078d4"))
+        .fill(vec![[11.0, 1.0], [18.0, 1.0], [18.0, 8.0], [11.0, 8.0]], c("#0078d4"))
+        .fill(vec![[2.0, 10.0], [9.0, 10.0], [9.0, 17.0], [2.0, 17.0]], c("#0078d4"))
+        .fill(vec![[11.0, 10.0], [18.0, 10.0], [18.0, 17.0], [11.0, 17.0]], c("#0078d4"))
+        .fill(vec![[3.0, 12.0], [21.0, 12.0], [23.0, 15.0], [1.0, 15.0]], c("#e4e8ed"))
+        .fill(vec![[1.0, 15.0], [23.0, 15.0], [23.0, 21.0], [1.0, 21.0]], c("#b9c0c9"))
+        .fill(vec![[1.0, 19.0], [23.0, 19.0], [23.0, 21.0], [1.0, 21.0]], c("#9aa1ab"))
+        .fill(vec![[12.0, 16.5], [21.0, 16.5], [21.0, 17.8], [12.0, 17.8]], c("#6e7681"))
+        .fill(circle(4.5, 17.2, 1.0), c("#3fbf6f"))
+        .view_box(24.0, 24.0);
     let _ = p;
+    canvas(sh).size(size, size)
+}
+
+/// Colourful place marks for the navigation rail and tab, matching the
+/// captures: each place owns a hue, drawn as a small filled glyph.
+fn place_glyph(index: usize, size: f32) -> El {
+    let sh = match index {
+        0 => Shape::new()
+            .fill(vec![[2.0, 12.0], [12.0, 3.0], [22.0, 12.0], [19.0, 12.0], [19.0, 21.0], [5.0, 21.0], [5.0, 12.0]], c("#f5a623"))
+            .fill(vec![[10.0, 14.0], [14.0, 14.0], [14.0, 21.0], [10.0, 21.0]], c("#c77f0a")),
+        1 | 6 => Shape::new()
+            .fill(vec![[2.0, 4.0], [22.0, 4.0], [22.0, 20.0], [2.0, 20.0]], c("#2fa8e0"))
+            .fill(circle(8.0, 9.0, 1.8), Color::WHITE)
+            .fill(vec![[4.0, 18.0], [10.0, 11.0], [14.0, 15.0], [17.0, 12.0], [21.0, 18.0]], Color::WHITE),
+        2 => Shape::new()
+            .fill(circle(8.0, 14.0, 5.0), c("#29a3ec"))
+            .fill(circle(14.0, 11.0, 6.0), c("#29a3ec"))
+            .fill(circle(18.0, 15.0, 4.0), c("#29a3ec"))
+            .fill(vec![[4.0, 15.0], [21.0, 15.0], [21.0, 19.0], [4.0, 19.0]], c("#1b86d8")),
+        3 | 9 => Shape::new()
+            .fill(vec![[2.0, 3.0], [22.0, 3.0], [22.0, 16.0], [2.0, 16.0]], c("#3e9bdd"))
+            .fill(vec![[3.0, 4.0], [21.0, 4.0], [21.0, 12.0], [3.0, 12.0]], c("#6cb8e8"))
+            .fill(vec![[10.0, 16.0], [14.0, 16.0], [14.0, 19.0], [10.0, 19.0]], c("#8a939e"))
+            .fill(vec![[7.0, 19.0], [17.0, 19.0], [17.0, 21.0], [7.0, 21.0]], c("#8a939e")),
+        4 => Shape::new()
+            .line([12.0, 3.0], [12.0, 13.0], 2.2, LineCap::Round, c("#1fae7c"))
+            .stroke(vec![[7.0, 9.0], [12.0, 14.0], [17.0, 9.0]], 2.2, c("#1fae7c"))
+            .stroke(vec![[4.0, 16.0], [4.0, 20.0], [20.0, 20.0], [20.0, 16.0]], 2.0, c("#1fae7c")),
+        5 => Shape::new()
+            .fill(vec![[5.0, 2.0], [14.0, 2.0], [19.0, 7.0], [19.0, 22.0], [5.0, 22.0]], c("#8fa6bc"))
+            .fill(vec![[14.0, 2.0], [14.0, 7.0], [19.0, 7.0]], c("#b9c9d9"))
+            .line([8.0, 11.0], [16.0, 11.0], 1.4, LineCap::Round, Color::WHITE)
+            .line([8.0, 14.5], [16.0, 14.5], 1.4, LineCap::Round, Color::WHITE)
+            .line([8.0, 18.0], [13.0, 18.0], 1.4, LineCap::Round, Color::WHITE),
+        7 => Shape::new()
+            .fill(circle(12.0, 12.0, 10.0), c("#e8734a"))
+            .fill(circle(9.0, 16.0, 2.4), Color::WHITE)
+            .line([11.4, 16.0], [11.4, 7.0], 1.6, LineCap::Round, Color::WHITE)
+            .line([11.4, 7.0], [17.0, 8.8], 1.6, LineCap::Round, Color::WHITE),
+        8 => Shape::new()
+            .fill(vec![[2.0, 4.0], [22.0, 4.0], [22.0, 20.0], [2.0, 20.0]], c("#8b5cf6"))
+            .fill(vec![[4.0, 6.0], [7.0, 6.0], [7.0, 8.0], [4.0, 8.0]], c("#c4a8f8"))
+            .fill(vec![[4.0, 16.0], [7.0, 16.0], [7.0, 18.0], [4.0, 18.0]], c("#c4a8f8"))
+            .fill(vec![[10.0, 8.0], [18.0, 12.0], [10.0, 16.0]], Color::WHITE),
+        _ => Shape::new()
+            .fill(circle(12.0, 10.0, 8.0), c("#3b9bdd"))
+            .stroke_with(circle(12.0, 10.0, 8.0), true, 1.2, LineCap::Round, c("#7cc4ee"))
+            .line([4.0, 10.0], [20.0, 10.0], 1.2, LineCap::Round, c("#7cc4ee"))
+            .stroke(vec![[12.0, 2.0], [8.5, 10.0], [12.0, 18.0], [15.5, 10.0], [12.0, 2.0]], 1.2, c("#7cc4ee"))
+            .fill(vec![[10.0, 18.0], [14.0, 18.0], [14.0, 21.0], [10.0, 21.0]], c("#8a939e"))
+            .fill(vec![[7.0, 21.0], [17.0, 21.0], [17.0, 22.5], [7.0, 22.5]], c("#8a939e")),
+    };
     canvas(sh.view_box(24.0, 24.0)).size(size, size)
 }
 
@@ -1306,6 +1640,11 @@ fn drive_glyph(p: Paint, size: f32) -> El {
 
 fn view(s: &App, cx: &mut Cx<App>) -> El {
     let p = paint(s.dark, cx.env().scale);
+    // The thumb is a window-level overlay driven by the Files viewport; when
+    // that viewport is not mounted nothing refreshes it, so hide it here.
+    if s.view != View::Files {
+        s.scroll_vis.set(0.0);
+    }
     col()
         .key("window")
         .w_full()
@@ -1316,58 +1655,112 @@ fn view(s: &App, cx: &mut Cx<App>) -> El {
         .child(command_bar(s, p))
         .child(body(s, p))
         .child(status_bar(s, p))
+        .child(scroll_thumb(s, p))
+}
+
+/// The drawn scrollbar thumb. Its rect and visibility arrive from the scroll
+/// viewport's `on_scroll_offset` through Live bindings, so scrolling never
+/// re-runs the view; dragging it scrolls the viewport back.
+fn scroll_thumb(s: &App, p: Paint) -> El {
+    el().key("scroll-thumb")
+        .pin(Some(0.0), Some(0.0), None, None)
+        .size(6.0, 28.0)
+        .live_rect(&s.scroll_thumb)
+        .live_opacity(&s.scroll_vis)
+        .radius(3.0)
+        .fill(p.scroll_thumb)
+        .hover(Color::WHITE.alpha(0.25))
+        .cursor(rune::Cursor::Default)
+        .on_drag(|s: &mut App, d: &mut rune::Drag, tx: &mut Tx| {
+            let max = s.scroll_max.get();
+            if max <= 0.0 {
+                return;
+            }
+            match d.phase {
+                Phase::Down => d.data = s.scroll_off.get(),
+                Phase::Move => {
+                    let track = s.scroll_track.get();
+                    let thumb = s.scroll_thumb.get();
+                    let range = (track[3] - thumb[3]).max(1.0);
+                    let off = (d.data + d.dy / range * max).clamp(0.0, max);
+                    tx.scroll_to_instant("viewport", 0.0, off);
+                }
+                Phase::Up => {}
+            }
+        })
 }
 
 fn tab_strip(s: &App, p: Paint) -> El {
     let tab = row()
         .key("tab")
-        .h(32.0)
-        .w(220.0)
+        .h(TAB_ITEM_H)
+        .w(230.0)
         .corners([8.0, 8.0, 0.0, 0.0])
         .fill(p.tab)
-        .px(10.0)
+        .pl(12.0)
+        .pr(6.0)
         .gap(8.0)
         .items_center()
-        .child(ico(p, Ico::Home, 14.0, c(place_color(s.nav))))
-        .child(text(s.tab.as_str()).font(CAPTION).color(p.text).truncate())
-        .child(el().grow(1.0))
-        .child(text("×").font(CAPTION).color(p.tertiary));
+        .child(place_glyph(s.nav, 16.0))
+        .child(
+            text(s.tab.as_str())
+                .font(CAPTION)
+                .color(p.text)
+                .grow(1.0)
+                .min_w(0.0)
+                .truncate(),
+        )
+        .child(
+            el().key("tab-close")
+                .size(22.0, 22.0)
+                .radius(4.0)
+                .hover(p.hover)
+                .center()
+                .child(ico(p, Ico::Close, 11.0, p.secondary))
+                .help("Close tab")
+                .on_press(|s: &mut App| {
+                    s.notice = "The last tab cannot be closed".into();
+                }),
+        );
     let mut strip = row()
         .key("tabs")
         .w_full()
         .h(TAB_H)
         .fill(p.title)
         .items_end()
-        .px(8.0)
-        .gap(4.0)
+        .pl(8.0)
+        .gap(2.0)
         // A borderless window has no system titlebar. This band is it: drag to
         // move, double press to zoom, and the drawn controls below to close.
         .window_drag()
         .child(tab)
         .child(
             el().key("new-tab")
-                .size(28.0, 28.0)
+                .size(30.0, 30.0)
                 .radius(4.0)
                 .hover(p.hover)
                 .center()
-                .child(text("+").font(BODY).color(p.secondary))
+                .child(text("+").font(TextStyle::new(16.0, 400.0)).color(p.secondary))
+                .help("New tab")
                 .on_press(|s: &mut App| {
                     s.notice = "New tabs are not implemented in this slice".into()
                 }),
         )
         .child(el().grow(1.0));
     let controls = [
-        (Ico::Minimize, "win-min"),
-        (Ico::Maximize, "win-max"),
-        (Ico::Close, "win-close"),
+        (Ico::Minimize, "win-min", "Minimize"),
+        (Ico::Maximize, "win-max", "Maximize"),
+        (Ico::Close, "win-close", "Close"),
     ];
-    for (i, (which, key)) in controls.iter().enumerate() {
+    for (i, (which, key, tip)) in controls.iter().enumerate() {
+        let close = i == 2;
         strip = strip.child(
             el().key(*key)
-                .size(46.0, 32.0)
-                .hover(p.hover)
+                .size(46.0, TAB_H)
+                .hover(if close { p.close_hover } else { p.hover })
                 .center()
-                .child(ico(p, *which, 14.0, p.secondary))
+                .child(ico(p, *which, 13.0, p.secondary))
+                .help(*tip)
                 .on_press_tx(move |s: &mut App, tx: &mut Tx| match i {
                     0 => tx.minimize(),
                     1 => {
@@ -1383,13 +1776,17 @@ fn tab_strip(s: &App, p: Paint) -> El {
     strip
 }
 
-fn nav_button(p: Paint, which: Ico, key: &str, action: usize) -> El {
+fn nav_button(p: Paint, which: Ico, key: &str, action: usize, enabled: bool, tip: &str) -> El {
+    let ink = if enabled { p.secondary } else { p.disabled };
     el().key(key)
         .size(30.0, 30.0)
         .radius(4.0)
         .hover(p.hover)
+        .press(p.press)
         .center()
-        .child(ico(p, which, 15.0, p.secondary))
+        .child(ico(p, which, 15.0, ink))
+        .help(tip)
+        .disabled(!enabled)
         .on_press(move |s: &mut App| match action {
             0 => go_back(s),
             1 => go_forward(s),
@@ -1409,41 +1806,46 @@ fn address_row(s: &App, p: Paint) -> El {
         .h(FIELD_H)
         .radius(4.0)
         .fill(p.field)
-        .border(p.hair, p.line)
+        .border(p.hair, p.field_line)
         .px(10.0)
-        .gap(4.0)
+        .gap(6.0)
         .items_center()
-        .child(ico(p, Ico::Desktop, 14.0, p.secondary));
+        .child(if s.view == View::Home {
+            place_glyph(0, 15.0)
+        } else {
+            ico(p, Ico::ThisPc, 15.0, p.secondary)
+        });
     for (i, part) in s.crumbs.iter().enumerate() {
         crumb = crumb
-            .child(ico(p, Ico::ChevronRight, 12.0, p.tertiary))
+            .child(ico(p, Ico::ChevronRight, 10.0, p.tertiary))
             .child(text(part.as_str()).font(CAPTION).color(p.text).truncate());
         if i + 1 == s.crumbs.len() {
-            crumb = crumb.child(ico(p, Ico::ChevronRight, 12.0, p.tertiary));
+            crumb = crumb.child(ico(p, Ico::ChevronRight, 10.0, p.tertiary));
         }
     }
     row()
         .key("address")
         .w_full()
         .h(ADDRESS_H)
-        .fill(p.chrome)
-        .px(8.0)
-        .gap(2.0)
+        .fill(p.toolbar)
+        .px(10.0)
+        .gap(4.0)
         .items_center()
-        .child(nav_button(p, Ico::Back, "back", 0))
-        .child(nav_button(p, Ico::Forward, "forward", 1))
-        .child(nav_button(p, Ico::Up, "up", 2))
-        .child(nav_button(p, Ico::Refresh, "refresh", 3))
-        .child(el().w(8.0))
+        .child(nav_button(p, Ico::Back, "back", 0, !s.history.is_empty(), "Back"))
+        .child(nav_button(p, Ico::Forward, "forward", 1, !s.forward.is_empty(), "Forward"))
+        .child(nav_button(p, Ico::Up, "up", 2, s.root.parent().is_some(), "Up"))
+        .child(nav_button(p, Ico::Refresh, "refresh", 3, true, "Refresh"))
+        .child(el().w(6.0))
         .child(crumb)
+        .child(el().w(6.0))
         .child(
             row()
                 .key("search")
-                .w(220.0)
+                .w(260.0)
                 .h(FIELD_H)
                 .radius(4.0)
                 .fill(p.field)
-                .border(p.hair, p.line)
+                .border(p.hair, p.field_line)
                 .px(10.0)
                 .gap(6.0)
                 .items_center()
@@ -1457,17 +1859,19 @@ fn address_row(s: &App, p: Paint) -> El {
                         .placeholder(s.search.as_str(), p.tertiary)
                         .on_edit(|s: &mut App| &mut s.search_edit),
                 )
-                .child(ico(p, Ico::Search, 14.0, p.accent)),
+                .child(ico(p, Ico::Search, 14.0, p.secondary)),
         )
 }
 
-fn icon_button(p: Paint, which: Ico, dim: bool) -> El {
+fn icon_button(p: Paint, which: Ico, dim: bool, tip: &str) -> El {
     let ink = if dim { p.disabled } else { p.secondary };
     el().size(32.0, 32.0)
         .radius(4.0)
         .hover(p.hover)
+        .press(p.press)
         .center()
-        .child(ico(p, which, 18.0, ink))
+        .child(ico(p, which, 17.0, ink))
+        .help(tip)
 }
 
 fn text_button(p: Paint, which: Ico, label: &str, chevron: bool, dim: bool) -> El {
@@ -1478,6 +1882,7 @@ fn text_button(p: Paint, which: Ico, label: &str, chevron: bool, dim: bool) -> E
         .gap(6.0)
         .radius(4.0)
         .hover(p.hover)
+        .press(p.press)
         .items_center()
         .child(ico(p, which, 16.0, ink))
         .child(
@@ -1486,7 +1891,7 @@ fn text_button(p: Paint, which: Ico, label: &str, chevron: bool, dim: bool) -> E
                 .color(if dim { p.disabled } else { p.text }),
         );
     if chevron {
-        b = b.child(ico(p, Ico::ChevronDown, 11.0, ink));
+        b = b.child(ico(p, Ico::ChevronDown, 10.0, ink));
     }
     b
 }
@@ -1498,24 +1903,30 @@ fn accent_button(p: Paint, which: Ico, label: &str) -> El {
         .gap(6.0)
         .radius(4.0)
         .hover(p.hover)
+        .press(p.press)
         .items_center()
         .child(ico(p, which, 16.0, p.accent))
         .child(text(label).font(CAPTION).color(p.text))
 }
 
 fn command_bar(s: &App, p: Paint) -> El {
+    let has_sel = s.selected.is_some();
     let mut bar = row()
         .key("command")
         .w_full()
         .h(COMMAND_H)
-        .fill(p.chrome)
-        .px(8.0)
+        .fill(p.command)
+        .px(10.0)
         .gap(2.0)
         .items_center()
-        .child(accent_button(p, Ico::New, "New").on_press(|s: &mut App| {
-            s.notice = "New is not implemented in this slice".into();
-        }))
-        .child(el().w(p.hair).h(20.0).fill(p.line));
+        .child(
+            text_button(p, Ico::New, "New", true, false)
+                .help("New item")
+                .on_press(|s: &mut App| {
+                    s.notice = "New is not implemented in this slice".into();
+                }),
+        )
+        .child(el().w(p.hair).h(20.0).fill(p.line).mx(6.0));
     for (which, label) in [
         (Ico::Cut, "Cut"),
         (Ico::Copy, "Copy"),
@@ -1524,40 +1935,50 @@ fn command_bar(s: &App, p: Paint) -> El {
         (Ico::Share, "Share"),
         (Ico::Delete, "Delete"),
     ] {
-        bar = bar.child(icon_button(p, which, true).on_press(move |s: &mut App| {
+        let dim = !has_sel && !matches!(which, Ico::Paste);
+        bar = bar.child(icon_button(p, which, dim, label).on_press(move |s: &mut App| {
             s.notice = format!("{label} is not implemented in this slice");
         }));
     }
     bar = bar
-        .child(el().w(p.hair).h(20.0).fill(p.line))
+        .child(el().w(p.hair).h(20.0).fill(p.line).mx(6.0))
         .child(
-            text_button(p, Ico::Sort, "Sort", true, false).on_press(|s: &mut App| {
-                s.sort = (s.sort + 1) % 4;
-                s.groups.clear();
-                s.keep_order = false;
-                refresh_visible(s);
-                s.notice = format!(
-                    "Sorted by {}",
-                    ["name", "date", "type", "size"][s.sort as usize]
-                );
-            }),
+            text_button(p, Ico::Sort, "Sort", true, s.view == View::Home)
+                .help("Sort")
+                .on_press(|s: &mut App| {
+                    s.sort = (s.sort + 1) % 4;
+                    s.groups.clear();
+                    s.keep_order = false;
+                    refresh_visible(s);
+                    s.notice = format!(
+                        "Sorted by {}",
+                        ["name", "date", "type", "size"][s.sort as usize]
+                    );
+                }),
         )
         .child(
-            text_button(p, Ico::View, "View", true, false).on_press(|s: &mut App| {
-                s.mode = if s.mode == Mode::Details {
-                    Mode::Grid
-                } else {
-                    Mode::Details
-                };
-            }),
-        )
-        .child(
-            text_button(p, Ico::Filter, "Filter", true, false).on_press(|s: &mut App| {
-                s.notice = "Filter is not implemented in this slice".into();
-            }),
+            text_button(p, Ico::View, "View", true, false)
+                .help("View")
+                .on_press(|s: &mut App| {
+                    s.mode = if s.mode == Mode::Details {
+                        Mode::Grid
+                    } else {
+                        Mode::Details
+                    };
+                }),
         );
+    if s.view == View::Home {
+        bar = bar.child(
+            text_button(p, Ico::Filter, "Filter", true, false)
+                .help("Filter")
+                .on_press(|s: &mut App| {
+                    s.notice = "Filter is not implemented in this slice".into();
+                }),
+        );
+    }
     if s.contextual {
         bar = bar
+            .child(el().w(p.hair).h(20.0).fill(p.line).mx(6.0))
             .child(
                 accent_button(p, Ico::SetBackground, "Set as background").on_press(
                     |s: &mut App| {
@@ -1577,15 +1998,24 @@ fn command_bar(s: &App, p: Paint) -> El {
             );
     }
     bar = bar
-        .child(icon_button(p, Ico::More, false).on_press(|s: &mut App| {
-            s.notice = "More commands are not implemented in this slice".into();
-        }))
+        .child(el().w(p.hair).h(20.0).fill(p.line).mx(6.0))
+        .child(
+            icon_button(p, Ico::More, false, "More")
+                .on_press(|s: &mut App| {
+                    s.notice = "More commands are not implemented in this slice".into();
+                }),
+        )
         .child(el().grow(1.0));
-    bar.child(
-        text_button(p, Ico::Details, "Details", false, false).on_press(|s: &mut App| {
+    let details = text_button(p, Ico::Details, "Details", false, false)
+        .help("Toggle the details pane")
+        .on_press(|s: &mut App| {
             s.preview = !s.preview;
-        }),
-    )
+        });
+    bar.child(if s.preview {
+        details.fill(p.rail_sel)
+    } else {
+        details
+    })
 }
 
 fn rail_item(
@@ -1593,7 +2023,6 @@ fn rail_item(
     p: Paint,
     index: usize,
     label: &str,
-    which: Ico,
     chevron: bool,
     pin: bool,
 ) -> El {
@@ -1602,7 +2031,7 @@ fn rail_item(
     let mut item = row()
         .key(format!("rail-{index}"))
         .w_full()
-        .h(30.0)
+        .h(28.0)
         .radius(4.0)
         .fill(if active {
             p.rail_sel
@@ -1617,29 +2046,20 @@ fn rail_item(
         // every element a default opacity entrance and springs colour changes;
         // both read as a jump here, so this subtree lands immediately.
         .motion(Spring::NONE)
-        .instant_changes()
-        // Always mounted: a bar that appears and disappears would fade in.
-        .child(
-            el().w(3.0)
-                .h(16.0)
-                .radius(1.5)
-                .fill(if active { p.accent } else { Color::TRANSPARENT })
-                .absolute(0.0, 7.0),
-        );
+        .instant_changes();
+    if active {
+        item = item.border(p.hair, p.sel_line);
+    }
     if chevron {
-        item = item.child(ico(p, Ico::ChevronRight, 10.0, p.tertiary));
+        item = item.child(ico(p, Ico::ChevronRight, 9.0, p.tertiary));
     } else {
-        item = item.child(el().w(10.0));
+        item = item.child(el().w(9.0));
     }
     item = item
-        .child(ico(p, which, 16.0, c(place_color(index))))
-        .child(text(label).font(BODY).color(ink));
+        .child(place_glyph(index, 16.0))
+        .child(text(label).font(ROW_TEXT).color(ink).grow(1.0).min_w(0.0).truncate());
     if pin {
-        item = item
-            .child(el().grow(1.0))
-            .child(ico(p, Ico::Pin, 10.0, p.tertiary));
-    } else {
-        item = item.child(el().grow(1.0));
+        item = item.child(ico(p, Ico::Pin, 10.0, p.tertiary));
     }
     item.on_press_tx(move |s: &mut App, tx: &mut Tx| {
         navigate(s, index);
@@ -1654,30 +2074,30 @@ fn nav_rail(s: &App, p: Paint) -> El {
         .h_full()
         .fill(p.content)
         .px(4.0)
-        .pt(4.0)
+        .pt(6.0)
         .gap(1.0)
         .motion(Spring::NONE)
         .instant_changes()
-        .child(rail_item(s, p, 0, "Home", Ico::Home, false, false))
-        .child(rail_item(s, p, 1, "Gallery", Ico::Gallery, false, false))
-        .child(rail_item(s, p, 2, "OneDrive", Ico::Cloud, true, false))
-        .child(el().w_full().h(p.hair).fill(p.soft_line).key("rail-sep-1"))
-        .child(rail_item(s, p, 3, "Desktop", Ico::Desktop, false, true))
-        .child(rail_item(s, p, 4, "Downloads", Ico::Downloads, false, true))
-        .child(rail_item(s, p, 5, "Documents", Ico::Documents, false, true))
-        .child(rail_item(s, p, 6, "Pictures", Ico::Pictures, false, true))
-        .child(rail_item(s, p, 7, "Music", Ico::Music, false, true))
-        .child(rail_item(s, p, 8, "Videos", Ico::Videos, false, true))
-        .child(el().w_full().h(p.hair).fill(p.soft_line).key("rail-sep-2"))
-        .child(rail_item(s, p, 9, "This PC", Ico::ThisPc, true, false))
-        .child(rail_item(s, p, 10, "Network", Ico::Network, true, false))
+        .child(rail_item(s, p, 0, "Home", false, false))
+        .child(rail_item(s, p, 1, "Gallery", false, false))
+        .child(rail_item(s, p, 2, "OneDrive", true, false))
+        .child(el().w_full().h(p.hair).fill(p.soft_line).my(5.0).key("rail-sep-1"))
+        .child(rail_item(s, p, 3, "Desktop", false, true))
+        .child(rail_item(s, p, 4, "Downloads", false, true))
+        .child(rail_item(s, p, 5, "Documents", false, true))
+        .child(rail_item(s, p, 6, "Pictures", false, true))
+        .child(rail_item(s, p, 7, "Music", false, true))
+        .child(rail_item(s, p, 8, "Videos", false, true))
+        .child(el().w_full().h(p.hair).fill(p.soft_line).my(5.0).key("rail-sep-2"))
+        .child(rail_item(s, p, 9, "This PC", true, false))
+        .child(rail_item(s, p, 10, "Network", true, false))
         .child(el().grow(1.0))
 }
 
-fn column_header(p: Paint, cols: &[(&str, f32)], right_last: bool) -> El {
+fn column_header(p: Paint, cols: &[(&str, f32)], right_last: bool, separators: bool) -> El {
     let mut h = row().key("header").w_full().h(HEADER_H).items_center();
     for (i, (label, w)) in cols.iter().enumerate() {
-        if i > 0 {
+        if i > 0 && separators {
             h = h.child(el().w(p.hair).h(16.0).fill(p.line));
         }
         let t = text(*label).font(CAPTION).color(p.secondary);
@@ -1700,12 +2120,25 @@ fn group_header(p: Paint, label: &str) -> El {
     row()
         .key(format!("group-{label}"))
         .w_full()
-        .h(30.0)
+        .h(GROUP_H)
         .px(12.0)
         .gap(6.0)
         .items_center()
-        .child(ico(p, Ico::ChevronDown, 11.0, p.secondary))
-        .child(text(label).font(TILE_TEXT).color(p.text))
+        .child(ico(p, Ico::ChevronDown, 10.0, p.secondary))
+        .child(text(label).font(GROUP_TEXT).color(p.text))
+}
+
+/// Record a selection and the status-bar detail Explorer shows beside the count.
+fn select_entry(s: &mut App, ei: usize) {
+    s.selected = Some(ei);
+    s.focused = Some(ei);
+    s.notice.clear();
+    let size = s.entries[ei].size_label();
+    s.selection_detail = if size.is_empty() {
+        "1 item selected".into()
+    } else {
+        format!("1 item selected  {size}")
+    };
 }
 
 fn file_row(s: &App, i: usize, p: Paint) -> El {
@@ -1713,24 +2146,17 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
     let e = &s.entries[ei];
     let selected = s.selected == Some(ei);
     let focused = s.focused == Some(ei);
-    let fill = if selected {
-        p.row_sel
-    } else if focused {
-        p.hover
-    } else {
-        Color::TRANSPARENT
-    };
     let path = e.path.clone();
     let mut line = row()
         .key(format!("row-{i}"))
         .w_full()
         .h(ROW_H)
         .items_center()
-        .fill(fill)
+        .fill(if selected { p.row_sel } else { Color::TRANSPARENT })
         .hover(p.hover)
         .motion(Spring::NONE);
     if focused && selected {
-        line = line.border(p.hair, p.accent);
+        line = line.border(p.hair, p.focus_line);
     }
     let line = line
         .child(
@@ -1740,11 +2166,13 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
                 .pr(8.0)
                 .gap(8.0)
                 .items_center()
-                .child(file_glyph(e, p, 20.0))
+                .child(file_glyph(e, p, 16.0))
                 .child(
                     text(e.name.as_str())
                         .font(ROW_TEXT)
                         .color(p.text)
+                        .grow(1.0)
+                        .min_w(0.0)
                         .truncate(),
                 ),
         )
@@ -1779,8 +2207,7 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
     let double_path = path.clone();
     line.on_press(move |s: &mut App| {
         if let Some(at) = s.entries.iter().position(|entry| entry.path == path) {
-            s.selected = Some(at);
-            s.focused = Some(at);
+            select_entry(s, at);
         }
     })
     .on_double_press(move |s: &mut App| {
@@ -1793,16 +2220,63 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
     })
 }
 
-fn details_rows(s: &App, p: Paint) -> El {
+/// Wrap list content in a scroll viewport plus a drawn scrollbar gutter. The
+/// viewport reports its offset into Live bindings each frame; the window-level
+/// thumb follows without a view re-run, and the gutter reserves its lane.
+fn scrollable(s: &App, content: El) -> El {
+    let track = s.scroll_track.clone();
+    let thumb = s.scroll_thumb.clone();
+    let vis = s.scroll_vis.clone();
+    let max = s.scroll_max.clone();
+    let off = s.scroll_off.clone();
     let viewport = col()
         .key("viewport")
+        .grow(1.0)
+        .min_w(0.0)
+        .min_h(0.0)
+        .h_full()
+        .scroll(ScrollSpec {
+            stick_bottom: false,
+        })
+        .on_scroll_offset(move |at| {
+            max.set(at.max[1]);
+            off.set(at.offset[1]);
+            let t = track.get();
+            if at.max[1] <= 0.5 || t[3] <= 0.0 {
+                vis.set(0.0);
+                return;
+            }
+            vis.set(1.0);
+            let h = (at.viewport[1] / (at.viewport[1] + at.max[1]) * t[3]).max(28.0);
+            let y = t[1] + (at.offset[1] / at.max[1]) * (t[3] - h);
+            thumb.set([t[0] + (GUTTER_W - 6.0) / 2.0, y, 6.0, h]);
+        });
+    row()
+        .key("list-area")
         .w_full()
         .grow(1.0)
         .min_h(0.0)
-        .scroll(ScrollSpec {
-            stick_bottom: false,
-        });
-    if !s.groups.is_empty() {
+        .child(viewport.child(content))
+        .child(
+            el().key("scroll-track")
+                .w(GUTTER_W)
+                .h_full()
+                .drawn_rect_into(&s.scroll_track)
+                .on_drag(|s: &mut App, d: &mut rune::Drag, tx: &mut Tx| {
+                    let max = s.scroll_max.get();
+                    if max <= 0.0 || !matches!(d.phase, Phase::Down) {
+                        return;
+                    }
+                    let thumb = s.scroll_thumb.get();
+                    let range = (d.h - thumb[3]).max(1.0);
+                    let off = ((d.y - thumb[3] / 2.0) / range * max).clamp(0.0, max);
+                    tx.scroll_to_instant("viewport", 0.0, off);
+                }),
+        )
+}
+
+fn details_rows(s: &App, p: Paint) -> El {
+    let list = if !s.groups.is_empty() {
         let mut list = col().key("rows").w_full();
         for i in 0..s.visible.len() {
             if let Some((_, label)) = s.groups.iter().find(|(start, _)| *start == i) {
@@ -1810,9 +2284,8 @@ fn details_rows(s: &App, p: Paint) -> El {
             }
             list = list.child(file_row(s, i, p));
         }
-        return viewport.child(list);
-    }
-    viewport.child(
+        list
+    } else {
         col()
             .key("rows")
             .w_full()
@@ -1822,8 +2295,9 @@ fn details_rows(s: &App, p: Paint) -> El {
                 ROW_H,
                 |s: &App, i| Cow::Borrowed(s.entries[s.visible[i]].path.as_str()),
                 move |s: &App, i| file_row(s, i, p),
-            ),
-    )
+            )
+    };
+    scrollable(s, list)
 }
 
 fn grid_tile(s: &App, i: usize, p: Paint) -> El {
@@ -1831,177 +2305,185 @@ fn grid_tile(s: &App, i: usize, p: Paint) -> El {
     let e = &s.entries[ei];
     let selected = s.selected == Some(ei);
     let path = e.path.clone();
-    col()
+    let preview = if e.kind == Kind::Image && e.fixture {
+        let at = ["095523", "103957", "104522", "111606", "111619"]
+            .iter()
+            .position(|t| e.name.ends_with(t))
+            .unwrap_or(0);
+        screenshot_thumb(at, 90.0, 72.0)
+    } else {
+        el().w(90.0).h(72.0).center().child(file_glyph(e, p, 44.0))
+    };
+    let mut tile = col()
         .key(format!("tile-{i}"))
-        .w(104.0)
-        .h(140.0)
+        .w(106.0)
         .radius(4.0)
-        .fill(if selected {
-            p.rail_sel
-        } else {
-            Color::TRANSPARENT
-        })
+        .fill(if selected { p.rail_sel } else { Color::TRANSPARENT })
         .hover(p.hover)
-        .pt(10.0)
+        .pt(8.0)
+        .pb(8.0)
         .px(6.0)
         .gap(6.0)
         .items_center()
-        .child(
-            el().w(88.0)
-                .h(72.0)
-                .radius(2.0)
-                .fill(p.field)
-                .border(p.hair, p.line)
-                .center()
-                .child(file_glyph(e, p, 44.0)),
-        )
+        .motion(Spring::NONE)
+        .child(preview)
         .child(
             text(e.name.as_str())
                 .font(CAPTION)
                 .color(p.text)
-                .w(92.0)
+                .w(94.0)
                 .align(Align::Center)
-                .max_lines(2),
-        )
-        .on_press(move |s: &mut App| {
-            if let Some(at) = s.entries.iter().position(|entry| entry.path == path) {
-                s.selected = Some(at);
-                s.focused = Some(at);
-            }
-        })
+                .max_lines(3),
+        );
+    if selected {
+        tile = tile.border(p.hair, p.focus_line);
+    }
+    tile.on_press(move |s: &mut App| {
+        if let Some(at) = s.entries.iter().position(|entry| entry.path == path) {
+            select_entry(s, at);
+        }
+    })
 }
 
 fn grid_rows(s: &App, p: Paint) -> El {
-    col()
-        .key("viewport")
+    let tiles = row()
+        .key("tiles")
         .w_full()
-        .grow(1.0)
-        .min_h(0.0)
-        .scroll(ScrollSpec {
-            stick_bottom: false,
-        })
-        .child(
-            row()
-                .key("tiles")
-                .w_full()
-                .pt(16.0)
-                .px(12.0)
-                .gap(8.0)
-                .children((0..s.visible.len()).map(|i| grid_tile(s, i, p))),
-        )
+        .flex_wrap()
+        .pt(12.0)
+        .px(16.0)
+        .gap(8.0)
+        .children((0..s.visible.len()).map(|i| grid_tile(s, i, p)));
+    scrollable(s, tiles)
 }
 
-fn quick_tile(p: Paint, label: &str, which: Ico, color: &str) -> El {
+fn quick_tile(p: Paint, label: &str, mark: Ico, top: &str, bottom: &str, back: &str, nav: usize) -> El {
     row()
-        .w(220.0)
-        .h(64.0)
+        .w(272.0)
+        .h(60.0)
+        .radius(4.0)
+        .hover(p.hover)
+        .px(12.0)
         .gap(12.0)
         .items_center()
-        .child(
-            el().size(40.0, 40.0)
-                .radius(2.0)
-                .fill(c(color))
-                .center()
-                .child(ico(p, which, 22.0, Color::WHITE))
-                .child(ico(p, Ico::Pin, 9.0, Color::WHITE).absolute(28.0, 28.0)),
-        )
+        .child(folder(40.0, top, bottom, back, Some(mark), p))
         .child(
             col()
-                .gap(2.0)
+                .gap(1.0)
                 .child(text(label).font(TILE_TEXT).color(p.text))
-                .child(text("Stored locally").font(CAPTION).color(p.tertiary)),
+                .child(text("Stored locally").font(CAPTION).color(p.tertiary))
+                .child(ico(p, Ico::Pin, 9.0, p.tertiary)),
         )
+        .on_press_tx(move |s: &mut App, tx: &mut Tx| {
+            navigate(s, nav);
+            tx.instant();
+        })
 }
 
 fn home_content(s: &App, p: Paint) -> El {
     let tiles = [
-        ("Desktop", Ico::Desktop, kind_hex(Kind::Folder)),
-        ("Downloads", Ico::Downloads, "#1f9e6e"),
-        ("Documents", Ico::Documents, "#2f6fd0"),
-        ("Pictures", Ico::Pictures, "#1f9e6e"),
-        ("Music", Ico::Music, "#e0518c"),
-        ("Videos", Ico::Videos, "#8b5cf6"),
+        ("Desktop", Ico::Desktop, "#2bbad8", "#046cbd", "#0a5a9e", 3usize),
+        ("Downloads", Ico::Downloads, "#2bc79a", "#0e9f76", "#0b7a5a", 4),
+        ("Documents", Ico::Documents, "#b9c9d9", "#8fa6bc", "#7488a0", 5),
+        ("Pictures", Ico::Pictures, "#2bb3e8", "#0e7fc4", "#0a6298", 6),
+        ("Music", Ico::Music, "#f2a06b", "#e06a3c", "#b8542e", 7),
+        ("Videos", Ico::Videos, "#a86fe8", "#7b3fd0", "#6230a8", 8),
     ];
-    let mut grid = col().w_full().px(16.0).pt(12.0).gap(8.0);
-    for pair in tiles.chunks(3) {
-        let mut line = row().w_full().gap(8.0);
-        for (label, which, color) in pair {
-            line = line.child(quick_tile(p, *label, *which, *color));
+    let mut grid = col().w_full().pt(10.0).gap(6.0);
+    for chunk in tiles.chunks(3) {
+        let mut line = row().w_full().justify_center().gap(12.0);
+        for (label, mark, top, bottom, back, nav) in chunk {
+            line = line.child(quick_tile(p, label, *mark, top, bottom, back, *nav));
         }
         grid = grid.child(line);
     }
-    let recent = row()
+    let recent_on = s.home_tab == 0;
+    let pills = row()
         .w_full()
-        .pt(16.0)
+        .pt(14.0)
         .px(16.0)
         .gap(8.0)
+        .items_center()
+        .child(ico(p, Ico::ChevronDown, 10.0, p.secondary))
         .child(
             row()
                 .h(30.0)
                 .px(14.0)
                 .radius(15.0)
-                .fill(p.accent_fill)
-                .gap(8.0)
+                .fill(if recent_on { p.accent } else { p.pill_off })
+                .hover(p.hover)
+                .gap(7.0)
                 .items_center()
-                .child(ico(p, Ico::Info, 13.0, Color::WHITE))
-                .child(text("Recent").font(CAPTION).color(Color::WHITE)),
+                .child(ico(p, Ico::Clock, 14.0, if recent_on { p.accent_ink } else { p.secondary }))
+                .child(text("Recent").font(CAPTION).color(if recent_on { p.accent_ink } else { p.text }))
+                .on_press(|s: &mut App| s.home_tab = 0),
         )
         .child(
             row()
                 .h(30.0)
                 .px(14.0)
                 .radius(15.0)
-                .fill(p.field)
-                .gap(8.0)
+                .fill(if recent_on { p.pill_off } else { p.accent })
+                .hover(p.hover)
+                .gap(7.0)
                 .items_center()
-                .child(ico(p, Ico::Gallery, 13.0, p.secondary))
-                .child(text("Favorites").font(CAPTION).color(p.text)),
+                .child(ico(p, Ico::Star, 14.0, if recent_on { p.secondary } else { p.accent_ink }))
+                .child(text("Favorites").font(CAPTION).color(if recent_on { p.text } else { p.accent_ink }))
+                .on_press(|s: &mut App| s.home_tab = 1),
         );
-    let mut table = col().w_full().pt(16.0);
-    table = table.child(column_header(
-        p,
-        &[
-            ("Name", 440.0),
-            ("Date accessed", 220.0),
-            ("Activity", 160.0),
-        ],
-        false,
-    ));
-    for &ei in s.visible.iter() {
-        let e = &s.entries[ei];
+    let mut table = col().w_full().pt(14.0);
+    if recent_on {
+        table = table.child(column_header(
+            p,
+            &[("Name", 440.0), ("Date accessed", 240.0), ("Activity", 160.0)],
+            false,
+            false,
+        ));
+        for &ei in s.visible.iter() {
+            let e = &s.entries[ei];
+            table = table.child(
+                row()
+                    .w_full()
+                    .h(46.0)
+                    .items_center()
+                    .hover(p.hover)
+                    .child(
+                        row()
+                            .w(440.0)
+                            .pl(16.0)
+                            .gap(10.0)
+                            .items_center()
+                            .child(file_glyph(e, p, 24.0))
+                            .child(
+                                col()
+                                    .gap(1.0)
+                                    .child(
+                                        text(e.name.as_str())
+                                            .font(ROW_TEXT)
+                                            .color(p.text)
+                                            .truncate(),
+                                    )
+                                    .child(text(e.type_label.as_str()).font(CAPTION).color(p.tertiary)),
+                            ),
+                    )
+                    .child(
+                        col()
+                            .w(240.0)
+                            .pl(12.0)
+                            .child(text(e.modified.as_str()).font(ROW_TEXT).color(p.secondary)),
+                    )
+                    .child(col().w(160.0))
+                    .on_press(move |st: &mut App| select_entry(st, ei)),
+            );
+        }
+    } else {
         table = table.child(
-            row()
+            col()
                 .w_full()
-                .h(34.0)
-                .items_center()
-                .child(
-                    row()
-                        .w(440.0)
-                        .pl(12.0)
-                        .gap(8.0)
-                        .items_center()
-                        .child(file_glyph(e, p, 20.0))
-                        .child(
-                            text(e.name.as_str())
-                                .font(ROW_TEXT)
-                                .color(p.text)
-                                .truncate(),
-                        ),
-                )
-                .child(
-                    col()
-                        .w(220.0)
-                        .pl(12.0)
-                        .child(text(e.modified.as_str()).font(ROW_TEXT).color(p.secondary)),
-                )
-                .child(
-                    col().w(160.0).pl(12.0).child(
-                        text(e.type_label.as_str())
-                            .font(ROW_TEXT)
-                            .color(p.secondary),
-                    ),
-                )
-                .on_press(move |st: &mut App| st.selected = Some(ei)),
+                .h(120.0)
+                .center()
+                .child(ico(p, Ico::Star, 28.0, p.disabled))
+                .child(text("No favorites yet").font(CAPTION).color(p.tertiary)),
         );
     }
     col()
@@ -2013,45 +2495,55 @@ fn home_content(s: &App, p: Paint) -> El {
         .child(
             row()
                 .w_full()
-                .h(30.0)
+                .h(34.0)
                 .px(16.0)
                 .gap(6.0)
                 .items_center()
-                .child(ico(p, Ico::ChevronDown, 11.0, p.secondary))
+                .child(ico(p, Ico::ChevronDown, 10.0, p.secondary))
                 .child(text("Quick access").font(TILE_TEXT).color(p.text)),
         )
         .child(grid)
-        .child(recent)
+        .child(pills)
         .child(table)
 }
 
 fn this_pc_content(s: &App, p: Paint) -> El {
-    let drive = col()
-        .w(240.0)
+    let selected = s.selected == Some(0);
+    let drive = row()
+        .w(250.0)
         .h(64.0)
+        .radius(4.0)
         .px(8.0)
-        .gap(6.0)
+        .gap(10.0)
+        .items_center()
+        .fill(if selected { p.row_sel } else { Color::TRANSPARENT })
+        .hover(p.hover)
+        .child(drive_glyph(p, 40.0))
         .child(
-            row()
-                .w_full()
-                .gap(8.0)
-                .items_center()
-                .child(drive_glyph(p, 32.0))
-                .child(text("Local Disk (C:)").font(ROW_TEXT).color(p.text)),
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .gap(4.0)
+                .child(text("Local Disk (C:)").font(ROW_TEXT).color(p.text))
+                .child(
+                    el().w_full()
+                        .h(10.0)
+                        .radius(2.0)
+                        .fill(c("#e6e6e6"))
+                        .child(el().w_frac(0.145).h_full().radius(2.0).fill(c("#0070cb"))),
+                )
+                .child(
+                    text("1.55 TB free of 1.81 TB")
+                        .font(CAPTION)
+                        .color(p.tertiary),
+                ),
         )
-        .child(
-            el().w_full()
-                .h(4.0)
-                .radius(2.0)
-                .fill(p.field)
-                .child(el().w(36.0).h_full().radius(2.0).fill(p.accent_fill)),
-        )
-        .child(
-            text("1.56 TB free of 1.81 TB")
-                .font(CAPTION)
-                .color(p.tertiary),
-        );
-    let _ = s;
+        .on_press(|s: &mut App| select_entry(s, 0))
+        .on_double_press(|s: &mut App| {
+            if let Some(path) = std::env::var_os("SystemDrive").map(|d| PathBuf::from(format!("{}\\", d.to_string_lossy()))) {
+                go(s, path);
+            }
+        });
     col()
         .key("thispc")
         .grow(1.0)
@@ -2066,7 +2558,7 @@ fn this_pc_content(s: &App, p: Paint) -> El {
                 .h(30.0)
                 .gap(6.0)
                 .items_center()
-                .child(ico(p, Ico::ChevronDown, 11.0, p.secondary))
+                .child(ico(p, Ico::ChevronDown, 10.0, p.secondary))
                 .child(text("Devices and drives").font(TILE_TEXT).color(p.text)),
         )
         .child(drive)
@@ -2083,10 +2575,10 @@ fn preview_pane(s: &App, p: Paint) -> El {
                 col()
                     .w_full()
                     .h(210.0)
+                    .fill(p.thumb_bg)
                     .center()
-                    .child(ico(p, Ico::Monitor, 96.0, p.accent_fill)),
+                    .child(ico(p, Ico::Monitor, 92.0, p.accent_fill)),
             )
-            .child(el().w_full().h(p.hair).fill(p.line))
             .child(
                 col()
                     .w_full()
@@ -2097,10 +2589,10 @@ fn preview_pane(s: &App, p: Paint) -> El {
                     .child(
                         row()
                             .w_full()
-                            .h(76.0)
                             .radius(4.0)
                             .border(p.hair, p.line)
                             .px(12.0)
+                            .py(14.0)
                             .gap(10.0)
                             .items_center()
                             .child(ico(p, Ico::Info, 16.0, p.secondary))
@@ -2115,67 +2607,101 @@ fn preview_pane(s: &App, p: Paint) -> El {
                     ),
             )
     } else {
-        let e = s.entries.get(s.selected.unwrap_or(0));
+        let e = s.selected.and_then(|i| s.entries.get(i)).or_else(|| s.entries.first());
         let name = e.map(|x| x.name.as_str()).unwrap_or("");
-        let mut details = col()
-            .w_full()
-            .px(24.0)
-            .gap(12.0)
-            .child(text("Details").font(TILE_TEXT).color(p.text));
-        for (k, v) in [
-            (
-                "Type",
-                e.map(|x| x.type_label.as_str()).unwrap_or("PNG File"),
-            ),
-            ("Size", "131 KB"),
-            ("File location", "Pictures / Screenshots"),
-            ("Date modified", "11/6/2026 10:39 AM"),
-        ] {
-            details = details.child(
-                row()
-                    .w_full()
-                    .items_center()
-                    .child(
-                        col()
-                            .w(110.0)
-                            .child(text(k).font(CAPTION).color(p.tertiary)),
-                    )
-                    .child(text(v).font(CAPTION).color(p.secondary).truncate()),
-            );
-        }
         let thumb = match e {
+            Some(entry) if entry.kind == Kind::Image && entry.fixture => {
+                let at = ["095523", "103957", "104522", "111606", "111619"]
+                    .iter()
+                    .position(|t| entry.name.ends_with(t))
+                    .unwrap_or(0);
+                col()
+                    .w_full()
+                    .h(210.0)
+                    .fill(p.thumb_bg)
+                    .center()
+                    .child(screenshot_thumb(at, PREVIEW_W - 2.0, 210.0))
+            }
             Some(entry) => col()
                 .w_full()
                 .h(210.0)
-                .fill(p.field)
+                .fill(p.thumb_bg)
                 .center()
                 .child(file_glyph(entry, p, 64.0)),
-            None => col().w_full().h(210.0).fill(p.field),
+            None => col().w_full().h(210.0).fill(p.thumb_bg),
         };
+        let location = s.crumbs.join(" / ");
+        let mut details = col()
+            .w_full()
+            .px(24.0)
+            .pt(18.0)
+            .gap(10.0)
+            .child(text("Details").font(TILE_TEXT).color(p.text));
+        let rows: [(&str, String); 4] = [
+            ("Type", e.map(|x| x.type_label.clone()).unwrap_or_default()),
+            ("Size", e.map(|x| x.size_label()).unwrap_or_default()),
+            ("File location", location),
+            ("Date modified", e.map(|x| x.modified.clone()).unwrap_or_default()),
+        ];
+        for (k, v) in rows {
+            details = details.child(
+                row()
+                    .w_full()
+                    .gap(8.0)
+                    .items_center()
+                    .child(col().w(96.0).child(text(k).font(CAPTION).color(p.tertiary)))
+                    .child(
+                        text(v)
+                            .font(CAPTION)
+                            .color(p.secondary)
+                            .grow(1.0)
+                            .min_w(0.0)
+                            .align(Align::End)
+                            .truncate(),
+                    ),
+            );
+        }
         col()
             .grow(1.0)
             .min_h(0.0)
             .w_full()
             .fill(p.content)
             .child(thumb)
-            .child(el().w_full().h(p.hair).fill(p.line))
             .child(
                 col()
                     .w_full()
                     .px(24.0)
-                    .pt(20.0)
-                    .gap(14.0)
-                    .child(text(name).font(TILE_TEXT).color(p.text))
+                    .pt(18.0)
+                    .gap(12.0)
+                    .child(
+                        row()
+                            .w_full()
+                            .gap(10.0)
+                            .items_center()
+                            .child(ico(p, Ico::Pictures, 22.0, p.secondary))
+                            .child(
+                                text(name)
+                                    .font(TextStyle::new(13.0, 600.0).lh(18.0))
+                                    .color(p.text)
+                                    .grow(1.0)
+                                    .min_w(0.0)
+                                    .max_lines(2),
+                            ),
+                    )
                     .child(
                         row()
                             .h(30.0)
                             .px(10.0)
                             .radius(4.0)
-                            .border(p.hair, p.line)
+                            .fill(p.pill_off)
+                            .hover(p.hover)
                             .gap(8.0)
                             .items_center()
                             .child(ico(p, Ico::ShareSmall, 14.0, p.accent))
-                            .child(text("Share").font(CAPTION).color(p.text)),
+                            .child(text("Share").font(CAPTION).color(p.text))
+                            .on_press(|s: &mut App| {
+                                s.notice = "Share is not implemented in this slice".into();
+                            }),
                     ),
             )
             .child(details)
@@ -2208,6 +2734,7 @@ fn content(s: &App, p: Paint) -> El {
                         ("Type", TYPE_W),
                         ("Size", SIZE_W),
                     ],
+                    true,
                     true,
                 )
             } else {
@@ -2250,6 +2777,17 @@ fn status_bar(s: &App, p: Paint) -> El {
     } else {
         s.notice.as_str()
     };
+    let toggle = |which: Ico, active: bool, grid: bool| {
+        el().size(24.0, 18.0)
+            .radius(3.0)
+            .fill(if active { p.rail_sel } else { Color::TRANSPARENT })
+            .hover(p.hover)
+            .center()
+            .child(ico(p, which, 13.0, if active { p.text } else { p.tertiary }))
+            .on_press(move |s: &mut App| {
+                s.mode = if grid { Mode::Grid } else { Mode::Details };
+            })
+    };
     row()
         .key("status")
         .w_full()
@@ -2274,8 +2812,31 @@ fn status_bar(s: &App, p: Paint) -> El {
             p.accent
         }))
         .child(el().grow(1.0))
-        .child(ico(p, Ico::View, 14.0, p.tertiary))
-        .child(ico(p, Ico::Details, 14.0, p.tertiary))
+        .child(
+            row()
+                .gap(1.0)
+                .px(2.0)
+                .py(1.0)
+                .radius(4.0)
+                .border(p.hair, p.line)
+                .child(toggle(Ico::List, s.mode == Mode::Details, false))
+                .child(toggle(Ico::Grid, s.mode == Mode::Grid, true)),
+        )
+}
+
+/// Register the system Segoe UI faces so the shell reads in Explorer's own
+/// type rather than Rune's bundled Inter. Rune does not load system fonts, so
+/// the bytes are read once and leaked for the process lifetime; when the faces
+/// are absent the family list falls back to Inter.
+fn load_fonts() -> &'static [&'static [u8]] {
+    let windir = std::env::var("WINDIR").unwrap_or_else(|_| "C:\\Windows".into());
+    let mut out: Vec<&'static [u8]> = Vec::new();
+    for name in ["segoeui.ttf", "seguisb.ttf", "segoeuib.ttf", "segoeuil.ttf", "consola.ttf"] {
+        if let Ok(bytes) = fs::read(format!("{windir}\\Fonts\\{name}")) {
+            out.push(Box::leak(bytes.into_boxed_slice()));
+        }
+    }
+    Box::leak(out.into_boxed_slice())
 }
 
 fn main() {
@@ -2295,6 +2856,8 @@ fn main() {
             ("thispc", |s| load(s, Fixture::ThisPc)),
         ],
         poll: Some(poll),
+        fonts: load_fonts(),
+        families: ("Segoe UI, Inter", "Consolas, IBM Plex Mono"),
         ..AppSpec::new("Lyre", (1076.0, 600.0), init, view)
     };
     let probe = init();

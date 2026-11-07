@@ -23,13 +23,14 @@ use std::time::{Instant, UNIX_EPOCH};
 use rune::color::hex;
 use rune::{
     Align, AppSpec, Color, Cx, El, GrowthSpec, Image, ImageCache, Key, KeyEvent, LineCap, Live,
-    Phase, Pixels, ScrollSpec, Shape, Spring, SurfaceFit, TextEdit, TextStyle, Tx, WindowOptions,
-    WindowSpec, canvas, col, el, row, run_windows, text, text_input,
+    Phase, Pixels, ScrollSpec, Shape, Span, Spring, SurfaceFit, TextEdit, TextStyle, Tx,
+    WindowOptions, WindowSpec, canvas, col, el, row, run_windows, text, text_input,
 };
 
 mod fileops;
 mod frame;
 mod imagery;
+mod search;
 mod shell;
 
 // Metrics and colours sampled from the four reference captures. The chrome is
@@ -418,7 +419,6 @@ struct App {
     selection_detail: String,
     notice: String,
     search_edit: TextEdit,
-    last_query: String,
     history: Vec<PathBuf>,
     forward: Vec<PathBuf>,
     sort: u8,
@@ -456,6 +456,17 @@ struct App {
     op_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// The open modal dialog (delete confirm, paste conflict, rename, new folder).
     dialog: Option<Dialog>,
+    /// Live search: results stream from a worker into these, replacing the list.
+    searching: bool,
+    search_hits: Vec<search::Hit>,
+    search_matched: usize,
+    search_scanned: usize,
+    search_elapsed: u64,
+    search_truncated: bool,
+    search_busy: bool,
+    search_query: String,
+    search_rx: Option<std::sync::mpsc::Receiver<search::Event>>,
+    search_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Trigger and window rects in window points, read to anchor and clamp menus.
     rect_new: Live<[f32; 4]>,
     rect_sort: Live<[f32; 4]>,
@@ -595,19 +606,6 @@ fn place_path(index: usize) -> Option<PathBuf> {
         _ => return None,
     };
     Some(home.join(sub))
-}
-
-/// Recompute the row order after a scan, a search keystroke, or a sort click.
-/// Open a folder by path, or report that launching files is still deferred.
-fn open_entry(s: &mut App, path: &str) {
-    if let Some(at) = s.entries.iter().position(|e| e.path == path) {
-        if s.entries[at].is_dir {
-            let next = PathBuf::from(&s.entries[at].path);
-            go(s, next);
-        } else if let Err(e) = shell::open_default(path) {
-            s.notice = e;
-        }
-    }
 }
 
 /// Details/List row height: Compact view tightens the rows Explorer-style.
@@ -877,15 +875,25 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
     if s.transfer.is_some() {
         tx.wake_after(std::time::Duration::from_millis(60));
     }
-    if s.search_edit.text != s.last_query {
-        s.last_query = s.search_edit.text.clone();
-        refresh_visible(s);
+    changed |= drain_search(s);
+    if s.search_busy {
+        tx.wake_after(std::time::Duration::from_millis(40));
+    }
+    if s.search_edit.text != s.search_query {
+        let q = s.search_edit.text.clone();
+        if q.trim().is_empty() {
+            clear_search(s);
+            refresh_visible(s);
+        } else {
+            start_search(s, q);
+        }
         changed = true;
     }
     changed
 }
 
 fn set_location(s: &mut App, path: PathBuf) {
+    clear_search(s);
     let (entries, scan_ms) = scan(&path);
     let crumbs: Vec<String> = path
         .components()
@@ -1239,7 +1247,6 @@ fn init() -> App {
         selection_detail: String::new(),
         notice: String::new(),
         search_edit: TextEdit::default(),
-        last_query: String::new(),
         history: Vec::new(),
         forward: Vec::new(),
         sort: 0,
@@ -1267,6 +1274,16 @@ fn init() -> App {
         op_rx: None,
         op_cancel: None,
         dialog: None,
+        searching: false,
+        search_hits: Vec::new(),
+        search_matched: 0,
+        search_scanned: 0,
+        search_elapsed: 0,
+        search_truncated: false,
+        search_busy: false,
+        search_query: String::new(),
+        search_rx: None,
+        search_cancel: None,
         rect_new: Live::new([0.0; 4]),
         rect_sort: Live::new([0.0; 4]),
         rect_view: Live::new([0.0; 4]),
@@ -2898,8 +2915,13 @@ fn menu_overlay(s: &App, p: Paint) -> El {
             let target = *target;
             match scope {
                 CtxScope::Item => {
-                    let is_dir = s.entries.get(target).map(|e| e.is_dir).unwrap_or(false);
-                    let path = s.entries.get(target).map(|e| e.path.clone()).unwrap_or_default();
+                    let entry = if s.searching {
+                        s.search_hits.get(target).map(|h| &h.entry)
+                    } else {
+                        s.entries.get(target)
+                    };
+                    let is_dir = entry.map(|e| e.is_dir).unwrap_or(false);
+                    let path = entry.map(|e| e.path.clone()).unwrap_or_default();
                     if menu_visible(s, "open") {
                         let open = path.clone();
                         let open_label = if is_dir { "Open" } else { "Open with default app" };
@@ -3665,7 +3687,7 @@ fn select_entry(s: &mut App, ei: usize) {
     s.selected = Some(ei);
     s.focused = Some(ei);
     s.notice.clear();
-    let size = s.entries[ei].size_label();
+    let size = entry_by_index(s, ei).size_label();
     s.selection_detail = if size.is_empty() {
         "1 item selected".into()
     } else {
@@ -3676,11 +3698,12 @@ fn select_entry(s: &mut App, ei: usize) {
 // ---------------------------------------------------------- file operations ----
 
 fn selected_paths(s: &App) -> Vec<PathBuf> {
-    s.selected
-        .and_then(|i| s.entries.get(i))
-        .map(|e| PathBuf::from(&e.path))
-        .into_iter()
-        .collect()
+    let Some(i) = s.selected else { return Vec::new() };
+    let valid = if s.searching { i < s.search_hits.len() } else { i < s.entries.len() };
+    if !valid {
+        return Vec::new();
+    }
+    vec![PathBuf::from(&entry_by_index(s, i).path)]
 }
 
 /// Whether an item is on the clipboard as a cut, so the list can ghost it. A
@@ -3690,6 +3713,163 @@ fn is_cut(s: &App, path: &str) -> bool {
         Some((paths, fileops::Mode::Cut)) => paths.iter().any(|p| p.as_path() == Path::new(path)),
         _ => false,
     }
+}
+
+// --------------------------------------------------------------- search ----
+
+/// How many rows the list shows: search results while searching, else the folder.
+fn display_len(s: &App) -> usize {
+    if s.searching {
+        s.search_hits.len()
+    } else {
+        s.visible.len()
+    }
+}
+
+/// The entry a row renders, and its selection index, in either display mode.
+fn display_entry(s: &App, i: usize) -> (usize, &crate::Entry) {
+    if s.searching {
+        (i, &s.search_hits[i].entry)
+    } else {
+        let ei = s.visible.get(i).copied().unwrap_or(i);
+        (ei, &s.entries[ei])
+    }
+}
+
+fn entry_by_index(s: &App, ei: usize) -> &crate::Entry {
+    if s.searching {
+        &s.search_hits[ei].entry
+    } else {
+        &s.entries[ei]
+    }
+}
+
+/// The entry name as text, with the matched characters highlighted while searching.
+fn name_text(s: &App, e: &crate::Entry, ei: usize, font: TextStyle, color: Color, p: Paint) -> El {
+    let t = text(e.name.as_str()).font(font).color(color);
+    if s.searching {
+        if let Some(hit) = s.search_hits.get(ei) {
+            let spans = highlight_spans(&e.name, &hit.indices, p.accent.alpha(0.35));
+            if !spans.is_empty() {
+                return t.spans(spans);
+            }
+        }
+    }
+    t
+}
+
+/// Turn match character offsets into byte-range background spans, grouping
+/// consecutive characters into one run.
+fn highlight_spans(name: &str, indices: &[u32], color: Color) -> Vec<Span> {
+    let mut boundaries: Vec<usize> = name.char_indices().map(|(b, _)| b).collect();
+    boundaries.push(name.len());
+    let mut spans = Vec::new();
+    let mut i = 0;
+    while i < indices.len() {
+        let start = indices[i] as usize;
+        let mut end = start + 1;
+        while i + 1 < indices.len() && indices[i + 1] as usize == end {
+            end += 1;
+            i += 1;
+        }
+        if end < boundaries.len() {
+            spans.push(Span::new(boundaries[start], boundaries[end]).bg(color, 1.0));
+        }
+        i += 1;
+    }
+    spans
+}
+
+/// Launch the search worker for a query, cancelling any walk already running.
+fn start_search(s: &mut App, query: String) {
+    use std::sync::atomic::Ordering;
+    if let Some(c) = &s.search_cancel {
+        c.store(true, Ordering::Relaxed);
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_cancel = cancel.clone();
+    let req = search::Request {
+        path: s.root.to_string_lossy().into_owned(),
+        local: s.entries.clone(),
+        query: query.clone(),
+        recursive: true,
+        show_hidden: s.show_hidden,
+    };
+    s.search_rx = Some(rx);
+    s.search_cancel = Some(cancel);
+    s.search_query = query;
+    s.searching = true;
+    s.search_busy = true;
+    s.search_matched = 0;
+    s.search_scanned = 0;
+    s.search_elapsed = 0;
+    s.search_truncated = false;
+    std::thread::spawn(move || {
+        search::search(&req, &worker_cancel, |ev| tx.send(ev).is_ok());
+    });
+}
+
+/// Drain the search worker's events into the result list; true to redraw.
+fn drain_search(s: &mut App) -> bool {
+    let mut changed = false;
+    let mut done = false;
+    if let Some(rx) = &s.search_rx {
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                search::Event::Local { items, matched, elapsed_ms } => {
+                    s.search_hits = items;
+                    s.search_matched = matched;
+                    s.search_elapsed = elapsed_ms;
+                    s.searching = true;
+                    changed = true;
+                }
+                search::Event::Batch { items, scanned } => {
+                    s.search_hits.extend(items);
+                    s.search_scanned = scanned;
+                    changed = true;
+                }
+                search::Event::Done { matched, scanned, elapsed_ms, truncated } => {
+                    s.search_matched = matched;
+                    s.search_scanned = scanned;
+                    s.search_elapsed = elapsed_ms;
+                    s.search_truncated = truncated;
+                    s.search_busy = false;
+                    done = true;
+                    changed = true;
+                }
+            }
+        }
+    }
+    if done {
+        // Settle the streamed results into one ranked list: folders first, then
+        // score, then the shorter name, then alphabetical.
+        s.search_hits.sort_by(|a, b| {
+            b.entry.is_dir.cmp(&a.entry.is_dir)
+                .then_with(|| b.score.cmp(&a.score))
+                .then_with(|| a.entry.name.len().cmp(&b.entry.name.len()))
+                .then_with(|| a.entry.name.to_lowercase().cmp(&b.entry.name.to_lowercase()))
+        });
+        s.search_rx = None;
+        s.search_cancel = None;
+    }
+    changed
+}
+
+/// Stop searching and return to the folder listing.
+fn clear_search(s: &mut App) {
+    if let Some(c) = &s.search_cancel {
+        c.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    s.search_rx = None;
+    s.search_cancel = None;
+    s.searching = false;
+    s.search_hits.clear();
+    s.search_query.clear();
+    s.search_busy = false;
+    s.selected = None;
+    s.focused = None;
+    s.selection_detail.clear();
 }
 
 fn copy_selection(s: &mut App) {
@@ -3910,14 +4090,18 @@ fn drain_op(s: &mut App) -> bool {
 
 /// Open the selected item: a folder navigates, a file launches its default app.
 fn open_selected(s: &mut App) {
-    if let Some(e) = s.selected.and_then(|i| s.entries.get(i)) {
-        let path = e.path.clone();
-        let is_dir = e.is_dir;
-        if is_dir {
-            go(s, PathBuf::from(&path));
-        } else if let Err(err) = shell::open_default(&path) {
-            s.notice = err;
-        }
+    let Some(i) = s.selected else { return };
+    let valid = if s.searching { i < s.search_hits.len() } else { i < s.entries.len() };
+    if !valid {
+        return;
+    }
+    let e = entry_by_index(s, i);
+    let path = e.path.clone();
+    let is_dir = e.is_dir;
+    if is_dir {
+        go(s, PathBuf::from(&path));
+    } else if let Err(err) = shell::open_default(&path) {
+        s.notice = err;
     }
 }
 
@@ -3972,11 +4156,9 @@ fn handle_key(s: &mut App, ev: &KeyEvent, _tx: &mut Tx) -> bool {
 }
 
 fn file_row(s: &App, i: usize, p: Paint) -> El {
-    let ei = s.visible.get(i).copied().unwrap_or(i);
-    let e = &s.entries[ei];
+    let (ei, e) = display_entry(s, i);
     let selected = s.selected == Some(ei);
     let focused = s.focused == Some(ei);
-    let path = e.path.clone();
     let mut line = row()
         .key(format!("row-{i}"))
         .w_full()
@@ -3998,9 +4180,7 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
                 .items_center()
                 .child(entry_icon(s, e, p, 16.0))
                 .child(
-                    text(e.name.as_str())
-                        .font(ROW_TEXT)
-                        .color(p.text)
+                    name_text(s, e, ei, ROW_TEXT, p.text, p)
                         .grow(1.0)
                         .min_w(0.0)
                         .truncate(),
@@ -4034,19 +4214,12 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
             ),
         )
         .child(el().grow(1.0));
-    let double_path = path.clone();
     line.on_press(move |s: &mut App| {
-        if let Some(at) = s.entries.iter().position(|entry| entry.path == path) {
-            select_entry(s, at);
-        }
+        select_entry(s, ei);
     })
     .on_double_press(move |s: &mut App| {
-        if let Some(at) = s.entries.iter().position(|entry| entry.path == double_path) {
-            if s.entries[at].is_dir {
-                let next = PathBuf::from(&s.entries[at].path);
-                go(s, next);
-            }
-        }
+        select_entry(s, ei);
+        open_selected(s);
     })
     .on_secondary_press(move |s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
         select_entry(s, ei);
@@ -4110,7 +4283,7 @@ fn scrollable(s: &App, content: El) -> El {
 }
 
 fn details_rows(s: &App, p: Paint) -> El {
-    let list = if !s.groups.is_empty() {
+    let list = if !s.groups.is_empty() && !s.searching {
         let mut list = col().key("rows").w_full();
         for i in 0..s.visible.len() {
             if let Some((_, label)) = s.groups.iter().find(|(start, _)| *start == i) {
@@ -4125,9 +4298,9 @@ fn details_rows(s: &App, p: Paint) -> El {
             .w_full()
             .growth(GrowthSpec::default())
             .virtual_rows(
-                s.visible.len(),
+                display_len(s),
                 row_h(s),
-                |s: &App, i| Cow::Borrowed(s.entries[s.visible[i]].path.as_str()),
+                |s: &App, i| Cow::Borrowed(display_entry(s, i).1.path.as_str()),
                 move |s: &App, i| file_row(s, i, p),
             )
     };
@@ -4135,10 +4308,8 @@ fn details_rows(s: &App, p: Paint) -> El {
 }
 
 fn grid_tile(s: &App, i: usize, p: Paint) -> El {
-    let ei = s.visible.get(i).copied().unwrap_or(i);
-    let e = &s.entries[ei];
+    let (ei, e) = display_entry(s, i);
     let selected = s.selected == Some(ei);
-    let path = e.path.clone();
     let preview = if e.fixture && e.kind == Kind::Image {
         let at = ["095523", "103957", "104522", "111606", "111619"]
             .iter()
@@ -4164,9 +4335,7 @@ fn grid_tile(s: &App, i: usize, p: Paint) -> El {
         .opacity(if is_cut(s, &e.path) { 0.4 } else { 1.0 })
         .child(preview)
         .child(
-            text(e.name.as_str())
-                .font(CAPTION)
-                .color(p.text)
+            name_text(s, e, ei, CAPTION, p.text, p)
                 .w(94.0)
                 .align(Align::Center)
                 .max_lines(3),
@@ -4174,21 +4343,12 @@ fn grid_tile(s: &App, i: usize, p: Paint) -> El {
     if selected {
         tile = tile.border(p.hair, p.focus_line);
     }
-    let double_path = path.clone();
     tile.on_press(move |s: &mut App| {
-        if let Some(at) = s.entries.iter().position(|entry| entry.path == path) {
-            select_entry(s, at);
-        }
+        select_entry(s, ei);
     })
     .on_double_press(move |s: &mut App| {
-        if let Some(at) = s.entries.iter().position(|entry| entry.path == double_path) {
-            if s.entries[at].is_dir {
-                let next = PathBuf::from(&s.entries[at].path);
-                go(s, next);
-            } else {
-                s.notice = "Opening files arrives with file operations".into();
-            }
-        }
+        select_entry(s, ei);
+        open_selected(s);
     })
     .on_secondary_press(move |s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
         select_entry(s, ei);
@@ -4204,16 +4364,14 @@ fn grid_rows(s: &App, p: Paint) -> El {
         .pt(12.0)
         .px(16.0)
         .gap(8.0)
-        .children((0..s.visible.len()).map(|i| grid_tile(s, i, p)));
+        .children((0..display_len(s)).map(|i| grid_tile(s, i, p)));
     scrollable(s, tiles)
 }
 
 /// List view: a compact small-icon + name flow, denser under Compact view.
 fn list_item(s: &App, i: usize, p: Paint) -> El {
-    let ei = s.visible.get(i).copied().unwrap_or(i);
-    let e = &s.entries[ei];
+    let (ei, e) = display_entry(s, i);
     let selected = s.selected == Some(ei);
-    let path = e.path.clone();
     let mut item = row()
         .key(format!("list-{i}"))
         .w(230.0)
@@ -4227,9 +4385,7 @@ fn list_item(s: &App, i: usize, p: Paint) -> El {
         .opacity(if is_cut(s, &e.path) { 0.4 } else { 1.0 })
         .child(entry_icon(s, e, p, 16.0))
         .child(
-            text(e.name.as_str())
-                .font(ROW_TEXT)
-                .color(p.text)
+            name_text(s, e, ei, ROW_TEXT, p.text, p)
                 .grow(1.0)
                 .min_w(0.0)
                 .truncate(),
@@ -4237,13 +4393,13 @@ fn list_item(s: &App, i: usize, p: Paint) -> El {
     if selected {
         item = item.border(p.hair, p.focus_line);
     }
-    let double_path = path.clone();
     item.on_press(move |s: &mut App| {
-        if let Some(at) = s.entries.iter().position(|en| en.path == path) {
-            select_entry(s, at);
-        }
+        select_entry(s, ei);
     })
-    .on_double_press(move |s: &mut App| open_entry(s, &double_path))
+    .on_double_press(move |s: &mut App| {
+        select_entry(s, ei);
+        open_selected(s);
+    })
     .on_secondary_press(move |s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
         select_entry(s, ei);
         s.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
@@ -4258,16 +4414,14 @@ fn list_rows(s: &App, p: Paint) -> El {
         .pt(8.0)
         .px(12.0)
         .gap(2.0)
-        .children((0..s.visible.len()).map(|i| list_item(s, i, p)));
+        .children((0..display_len(s)).map(|i| list_item(s, i, p)));
     scrollable(s, items)
 }
 
 /// Tiles view: a medium icon with the name and a type/size subtitle.
 fn tile_item(s: &App, i: usize, p: Paint) -> El {
-    let ei = s.visible.get(i).copied().unwrap_or(i);
-    let e = &s.entries[ei];
+    let (ei, e) = display_entry(s, i);
     let selected = s.selected == Some(ei);
-    let path = e.path.clone();
     let subtitle = if e.is_dir {
         e.type_label.clone()
     } else {
@@ -4294,19 +4448,19 @@ fn tile_item(s: &App, i: usize, p: Paint) -> El {
                 .grow(1.0)
                 .min_w(0.0)
                 .gap(2.0)
-                .child(text(e.name.as_str()).font(ROW_TEXT).color(p.text).w_full().truncate())
+                .child(name_text(s, e, ei, ROW_TEXT, p.text, p).w_full().truncate())
                 .child(text(subtitle.as_str()).font(CAPTION).color(p.tertiary).w_full().truncate()),
         );
     if selected {
         tile = tile.border(p.hair, p.focus_line);
     }
-    let double_path = path.clone();
     tile.on_press(move |s: &mut App| {
-        if let Some(at) = s.entries.iter().position(|en| en.path == path) {
-            select_entry(s, at);
-        }
+        select_entry(s, ei);
     })
-    .on_double_press(move |s: &mut App| open_entry(s, &double_path))
+    .on_double_press(move |s: &mut App| {
+        select_entry(s, ei);
+        open_selected(s);
+    })
     .on_secondary_press(move |s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
         select_entry(s, ei);
         s.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
@@ -4321,7 +4475,7 @@ fn tiles_rows(s: &App, p: Paint) -> El {
         .pt(12.0)
         .px(16.0)
         .gap(8.0)
-        .children((0..s.visible.len()).map(|i| tile_item(s, i, p)));
+        .children((0..display_len(s)).map(|i| tile_item(s, i, p)));
     scrollable(s, tiles)
 }
 
@@ -4738,41 +4892,50 @@ fn preview_pane(s: &App, p: Paint) -> El {
         .child(inner)
 }
 
+fn files_list(s: &App, p: Paint) -> El {
+    col()
+        .key("content")
+        .grow(1.0)
+        .min_h(0.0)
+        .w_full()
+        .fill(p.content)
+        .on_secondary_press(|s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
+            s.menu = Some(Menu::Context { scope: CtxScope::Background, target: 0, x: at.x, y: at.y });
+        })
+        .child(if s.mode == Mode::Details {
+            column_header(
+                p,
+                &[
+                    ("Name", NAME_W),
+                    ("Date modified", DATE_W),
+                    ("Type", TYPE_W),
+                    ("Size", SIZE_W),
+                ],
+                true,
+                true,
+            )
+        } else {
+            el().w_full().h(p.hair)
+        })
+        .child(el().w_full().h(p.hair).fill(p.line))
+        .child(match s.mode {
+            Mode::Details => details_rows(s, p),
+            Mode::List => list_rows(s, p),
+            Mode::Tiles => tiles_rows(s, p),
+            Mode::Grid => grid_rows(s, p),
+        })
+}
+
 fn content(s: &App, p: Paint) -> El {
-    let main = match s.view {
-        View::Home => home_content(s, p),
-        View::ThisPc => this_pc_content(s, p),
-        View::Files => col()
-            .key("content")
-            .grow(1.0)
-            .min_h(0.0)
-            .w_full()
-            .fill(p.content)
-            .on_secondary_press(|s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
-                s.menu = Some(Menu::Context { scope: CtxScope::Background, target: 0, x: at.x, y: at.y });
-            })
-            .child(if s.mode == Mode::Details {
-                column_header(
-                    p,
-                    &[
-                        ("Name", NAME_W),
-                        ("Date modified", DATE_W),
-                        ("Type", TYPE_W),
-                        ("Size", SIZE_W),
-                    ],
-                    true,
-                    true,
-                )
-            } else {
-                el().w_full().h(p.hair)
-            })
-            .child(el().w_full().h(p.hair).fill(p.line))
-            .child(match s.mode {
-                Mode::Details => details_rows(s, p),
-                Mode::List => list_rows(s, p),
-                Mode::Tiles => tiles_rows(s, p),
-                Mode::Grid => grid_rows(s, p),
-            }),
+    // Search results render as a file list whichever place is active.
+    let main = if s.searching {
+        files_list(s, p)
+    } else {
+        match s.view {
+            View::Home => home_content(s, p),
+            View::ThisPc => this_pc_content(s, p),
+            View::Files => files_list(s, p),
+        }
     };
     let mut body = row().key("body").w_full().grow(1.0).min_h(0.0);
     if s.nav_open {
@@ -4829,6 +4992,35 @@ fn status_bar(s: &App, p: Paint) -> El {
                     .on_press(|s: &mut App| cancel_op(s)),
             )
             .child(el().grow(1.0));
+    }
+
+    // While searching, the count that matters is matches, and the walk reports
+    // how much of the tree it has examined.
+    if s.searching {
+        let results = format!(
+            "{} {}{}",
+            s.search_matched,
+            if s.search_matched == 1 { "result" } else { "results" },
+            if s.search_truncated { " (showing the best)" } else { "" }
+        );
+        let elapsed = if s.search_elapsed < 1 { "<1 ms".to_string() } else { format!("{} ms", s.search_elapsed) };
+        return bar
+            .child(text(results.as_str()).font(CAPTION).color(p.secondary))
+            .child(el().w(p.hair).h(12.0).fill(p.line))
+            .child(if s.search_scanned > 0 {
+                text(format!("{} examined", s.search_scanned)).font(CAPTION).color(p.tertiary)
+            } else {
+                text("").font(CAPTION)
+            })
+            .child(el().grow(1.0))
+            .child(if s.search_busy {
+                row().gap(6.0).items_center()
+                    .child(el().size(7.0, 7.0).radius(4.0).fill(p.accent))
+                    .child(text("Searching").font(CAPTION).color(p.secondary))
+            } else {
+                row()
+            })
+            .child(text(elapsed.as_str()).font(CAPTION).color(p.tertiary));
     }
 
     let middle = if s.notice.is_empty() {
@@ -4974,6 +5166,20 @@ fn main() {
                     edit.text = e.name.clone();
                     s.dialog = Some(Dialog::Rename { path: PathBuf::from(&e.path), edit });
                 }
+            }),
+            ("search", |s| {
+                s.view = View::Files;
+                s.mode = Mode::Details;
+                s.searching = true;
+                s.search_busy = false;
+                s.search_matched = 3;
+                s.search_scanned = 128;
+                s.search_elapsed = 12;
+                s.search_query = "do".into();
+                s.search_edit.text = "do".into();
+                s.search_hits = s.entries.iter().take(3).enumerate().map(|(i, e)| {
+                    search::Hit { entry: e.clone(), score: 100 - i as u32, indices: vec![0, 1] }
+                }).collect();
             }),
         ],
         poll: Some(poll),

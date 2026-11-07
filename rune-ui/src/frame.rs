@@ -379,7 +379,7 @@ mod imp {
                 let Some(root) = sym::<RootWindow>(lib, "XRootWindow") else { return };
                 let Some(send) = sym::<SendEvent>(lib, "XSendEvent") else { return };
                 let Some(flush) = sym::<Flush>(lib, "XFlush") else { return };
-                let atom = |name: &str| unsafe {
+                let atom = |name: &str| {
                     let c = CString::new(name).unwrap();
                     intern(display, c.as_ptr(), 0)
                 };
@@ -389,7 +389,7 @@ mod imp {
                 let screen = default_screen(display);
                 let root_window = root(display, screen);
                 // XEvent is a 24-long union; place the client message at its start.
-                let mut event = [0c_long; 24];
+                let mut event = [0 as c_long; 24];
                 let msg = event.as_mut_ptr() as *mut ClientMessage;
                 (*msg).type_ = 33; // ClientMessage
                 (*msg).send_event = 1;
@@ -401,7 +401,7 @@ mod imp {
                 (*msg).data[1] = vert as c_long;
                 (*msg).data[2] = horiz as c_long;
                 (*msg).data[3] = 1; // source: application
-                let mask = (1c_long << 19) | (1c_long << 20); // SubstructureRedirect | SubstructureNotify
+                let mask = ((1 as c_long) << 19) | ((1 as c_long) << 20); // SubstructureRedirect | SubstructureNotify
                 send(display, root_window, 0, mask, event.as_mut_ptr() as *mut c_void);
                 flush(display);
             });

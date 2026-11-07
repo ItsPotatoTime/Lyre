@@ -10,6 +10,7 @@
 
 /// One registered command verb, as the context menu and customize list show it.
 #[derive(Clone)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 pub struct Verb {
     /// Stable identity, remembered when the person turns the item on or off.
     pub id: String,

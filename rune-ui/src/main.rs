@@ -55,6 +55,9 @@ const DATE_W: f32 = 140.0;
 const TYPE_W: f32 = 120.0;
 const SIZE_W: f32 = 80.0;
 const MENU_W: f32 = 248.0;
+/// The More and context menus carry longer labels ("Stop opening folders with
+/// Lyre", shell verbs) than the command-bar flyouts, so they get extra room.
+const MENU_W_WIDE: f32 = 288.0;
 const MENU_ROW_H: f32 = 30.0;
 
 /// Every context-menu item the customize dialog can turn off, by stable id.
@@ -485,6 +488,12 @@ struct App {
     update_busy: bool,
     update_progress: Option<(u64, Option<u64>)>,
     update_installing: bool,
+    /// Whether to check for updates at launch; persisted so the user can opt out.
+    update_check_startup: bool,
+    /// True once the first-frame startup check has been considered.
+    startup_check_done: bool,
+    /// Whether the running check stays quiet (startup) or reports (manual).
+    update_silent: bool,
     /// Trigger and window rects in window points, read to anchor and clamp menus.
     rect_new: Live<[f32; 4]>,
     rect_sort: Live<[f32; 4]>,
@@ -718,6 +727,9 @@ fn load_prefs(s: &mut App) {
     if let Some(h) = prefs.get::<Vec<usize>>("hidden_places") {
         s.hidden_places = h;
     }
+    if let Some(v) = prefs.get::<bool>("update_check_startup") {
+        s.update_check_startup = v;
+    }
 }
 
 /// Write the whole view state and collections; poll calls this once per change.
@@ -741,12 +753,13 @@ fn persist(s: &App) {
     let _ = prefs.set("menu_hidden", &s.menu_hidden);
     let _ = prefs.set("menu_shown", &s.menu_shown);
     let _ = prefs.set("hidden_places", &s.hidden_places);
+    let _ = prefs.set("update_check_startup", &s.update_check_startup);
 }
 
 /// A cheap fingerprint of everything persisted, so poll saves only on change.
 fn prefs_signature(s: &App) -> String {
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{}",
         s.sort,
         s.sort_desc,
         s.preview,
@@ -761,7 +774,8 @@ fn prefs_signature(s: &App) -> String {
         s.pinned,
         s.menu_hidden,
         s.menu_shown,
-        s.hidden_places
+        s.hidden_places,
+        s.update_check_startup
     )
 }
 
@@ -887,6 +901,15 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
     if sig != s.prefs_sig {
         persist(s);
         s.prefs_sig = sig;
+    }
+    // Check once at launch, quietly, unless the person opted out or this is a
+    // headless scene render. The window is already up; the work is off-thread.
+    if !s.startup_check_done {
+        s.startup_check_done = true;
+        let headless = std::env::args().any(|a| a == "--snap" || a == "--scene");
+        if s.update_check_startup && !headless {
+            start_update_check(s, true);
+        }
     }
     let mut changed = drain_op(s);
     // Keep frames coming while a transfer runs so its progress drains promptly.
@@ -1313,6 +1336,9 @@ fn init() -> App {
         update_busy: false,
         update_progress: None,
         update_installing: false,
+        update_check_startup: true,
+        startup_check_done: false,
+        update_silent: false,
         rect_new: Live::new([0.0; 4]),
         rect_sort: Live::new([0.0; 4]),
         rect_view: Live::new([0.0; 4]),
@@ -2945,8 +2971,15 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                     rows.push(
                         menu_item(p, "Check for updates", Some(Ico::Refresh), None, s.update_busy)
                             .on_press(|s: &mut App| {
-                                start_update_check(s);
+                                start_update_check(s, false);
                                 s.menu = None;
+                            }),
+                    );
+                    h += MENU_ROW_H;
+                    rows.push(
+                        menu_item(p, "Check for updates at startup", s.update_check_startup.then_some(Ico::Check), None, false)
+                            .on_press(|s: &mut App| {
+                                s.update_check_startup = !s.update_check_startup;
                             }),
                     );
                     h += MENU_ROW_H;
@@ -3310,7 +3343,11 @@ fn menu_overlay(s: &App, p: Paint) -> El {
         }
     }
 
-    let x = ax.clamp(8.0, (ww - MENU_W - 8.0).max(8.0));
+    let mw = match &menu {
+        Menu::Context { .. } | Menu::Drop { kind: DropMenu::More, .. } => MENU_W_WIDE,
+        _ => MENU_W,
+    };
+    let x = ax.clamp(8.0, (ww - mw - 8.0).max(8.0));
     let y = ay.clamp(8.0, (wh - h - 8.0).max(8.0));
     // No blocking scrim: a press elsewhere both dismisses the menu (the shared
     // action helpers clear it) and reaches its target, so navigation and switching
@@ -3318,7 +3355,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
     col()
         .key("menu-panel")
         .absolute(x, y)
-        .w(MENU_W)
+        .w(mw)
         .py(4.0)
         .px(4.0)
         .fill(p.menu)
@@ -3587,7 +3624,8 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
                     text("Lyre can open folders instead of your current file manager. This changes a few per-user settings and can be undone at any time from the More menu.")
                         .font(UI_TEXT)
                         .color(p.secondary)
-                        .w_full(),
+                        .w_full()
+                        .wrap(),
                 )
                 .child(
                     row().w_full().gap(8.0).child(el().grow(1.0))
@@ -3635,8 +3673,21 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
                         .child(text(label.as_str()).font(CAPTION).color(p.secondary)),
                 );
             }
+            let mut footer = row().w_full().gap(8.0).items_center();
+            if !busy {
+                footer = footer.child(
+                    text("Don't check at startup")
+                        .font(CAPTION)
+                        .color(p.tertiary)
+                        .on_press(|s: &mut App| {
+                            s.update_check_startup = false;
+                            s.dialog = None;
+                        }),
+                );
+            }
             panel.child(
-                row().w_full().gap(8.0).child(el().grow(1.0))
+                footer
+                    .child(el().grow(1.0))
                     .child(dialog_button(p, "Cancel", false).on_press(move |s: &mut App| {
                         if !busy {
                             s.dialog = None;
@@ -4009,14 +4060,17 @@ fn clear_search(s: &mut App) {
 // ----------------------------------------------------------- auto-update ----
 
 /// Ask the release page whether there is a newer build, off the UI thread.
-fn start_update_check(s: &mut App) {
+fn start_update_check(s: &mut App, silent: bool) {
     if s.update_busy {
         return;
     }
     let (tx, rx) = std::sync::mpsc::channel();
     s.update_rx = Some(rx);
     s.update_busy = true;
-    s.notice = "Checking for updates…".into();
+    s.update_silent = silent;
+    if !silent {
+        s.notice = "Checking for updates…".into();
+    }
     std::thread::spawn(move || {
         let _ = tx.send(UpdateMsg::Checked(updates::check()));
     });
@@ -4062,9 +4116,15 @@ fn drain_update(s: &mut App) -> bool {
                             s.notice.clear();
                         }
                         Ok(None) => {
-                            s.notice = format!("You're up to date (version {})", env!("CARGO_PKG_VERSION"));
+                            if !s.update_silent {
+                                s.notice = format!("You're up to date (version {})", env!("CARGO_PKG_VERSION"));
+                            }
                         }
-                        Err(e) => s.notice = e,
+                        Err(e) => {
+                            if !s.update_silent {
+                                s.notice = e;
+                            }
+                        }
                     }
                     changed = true;
                 }

@@ -22,11 +22,12 @@ use std::time::{Instant, UNIX_EPOCH};
 
 use rune::color::hex;
 use rune::{
-    Align, AppSpec, Color, Cx, El, GrowthSpec, Image, ImageCache, LineCap, Live, Phase, Pixels,
-    ScrollSpec, Shape, Spring, SurfaceFit, TextEdit, TextStyle, Tx, WindowOptions, WindowSpec,
-    canvas, col, el, row, run_windows, text, text_input,
+    Align, AppSpec, Color, Cx, El, GrowthSpec, Image, ImageCache, Key, KeyEvent, LineCap, Live,
+    Phase, Pixels, ScrollSpec, Shape, Spring, SurfaceFit, TextEdit, TextStyle, Tx, WindowOptions,
+    WindowSpec, canvas, col, el, row, run_windows, text, text_input,
 };
 
+mod fileops;
 mod frame;
 mod imagery;
 mod shell;
@@ -369,6 +370,32 @@ enum Fixture {
     ThisPc,
 }
 
+/// The file operation running in the background, as the status bar shows it.
+#[derive(Clone)]
+struct Transfer {
+    label: &'static str,
+    name: String,
+    done: usize,
+    total: usize,
+    done_bytes: u64,
+    total_bytes: u64,
+    stopping: bool,
+}
+
+/// Messages from the operation worker thread, drained in `poll`.
+enum OpMsg {
+    Progress(fileops::Progress),
+    Done(Result<usize, String>),
+}
+
+/// A modal dialog: delete confirmation, paste conflict, rename or new folder.
+enum Dialog {
+    Delete { permanent: bool, paths: Vec<PathBuf> },
+    PasteConflict { mode: fileops::Mode, sources: Vec<PathBuf>, target: PathBuf },
+    Rename { path: PathBuf, edit: TextEdit },
+    NewFolder { parent: PathBuf, edit: TextEdit },
+}
+
 struct App {
     dark: bool,
     view: View,
@@ -422,6 +449,13 @@ struct App {
     /// Real shell icons keyed by type/path, and decoded image previews by path.
     icon_cache: RefCell<HashMap<String, Pixels>>,
     thumb_cache: RefCell<HashMap<String, Image>>,
+    /// Cut/copy clipboard, the running transfer, its worker channel and cancel.
+    clipboard: Option<(Vec<PathBuf>, fileops::Mode)>,
+    transfer: Option<Transfer>,
+    op_rx: Option<std::sync::mpsc::Receiver<OpMsg>>,
+    op_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// The open modal dialog (delete confirm, paste conflict, rename, new folder).
+    dialog: Option<Dialog>,
     /// Trigger and window rects in window points, read to anchor and clamp menus.
     rect_new: Live<[f32; 4]>,
     rect_sort: Live<[f32; 4]>,
@@ -570,8 +604,8 @@ fn open_entry(s: &mut App, path: &str) {
         if s.entries[at].is_dir {
             let next = PathBuf::from(&s.entries[at].path);
             go(s, next);
-        } else {
-            s.notice = "Opening files arrives with file operations".into();
+        } else if let Err(e) = shell::open_default(path) {
+            s.notice = e;
         }
     }
 }
@@ -832,18 +866,23 @@ fn refresh_visible(s: &mut App) {
 
 /// Rune calls this before each frame. Search edits land in `TextEdit` through
 /// `on_edit`, which only binds the field, so the row order is recomputed here.
-fn poll(s: &mut App, _t: f64, _tx: &mut Tx) -> bool {
+fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
     let sig = prefs_signature(s);
     if sig != s.prefs_sig {
         persist(s);
         s.prefs_sig = sig;
     }
-    if s.search_edit.text == s.last_query {
-        return false;
+    let mut changed = drain_op(s);
+    // Keep frames coming while a transfer runs so its progress drains promptly.
+    if s.transfer.is_some() {
+        tx.wake_after(std::time::Duration::from_millis(60));
     }
-    s.last_query = s.search_edit.text.clone();
-    refresh_visible(s);
-    true
+    if s.search_edit.text != s.last_query {
+        s.last_query = s.search_edit.text.clone();
+        refresh_visible(s);
+        changed = true;
+    }
+    changed
 }
 
 fn set_location(s: &mut App, path: PathBuf) {
@@ -1223,6 +1262,11 @@ fn init() -> App {
         prefs_sig: String::new(),
         icon_cache: RefCell::new(HashMap::new()),
         thumb_cache: RefCell::new(HashMap::new()),
+        clipboard: None,
+        transfer: None,
+        op_rx: None,
+        op_cancel: None,
+        dialog: None,
         rect_new: Live::new([0.0; 4]),
         rect_sort: Live::new([0.0; 4]),
         rect_view: Live::new([0.0; 4]),
@@ -2175,6 +2219,7 @@ fn view(s: &App, cx: &mut Cx<App>) -> El {
         .child(scroll_thumb(s, p))
         .child(menu_overlay(s, p))
         .child(customize_dialog(s, p))
+        .child(dialog_overlay(s, p))
 }
 
 /// The drawn scrollbar thumb. Its rect and visibility arrive from the scroll
@@ -2457,7 +2502,14 @@ fn command_bar(s: &App, p: Paint) -> El {
     ] {
         let dim = !has_sel && !matches!(which, Ico::Paste);
         bar = bar.child(icon_button(p, which, dim, label).on_press(move |s: &mut App| {
-            s.notice = format!("{label} is not implemented in this slice");
+            match which {
+                Ico::Cut => cut_selection(s),
+                Ico::Copy => copy_selection(s),
+                Ico::Paste => begin_paste(s),
+                Ico::Rename => begin_rename(s),
+                Ico::Delete => begin_delete(s, false),
+                _ => s.notice = "Sharing arrives with the share sheet".into(),
+            }
         }));
     }
     bar = bar
@@ -2638,7 +2690,10 @@ fn menu_overlay(s: &App, p: Paint) -> El {
         Menu::Drop { kind, .. } => {
             match kind {
                 DropMenu::New => {
-                    rows.push(menu_item(p, "Folder", Some(Ico::New), None, true));
+                    rows.push(
+                        menu_item(p, "Folder", Some(Ico::New), None, false)
+                            .on_press(|s: &mut App| begin_new_folder(s)),
+                    );
                     rows.push(menu_item(p, "Shortcut", Some(Ico::New), None, true));
                     h += MENU_ROW_H * 2.0;
                 }
@@ -2921,7 +2976,23 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                         ("delete", "Delete", Ico::Delete),
                     ] {
                         if menu_visible(s, id) {
-                            rows.push(menu_item(p, label, Some(icon), None, true));
+                            rows.push(
+                                menu_item(p, label, Some(icon), None, false).on_press(move |s: &mut App| {
+                                    match id {
+                                        "rename" => begin_rename(s),
+                                        "cut" => {
+                                            cut_selection(s);
+                                            s.menu = None;
+                                        }
+                                        "copy" => {
+                                            copy_selection(s);
+                                            s.menu = None;
+                                        }
+                                        "delete" => begin_delete(s, false),
+                                        _ => {}
+                                    }
+                                }),
+                            );
                             h += MENU_ROW_H;
                         }
                     }
@@ -2953,11 +3024,17 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                 }
                 CtxScope::Background => {
                     if menu_visible(s, "new-folder") {
-                        rows.push(menu_item(p, "New folder", Some(Ico::New), None, true));
+                        rows.push(
+                            menu_item(p, "New folder", Some(Ico::New), None, false)
+                                .on_press(|s: &mut App| begin_new_folder(s)),
+                        );
                         h += MENU_ROW_H;
                     }
                     if menu_visible(s, "paste") {
-                        rows.push(menu_item(p, "Paste", Some(Ico::Paste), None, true));
+                        rows.push(
+                            menu_item(p, "Paste", Some(Ico::Paste), None, s.clipboard.is_none())
+                                .on_press(|s: &mut App| begin_paste(s)),
+                        );
                         h += MENU_ROW_H;
                     }
                     rows.push(menu_sep(p));
@@ -3277,6 +3354,134 @@ fn customize_dialog(s: &App, p: Paint) -> El {
         )
 }
 
+fn dialog_button(p: Paint, label: &str, primary: bool) -> El {
+    row()
+        .h(32.0)
+        .px(16.0)
+        .radius(4.0)
+        .fill(if primary { p.accent_fill } else { p.field })
+        .border(p.hair, if primary { p.accent_fill } else { p.field_line })
+        .hover(p.hover)
+        .center()
+        .child(text(label).font(UI_TEXT).color(if primary { Color::WHITE } else { p.text }))
+}
+
+/// The modal dialog: delete confirmation, paste conflict, rename or new folder.
+fn dialog_overlay(s: &App, p: Paint) -> El {
+    let Some(dialog) = &s.dialog else {
+        return el().key("dialog-none");
+    };
+    let base = || {
+        col()
+            .key("dialog-panel")
+            .w(420.0)
+            .px(20.0)
+            .py(18.0)
+            .gap(14.0)
+            .fill(p.menu)
+            .border(p.hair, p.menu_line)
+            .radius(8.0)
+            .shadow(6.0, 24.0, Color::BLACK.alpha(0.5))
+    };
+    let panel = match dialog {
+        Dialog::Delete { permanent, paths } => {
+            let n = paths.len();
+            let plural = if n == 1 { "" } else { "s" };
+            let (title, msg) = if *permanent {
+                ("Permanently delete?", format!("Permanently delete {n} item{plural}? This cannot be undone."))
+            } else {
+                ("Move to trash?", format!("Move {n} item{plural} to the trash? You can restore it later."))
+            };
+            let paths = paths.clone();
+            let mode = if *permanent { fileops::DeleteMode::Permanent } else { fileops::DeleteMode::Trash };
+            let confirm_label = if *permanent { "Delete permanently" } else { "Delete" };
+            base()
+                .child(text(title).font(TILE_TEXT).color(p.text))
+                .child(text(msg.as_str()).font(UI_TEXT).color(p.secondary))
+                .child(
+                    row().w_full().gap(8.0).child(el().grow(1.0))
+                        .child(dialog_button(p, "Cancel", false).on_press(|s: &mut App| s.dialog = None))
+                        .child(dialog_button(p, confirm_label, true).on_press(move |s: &mut App| {
+                            s.dialog = None;
+                            start_delete(s, mode, paths.clone());
+                        })),
+                )
+        }
+        Dialog::PasteConflict { mode, sources, target } => {
+            let mode = *mode;
+            let rename_sources = sources.clone();
+            let rename_target = target.clone();
+            let over_sources = sources.clone();
+            let over_target = target.clone();
+            base()
+                .child(text("Replace or keep both?").font(TILE_TEXT).color(p.text))
+                .child(text("An item with the same name already exists in this folder.").font(UI_TEXT).color(p.secondary))
+                .child(
+                    row().w_full().gap(8.0).child(el().grow(1.0))
+                        .child(dialog_button(p, "Cancel", false).on_press(|s: &mut App| s.dialog = None))
+                        .child(dialog_button(p, "Keep both", false).on_press(move |s: &mut App| {
+                            s.dialog = None;
+                            start_paste(s, mode, fileops::Conflict::Rename, rename_sources.clone(), rename_target.clone());
+                        }))
+                        .child(dialog_button(p, "Overwrite", true).on_press(move |s: &mut App| {
+                            s.dialog = None;
+                            start_paste(s, mode, fileops::Conflict::Overwrite, over_sources.clone(), over_target.clone());
+                        })),
+                )
+        }
+        Dialog::Rename { edit, .. } => {
+            base()
+                .child(text("Rename").font(TILE_TEXT).color(p.text))
+                .child(
+                    text_input(edit, UI_TEXT)
+                        .key("dialog-edit")
+                        .w_full()
+                        .h(FIELD_H)
+                        .single_line()
+                        .color(p.text)
+                        .on_edit(|s: &mut App| match &mut s.dialog {
+                            Some(Dialog::Rename { edit, .. }) => edit,
+                            _ => unreachable!(),
+                        })
+                        .on_submit(|s: &mut App, _tx: &mut Tx| commit_rename(s)),
+                )
+                .child(
+                    row().w_full().gap(8.0).child(el().grow(1.0))
+                        .child(dialog_button(p, "Cancel", false).on_press(|s: &mut App| s.dialog = None))
+                        .child(dialog_button(p, "OK", true).on_press(|s: &mut App| commit_rename(s))),
+                )
+        }
+        Dialog::NewFolder { edit, .. } => {
+            base()
+                .child(text("New folder").font(TILE_TEXT).color(p.text))
+                .child(
+                    text_input(edit, UI_TEXT)
+                        .key("dialog-edit")
+                        .w_full()
+                        .h(FIELD_H)
+                        .single_line()
+                        .color(p.text)
+                        .on_edit(|s: &mut App| match &mut s.dialog {
+                            Some(Dialog::NewFolder { edit, .. }) => edit,
+                            _ => unreachable!(),
+                        })
+                        .on_submit(|s: &mut App, _tx: &mut Tx| commit_new_folder(s)),
+                )
+                .child(
+                    row().w_full().gap(8.0).child(el().grow(1.0))
+                        .child(dialog_button(p, "Cancel", false).on_press(|s: &mut App| s.dialog = None))
+                        .child(dialog_button(p, "Create", true).on_press(|s: &mut App| commit_new_folder(s))),
+                )
+        }
+    };
+    el().key("dialog-overlay")
+        .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+        .fill(Color::BLACK.alpha(0.45))
+        .on_press(|s: &mut App| s.dialog = None)
+        .center()
+        .child(panel)
+}
+
 fn rail_item(
     s: &App,
     p: Paint,
@@ -3446,6 +3651,281 @@ fn select_entry(s: &mut App, ei: usize) {
     } else {
         format!("1 item selected  {size}")
     };
+}
+
+// ---------------------------------------------------------- file operations ----
+
+fn selected_paths(s: &App) -> Vec<PathBuf> {
+    s.selected
+        .and_then(|i| s.entries.get(i))
+        .map(|e| PathBuf::from(&e.path))
+        .into_iter()
+        .collect()
+}
+
+fn copy_selection(s: &mut App) {
+    let paths = selected_paths(s);
+    if !paths.is_empty() {
+        s.clipboard = Some((paths, fileops::Mode::Copy));
+        s.notice = "Copied to clipboard".into();
+    }
+}
+
+fn cut_selection(s: &mut App) {
+    let paths = selected_paths(s);
+    if !paths.is_empty() {
+        s.clipboard = Some((paths, fileops::Mode::Cut));
+        s.notice = "Cut to clipboard".into();
+    }
+}
+
+/// Spawn the worker for a paste, wiring progress into the status bar.
+fn start_paste(s: &mut App, mode: fileops::Mode, conflict: fileops::Conflict, sources: Vec<PathBuf>, target: PathBuf) {
+    use std::sync::atomic::Ordering;
+    let total = sources.len();
+    let label = if mode == fileops::Mode::Cut { "Moving" } else { "Copying" };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_cancel = cancel.clone();
+    s.op_rx = Some(rx);
+    s.op_cancel = Some(cancel);
+    s.transfer = Some(Transfer { label, name: String::new(), done: 0, total, done_bytes: 0, total_bytes: 0, stopping: false });
+    std::thread::spawn(move || {
+        let progress_tx = tx.clone();
+        let emit = |p: fileops::Progress| {
+            let _ = progress_tx.send(OpMsg::Progress(p));
+            !worker_cancel.load(Ordering::Relaxed)
+        };
+        let result = fileops::paste(mode, conflict, &sources, &target, &worker_cancel, emit);
+        let _ = tx.send(OpMsg::Done(result));
+    });
+}
+
+fn start_delete(s: &mut App, mode: fileops::DeleteMode, paths: Vec<PathBuf>) {
+    use std::sync::atomic::Ordering;
+    let total = paths.len();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let worker_cancel = cancel.clone();
+    s.op_rx = Some(rx);
+    s.op_cancel = Some(cancel);
+    s.transfer = Some(Transfer { label: "Deleting", name: String::new(), done: 0, total, done_bytes: 0, total_bytes: 0, stopping: false });
+    std::thread::spawn(move || {
+        let progress_tx = tx.clone();
+        let emit = |p: fileops::Progress| {
+            let _ = progress_tx.send(OpMsg::Progress(p));
+            !worker_cancel.load(Ordering::Relaxed)
+        };
+        let result = fileops::delete(mode, &paths, &worker_cancel, emit);
+        let _ = tx.send(OpMsg::Done(result));
+    });
+}
+
+/// Paste the clipboard into the current folder, asking about conflicts first.
+fn begin_paste(s: &mut App) {
+    let Some((sources, mode)) = s.clipboard.clone() else {
+        s.notice = "Nothing to paste".into();
+        return;
+    };
+    if s.view != View::Files {
+        s.notice = "Open a folder to paste into".into();
+        return;
+    }
+    let target = s.root.clone();
+    let conflict_exists = sources.iter().any(|src| {
+        src.file_name().map(|n| target.join(n).exists()).unwrap_or(false)
+    });
+    s.menu = None;
+    if conflict_exists {
+        s.dialog = Some(Dialog::PasteConflict { mode, sources, target });
+    } else {
+        start_paste(s, mode, fileops::Conflict::Rename, sources, target);
+    }
+}
+
+/// Ask before deleting; Shift chooses permanent, otherwise the trash.
+fn begin_delete(s: &mut App, permanent: bool) {
+    let paths = selected_paths(s);
+    if paths.is_empty() {
+        return;
+    }
+    s.menu = None;
+    s.dialog = Some(Dialog::Delete { permanent, paths });
+}
+
+fn begin_rename(s: &mut App) {
+    let Some(e) = s.selected.and_then(|i| s.entries.get(i)) else { return };
+    let mut edit = TextEdit::default();
+    edit.text = e.name.clone();
+    s.menu = None;
+    s.dialog = Some(Dialog::Rename { path: PathBuf::from(&e.path), edit });
+}
+
+fn begin_new_folder(s: &mut App) {
+    if s.view != View::Files {
+        s.notice = "Open a folder to create one in".into();
+        return;
+    }
+    let mut edit = TextEdit::default();
+    edit.text = "New folder".into();
+    s.menu = None;
+    s.dialog = Some(Dialog::NewFolder { parent: s.root.clone(), edit });
+}
+
+fn commit_rename(s: &mut App) {
+    let Some(Dialog::Rename { path, edit }) = s.dialog.take() else { return };
+    let name = edit.text.trim().to_string();
+    if name.is_empty() {
+        return;
+    }
+    match fileops::rename(&path, &name) {
+        Ok(_) => {
+            if s.view == View::Files {
+                let root = s.root.clone();
+                set_location(s, root);
+            }
+        }
+        Err(e) => s.notice = e,
+    }
+}
+
+fn commit_new_folder(s: &mut App) {
+    let Some(Dialog::NewFolder { parent, edit }) = s.dialog.take() else { return };
+    let name = edit.text.trim().to_string();
+    if name.is_empty() {
+        return;
+    }
+    match fileops::create_folder(&parent, &name) {
+        Ok(_) => {
+            if s.view == View::Files {
+                let root = s.root.clone();
+                set_location(s, root);
+            }
+        }
+        Err(e) => s.notice = e,
+    }
+}
+
+fn cancel_op(s: &mut App) {
+    if let Some(cancel) = &s.op_cancel {
+        cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+    if let Some(t) = &mut s.transfer {
+        t.stopping = true;
+    }
+}
+
+/// Drain the worker's messages into the status bar; returns true to redraw.
+fn drain_op(s: &mut App) -> bool {
+    let mut changed = false;
+    let mut finished = false;
+    if let Some(rx) = &s.op_rx {
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                OpMsg::Progress(p) => {
+                    if let Some(t) = &mut s.transfer {
+                        t.name = p.name;
+                        t.done = p.done;
+                        t.total = p.total;
+                        t.done_bytes = p.done_bytes;
+                        t.total_bytes = p.total_bytes;
+                    }
+                    changed = true;
+                }
+                OpMsg::Done(result) => {
+                    finished = true;
+                    let label = s.transfer.as_ref().map(|t| t.label).unwrap_or("Done");
+                    let past = match label {
+                        "Copying" => "Copied",
+                        "Moving" => "Moved",
+                        "Deleting" => "Deleted",
+                        _ => "Finished",
+                    };
+                    match result {
+                        Ok(n) => s.notice = format!("{past} {n} item{}", if n == 1 { "" } else { "s" }),
+                        Err(e) => s.notice = e,
+                    }
+                }
+            }
+        }
+    }
+    if finished {
+        s.op_rx = None;
+        s.op_cancel = None;
+        s.transfer = None;
+        s.selected = None;
+        s.focused = None;
+        s.selection_detail.clear();
+        if s.view == View::Files {
+            let root = s.root.clone();
+            set_location(s, root);
+        }
+        changed = true;
+    }
+    changed
+}
+
+/// Open the selected item: a folder navigates, a file launches its default app.
+fn open_selected(s: &mut App) {
+    if let Some(e) = s.selected.and_then(|i| s.entries.get(i)) {
+        let path = e.path.clone();
+        let is_dir = e.is_dir;
+        if is_dir {
+            go(s, PathBuf::from(&path));
+        } else if let Err(err) = shell::open_default(&path) {
+            s.notice = err;
+        }
+    }
+}
+
+/// Global shortcuts. Returns true when the key was handled. Editing keys are
+/// left to a focused field or an open dialog.
+fn handle_key(s: &mut App, ev: &KeyEvent, _tx: &mut Tx) -> bool {
+    if ev.key == Key::Escape {
+        if s.dialog.is_some() {
+            s.dialog = None;
+            return true;
+        }
+        if s.menu.is_some() {
+            s.menu = None;
+            return true;
+        }
+        return false;
+    }
+    if s.dialog.is_some() || s.search_edit.focused {
+        return false;
+    }
+    if ev.is_command('c') {
+        copy_selection(s);
+        return true;
+    }
+    if ev.is_command('x') {
+        cut_selection(s);
+        return true;
+    }
+    if ev.is_command('v') {
+        begin_paste(s);
+        return true;
+    }
+    match ev.key {
+        Key::Delete => {
+            begin_delete(s, ev.mods.shift);
+            true
+        }
+        Key::Function(2) => {
+            begin_rename(s);
+            true
+        }
+        Key::Enter => {
+            open_selected(s);
+            true
+        }
+        Key::Backspace => {
+            go_up(s);
+            true
+        }
+        _ => false,
+    }
 }
 
 fn file_row(s: &App, i: usize, p: Paint) -> El {
@@ -4263,11 +4743,54 @@ fn body(s: &App, p: Paint) -> El {
 }
 
 fn status_bar(s: &App, p: Paint) -> El {
+    let bar = row()
+        .key("status")
+        .w_full()
+        .h(STATUS_H)
+        .fill(p.status)
+        .px(12.0)
+        .gap(8.0)
+        .items_center();
+
+    // A running transfer takes the bar: label, progress, percent and cancel.
+    if let Some(t) = &s.transfer {
+        let frac = if t.total_bytes > 0 {
+            (t.done_bytes as f64 / t.total_bytes as f64).min(1.0) as f32
+        } else if t.total > 0 {
+            (t.done as f32 / t.total as f32).min(1.0)
+        } else {
+            0.0
+        };
+        let readout = if t.total_bytes > 0 {
+            format!("{}%", (frac * 100.0) as u32)
+        } else {
+            format!("{} of {}", t.done.min(t.total), t.total)
+        };
+        let label = if t.stopping { "Stopping".to_string() } else { format!("{} {}", t.label, t.name) };
+        let cancel_label = if t.stopping { "Stopping…" } else { "Cancel" };
+        return bar
+            .child(el().size(7.0, 7.0).radius(4.0).fill(p.accent))
+            .child(text(label.as_str()).font(CAPTION).color(p.secondary).w(240.0).truncate())
+            .child(
+                el().w(160.0).h(6.0).radius(3.0).fill(p.line)
+                    .child(el().w_frac(frac).h_full().radius(3.0).fill(p.accent_fill)),
+            )
+            .child(text(readout.as_str()).font(CAPTION).color(p.secondary))
+            .child(
+                row().h(18.0).px(8.0).radius(3.0).hover(p.hover).center()
+                    .child(text(cancel_label).font(CAPTION).color(p.secondary))
+                    .on_press(|s: &mut App| cancel_op(s)),
+            )
+            .child(el().grow(1.0));
+    }
+
     let middle = if s.notice.is_empty() {
         s.selection_detail.as_str()
     } else {
         s.notice.as_str()
     };
+    let filtering = !s.search_edit.text.is_empty();
+    let elapsed = if s.scan_ms < 1.0 { "<1 ms".to_string() } else { format!("{:.0} ms", s.scan_ms) };
     let toggle = |which: Ico, active: bool, grid: bool| {
         el().size(24.0, 18.0)
             .radius(3.0)
@@ -4279,40 +4802,30 @@ fn status_bar(s: &App, p: Paint) -> El {
                 s.mode = if grid { Mode::Grid } else { Mode::Details };
             })
     };
-    row()
-        .key("status")
-        .w_full()
-        .h(STATUS_H)
-        .fill(p.status)
-        .px(12.0)
-        .gap(8.0)
-        .items_center()
-        .child(
-            text(if s.count == 1 {
-                "1 item".to_string()
-            } else {
-                format!("{} items", s.count)
-            })
+    bar.child(
+        text(if s.count == 1 { "1 item".to_string() } else { format!("{} items", s.count) })
             .font(CAPTION)
             .color(p.secondary),
-        )
-        .child(el().w(p.hair).h(12.0).fill(p.line))
-        .child(text(middle).font(CAPTION).color(if s.notice.is_empty() {
-            p.secondary
-        } else {
-            p.accent
-        }))
-        .child(el().grow(1.0))
-        .child(
-            row()
-                .gap(1.0)
-                .px(2.0)
-                .py(1.0)
-                .radius(4.0)
-                .border(p.hair, p.line)
-                .child(toggle(Ico::Details, s.mode == Mode::Details, false))
-                .child(toggle(Ico::Grid, s.mode == Mode::Grid, true)),
-        )
+    )
+    .child(el().w(p.hair).h(12.0).fill(p.line))
+    .child(text(middle).font(CAPTION).color(if s.notice.is_empty() { p.secondary } else { p.accent }))
+    .child(el().grow(1.0))
+    .child(if filtering {
+        text(format!("{} shown", s.visible.len())).font(CAPTION).color(p.secondary)
+    } else {
+        text("").font(CAPTION)
+    })
+    .child(text(elapsed.as_str()).font(CAPTION).color(p.tertiary))
+    .child(
+        row()
+            .gap(1.0)
+            .px(2.0)
+            .py(1.0)
+            .radius(4.0)
+            .border(p.hair, p.line)
+            .child(toggle(Ico::Details, s.mode == Mode::Details, false))
+            .child(toggle(Ico::Grid, s.mode == Mode::Grid, true)),
+    )
 }
 
 /// Register the system Segoe UI faces so the shell reads in Explorer's own
@@ -4379,8 +4892,29 @@ fn main() {
                 s.view = View::Files;
                 s.mode = Mode::Details;
             }),
+            ("deletedlg", |s| {
+                s.view = View::Files;
+                s.mode = Mode::Details;
+                s.selected = Some(0);
+                let paths = selected_paths(s);
+                s.dialog = Some(Dialog::Delete { permanent: false, paths });
+            }),
+            ("transfer", |s| {
+                s.view = View::Files;
+                s.mode = Mode::Details;
+                s.transfer = Some(Transfer {
+                    label: "Copying",
+                    name: "ubuntu-24.04.iso".into(),
+                    done: 3,
+                    total: 10,
+                    done_bytes: 450,
+                    total_bytes: 1000,
+                    stopping: false,
+                });
+            }),
         ],
         poll: Some(poll),
+        on_key: Some(handle_key),
         fonts: load_fonts(),
         families: ("Segoe UI, Inter", "Consolas, IBM Plex Mono"),
         ..AppSpec::new("Lyre", (1076.0, 600.0), init, view)

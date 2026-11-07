@@ -14,17 +14,20 @@
 //! highlight.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Instant, UNIX_EPOCH};
 
 use rune::color::hex;
 use rune::{
-    Align, AppSpec, Color, Cx, El, GrowthSpec, LineCap, Live, Phase, ScrollSpec, Shape, Spring,
-    TextEdit, TextStyle, Tx, WindowOptions, WindowSpec, canvas, col, el, row, run_windows, text,
-    text_input,
+    Align, AppSpec, Color, Cx, El, GrowthSpec, Image, ImageCache, LineCap, Live, Phase, Pixels,
+    ScrollSpec, Shape, Spring, SurfaceFit, TextEdit, TextStyle, Tx, WindowOptions, WindowSpec,
+    canvas, col, el, row, run_windows, text, text_input,
 };
 
+mod imagery;
 mod shell;
 
 // Metrics and colours sampled from the four reference captures. The chrome is
@@ -415,6 +418,9 @@ struct App {
     customize_background: bool,
     /// Signature of the persisted state; poll writes to disk when it changes.
     prefs_sig: String,
+    /// Real shell icons keyed by type/path, and decoded image previews by path.
+    icon_cache: RefCell<HashMap<String, Pixels>>,
+    thumb_cache: RefCell<HashMap<String, Image>>,
     /// Trigger and window rects in window points, read to anchor and clamp menus.
     rect_new: Live<[f32; 4]>,
     rect_sort: Live<[f32; 4]>,
@@ -1214,6 +1220,8 @@ fn init() -> App {
         customize_is_dir: false,
         customize_background: false,
         prefs_sig: String::new(),
+        icon_cache: RefCell::new(HashMap::new()),
+        thumb_cache: RefCell::new(HashMap::new()),
         rect_new: Live::new([0.0; 4]),
         rect_sort: Live::new([0.0; 4]),
         rect_view: Live::new([0.0; 4]),
@@ -1982,6 +1990,95 @@ fn file_glyph(e: &Entry, p: Paint, size: f32) -> El {
         }
         kind => page_glyph(kind, size),
     }
+}
+
+// ----------------------------------------------------- icons & previews ----
+
+/// Rune's cross-platform image decoder, shared app-wide. A decoded image's Pixels
+/// self-wake the windows showing it, so a no-op waker is enough to stream previews.
+fn image_cache() -> &'static ImageCache {
+    static CACHE: std::sync::OnceLock<ImageCache> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| ImageCache::new(std::sync::Arc::new(|| {})))
+}
+
+/// Folders share one icon; executables/icon files key by path (their own icon);
+/// everything else keys by extension (its default-app/type icon).
+fn icon_key(e: &Entry) -> String {
+    if e.is_dir {
+        return "folder".into();
+    }
+    let ext = Path::new(&e.path)
+        .extension()
+        .and_then(|x| x.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if matches!(ext.as_str(), "exe" | "ico" | "lnk" | "scr" | "dll" | "icl" | "cpl") {
+        format!("file:{}", e.path)
+    } else if ext.is_empty() {
+        "file:none".into()
+    } else {
+        format!("ext:{ext}")
+    }
+}
+
+/// The entry's real shell icon at `size`, falling back to the drawn glyph when the
+/// platform supplies none (or the path is only a fixture).
+fn entry_icon(s: &App, e: &Entry, p: Paint, size: f32) -> El {
+    let key = icon_key(e);
+    let pixels = {
+        let mut cache = s.icon_cache.borrow_mut();
+        if let Some(px) = cache.get(&key) {
+            px.clone()
+        } else {
+            let px = Pixels::new();
+            if let Some((w, h, rgba)) = imagery::icon_rgba(&e.path, e.is_dir, (size.ceil() as u32).max(32)) {
+                px.set(w, h, rgba);
+            }
+            cache.insert(key, px.clone());
+            px
+        }
+    };
+    if pixels.size() == (0, 0) {
+        return file_glyph(e, p, size);
+    }
+    el().size(size, size).pixels(&pixels)
+}
+
+/// Whether an entry is a raster image worth decoding into a preview.
+fn previewable(e: &Entry) -> bool {
+    if e.is_dir || e.kind != Kind::Image {
+        return false;
+    }
+    let ext = Path::new(&e.path)
+        .extension()
+        .and_then(|x| x.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tif" | "tiff" | "avif" | "heic")
+}
+
+/// A decoded preview of an image file, cached by path and size. The handle is live:
+/// it draws nothing until the decoder lands, then wakes the window showing it.
+fn entry_thumb(s: &App, e: &Entry, px: u32) -> Image {
+    let key = format!("{}:{px}", e.path);
+    let mut cache = s.thumb_cache.borrow_mut();
+    if let Some(img) = cache.get(&key) {
+        return img.clone();
+    }
+    let img = image_cache().file(&e.path, px as f32, 1.0);
+    cache.insert(key, img.clone());
+    img
+}
+
+/// An image preview rect: the decoded picture fills it once ready, over a quiet
+/// placeholder so the tile is never a hole while the decoder works.
+fn thumb_rect(s: &App, e: &Entry, p: Paint, w: f32, h: f32, px: u32) -> El {
+    let img = entry_thumb(s, e, px);
+    el().size(w, h)
+        .radius(3.0)
+        .fill(p.thumb_bg)
+        .child(el().absolute(0.0, 0.0).size(w, h).center().child(file_glyph(e, p, h * 0.5)))
+        .child(el().absolute(0.0, 0.0).size(w, h).radius(3.0).pixels_fit(img.pixels(), SurfaceFit::Fill))
 }
 
 /// The Windows 11 local-disk mark: the four-square logo over a grey drive.
@@ -3374,7 +3471,7 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
                 .pr(8.0)
                 .gap(8.0)
                 .items_center()
-                .child(file_glyph(e, p, 16.0))
+                .child(entry_icon(s, e, p, 16.0))
                 .child(
                     text(e.name.as_str())
                         .font(ROW_TEXT)
@@ -3517,14 +3614,16 @@ fn grid_tile(s: &App, i: usize, p: Paint) -> El {
     let e = &s.entries[ei];
     let selected = s.selected == Some(ei);
     let path = e.path.clone();
-    let preview = if e.kind == Kind::Image && e.fixture {
+    let preview = if e.fixture && e.kind == Kind::Image {
         let at = ["095523", "103957", "104522", "111606", "111619"]
             .iter()
             .position(|t| e.name.ends_with(t))
             .unwrap_or(0);
         screenshot_thumb(at, 90.0, 72.0)
+    } else if previewable(e) {
+        thumb_rect(s, e, p, 90.0, 72.0, 128)
     } else {
-        el().w(90.0).h(72.0).center().child(file_glyph(e, p, 44.0))
+        el().w(90.0).h(72.0).center().child(entry_icon(s, e, p, 44.0))
     };
     let mut tile = col()
         .key(format!("tile-{i}"))
@@ -3599,7 +3698,7 @@ fn list_item(s: &App, i: usize, p: Paint) -> El {
         .px(6.0)
         .gap(8.0)
         .items_center()
-        .child(file_glyph(e, p, 16.0))
+        .child(entry_icon(s, e, p, 16.0))
         .child(
             text(e.name.as_str())
                 .font(ROW_TEXT)
@@ -3657,7 +3756,11 @@ fn tile_item(s: &App, i: usize, p: Paint) -> El {
         .px(8.0)
         .gap(10.0)
         .items_center()
-        .child(file_glyph(e, p, 32.0))
+        .child(if previewable(e) {
+            thumb_rect(s, e, p, 40.0, 40.0, 64)
+        } else {
+            entry_icon(s, e, p, 32.0)
+        })
         .child(
             col()
                 .grow(1.0)
@@ -3790,7 +3893,7 @@ fn home_content(s: &App, p: Paint) -> El {
                             .pl(16.0)
                             .gap(10.0)
                             .items_center()
-                            .child(file_glyph(e, p, 24.0))
+                            .child(entry_icon(s, e, p, 24.0))
                             .child(
                                 col()
                                     .gap(1.0)
@@ -3993,6 +4096,15 @@ fn preview_pane(s: &App, p: Paint) -> El {
         let e = s.selected.and_then(|i| s.entries.get(i)).or_else(|| s.entries.first());
         let name = e.map(|x| x.name.as_str()).unwrap_or("");
         let thumb = match e {
+            Some(entry) if previewable(entry) => {
+                let img = entry_thumb(s, entry, 320);
+                col()
+                    .w_full()
+                    .h(210.0)
+                    .fill(p.thumb_bg)
+                    .center()
+                    .child(el().size(PREVIEW_W - 2.0, 210.0).pixels_fit(img.pixels(), SurfaceFit::Fit))
+            }
             Some(entry) if entry.kind == Kind::Image && entry.fixture => {
                 let at = ["095523", "103957", "104522", "111606", "111619"]
                     .iter()
@@ -4010,7 +4122,7 @@ fn preview_pane(s: &App, p: Paint) -> El {
                 .h(210.0)
                 .fill(p.thumb_bg)
                 .center()
-                .child(file_glyph(entry, p, 64.0)),
+                .child(entry_icon(s, entry, p, 64.0)),
             None => col().w_full().h(210.0).fill(p.thumb_bg),
         };
         let location = s.crumbs.join(" / ");
@@ -4416,6 +4528,10 @@ fn main() {
             ("context", |s| {
                 load(s, Fixture::Downloads);
                 s.menu = Some(Menu::Context { scope: CtxScope::Item, target: 0, x: 420.0, y: 200.0 });
+            }),
+            ("real", |s| {
+                s.view = View::Files;
+                s.mode = Mode::Details;
             }),
         ],
         poll: Some(poll),

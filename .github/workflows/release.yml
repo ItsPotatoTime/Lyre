@@ -1,5 +1,14 @@
 name: release
 
+# Ships the native Rune crate (rune-ui/), not the old Tauri app. Each platform
+# builds lyre-rune, packages the format the updater installs (NSIS setup, AppImage,
+# universal .app.tar.gz), signs it with the project's minisign key, and uploads the
+# installer plus a manifest fragment. The publish job merges the fragments into a
+# Tauri-shaped latest.json and attaches everything to a DRAFT release; a person
+# publishes it, because releases/latest/download/latest.json only resolves once
+# published. The signing key is the same one the old release used, so installed
+# copies keep trusting it. See docs/updates.md.
+
 on:
   push:
     tags: ["v*"]
@@ -16,37 +25,18 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: Linux (AppImage, deb, rpm)
+          - name: Linux (AppImage)
             os: ubuntu-22.04
-            args: "-- --features custom-protocol"
-          - name: Windows (msi, exe)
+            platform: linux
+          - name: Windows (NSIS)
             os: windows-latest
-            args: "-- --features custom-protocol"
-          - name: macOS (universal dmg, app)
+            platform: windows
+          - name: macOS (universal)
             os: macos-latest
-            # build.rs refuses a release build that does not embed the
-            # frontend, so the feature travels with every platform.
-            args: "--target universal-apple-darwin -- --features custom-protocol"
+            platform: macos
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-
-      # Building on 22.04 rather than 24.04 on purpose: the AppImage links
-      # against whatever glibc the runner has, so an older base is the one that
-      # runs on more distributions.
-      - name: Install Linux dependencies
-        if: matrix.os == 'ubuntu-22.04'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libwebkit2gtk-4.1-dev \
-            libgtk-3-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            libxdo-dev \
-            libssl-dev \
-            patchelf \
-            rpm
 
       - uses: oven-sh/setup-bun@v2
         with:
@@ -54,74 +44,190 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # The same X11/Wayland/xcb development set the crate builds against on a
+      # working Linux machine; rune pulls these in through winit/wgpu. 22.04 rather
+      # than 24.04 on purpose: the AppImage links the runner's glibc, so an older
+      # base runs on more distributions.
+      - name: Install Linux dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config libssl-dev libwayland-dev libx11-dev libx11-xcb-dev \
+            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-shm0-dev \
+            libxcb-xfixes0-dev libxcb-xkb-dev libxkbcommon-dev libxkbcommon-x11-dev \
+            desktop-file-utils
+
+      # Git for Windows puts a GNU link.exe on PATH; activate MSVC so rustc finds
+      # the real one.
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: matrix.platform == 'windows'
+
       - name: Add both macOS targets
-        if: matrix.os == 'macos-latest'
+        if: matrix.platform == 'macos'
         run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
 
-      - name: Install the interface's dependencies
+      # The Tauri CLI is only needed for `signer sign`; the lockfile pins it.
+      - name: Install signing tool
         run: bun install --frozen-lockfile
 
-      # Creates the draft release for this tag on the first job that reaches it,
-      # and adds to it from the others.
-      - uses: tauri-apps/tauri-action@v0
+      - name: Build lyre-rune
+        if: matrix.platform != 'macos'
+        run: cargo build --release --manifest-path rune-ui/Cargo.toml
+
+      - name: Build lyre-rune (universal)
+        if: matrix.platform == 'macos'
+        run: |
+          cargo build --release --manifest-path rune-ui/Cargo.toml --target aarch64-apple-darwin
+          cargo build --release --manifest-path rune-ui/Cargo.toml --target x86_64-apple-darwin
+          mkdir -p target/universal
+          lipo -create -output target/universal/lyre-rune \
+            rune-ui/target/aarch64-apple-darwin/release/lyre-rune \
+            rune-ui/target/x86_64-apple-darwin/release/lyre-rune
+
+      - name: Package (Linux AppImage)
+        if: matrix.platform == 'linux'
+        run: |
+          set -eu
+          VERSION="${GITHUB_REF_NAME#v}"
+          APPDIR=AppDir
+          mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/applications" \
+            "$APPDIR/usr/share/icons/hicolor/256x256/apps" dist
+          cp rune-ui/target/release/lyre-rune "$APPDIR/usr/bin/lyre-rune"
+          cp packaging/rune/AppRun "$APPDIR/AppRun"
+          chmod +x "$APPDIR/AppRun" "$APPDIR/usr/bin/lyre-rune"
+          cp packaging/rune/lyre.desktop "$APPDIR/lyre.desktop"
+          cp packaging/rune/lyre.desktop "$APPDIR/usr/share/applications/lyre.desktop"
+          cp src-tauri/icons/icon.png "$APPDIR/lyre.png"
+          cp src-tauri/icons/icon.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/lyre.png"
+          curl -fsSL -o appimagetool \
+            https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+          ARCH=x86_64 ./appimagetool --appimage-extract-and-run "$APPDIR" "dist/Lyre_${VERSION}_amd64.AppImage"
+
+      - name: Package (Windows NSIS)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v',''
+          New-Item -ItemType Directory -Force dist | Out-Null
+          makensis /DVERSION=$version /DBINARY=rune-ui/target/release/lyre-rune.exe `
+            /DOUTFILE="dist/Lyre_${version}_x64-setup.exe" packaging/rune/windows/lyre.nsi
+
+      - name: Package (macOS .app)
+        if: matrix.platform == 'macos'
+        run: |
+          set -eu
+          VERSION="${GITHUB_REF_NAME#v}"
+          mkdir -p dist/Lyre.app/Contents/MacOS dist/Lyre.app/Contents/Resources
+          cp target/universal/lyre-rune dist/Lyre.app/Contents/MacOS/lyre-rune
+          sed "s/@VERSION@/$VERSION/g" packaging/rune/macos/Info.plist > dist/Lyre.app/Contents/Info.plist
+          cp src-tauri/icons/icon.icns dist/Lyre.app/Contents/Resources/icon.icns
+          tar -czf dist/Lyre_universal.app.tar.gz -C dist Lyre.app
+
+      - name: Sign (Linux)
+        if: matrix.platform == 'linux'
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # Signs the updater artifacts and writes latest.json beside them. Both
-          # secrets are required: without the key the build refuses to produce
-          # an update rather than shipping one nothing can verify. See
-          # docs/updates.md.
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        with:
-          tagName: ${{ github.ref_name }}
-          releaseName: Lyre ${{ github.ref_name }}
-          releaseDraft: true
-          prerelease: false
-          includeUpdaterJson: true
-          args: ${{ matrix.args }}
-          releaseBody: |
-            A fast, cross-platform file manager in the Windows 11 Explorer design
-            language.
-
-            | Platform | File |
-            | --- | --- |
-            | Linux | `AppImage` (no install), `deb`, `rpm` |
-            | Windows | `-setup.exe` (NSIS), `msi` |
-            | macOS | `dmg`, universal (Apple silicon and Intel) |
-
-            The `deb` and `rpm` use the system's `webkit2gtk-4.1`; the AppImage
-            carries its own, and needs glibc 2.35 or newer because it is built
-            on Ubuntu 22.04.
-
-            Nothing is code-signed yet. On Windows expect a SmartScreen prompt
-            (More info, then Run anyway); on macOS the app is unsigned and not
-            notarised, so the first launch needs a right-click and Open, or
-            `xattr -d com.apple.quarantine /Applications/Lyre.app`.
-
-            Installing from a package manager is described in
-            [docs/install.md](https://github.com/ItsPotatoTime/Lyre/blob/main/docs/install.md).
-
-      # The changelog is the release notes, so the draft is built from it rather
-      # than from a second copy that can drift. One platform does the edit: three
-      # of them appending to the same body would fight each other.
-      - name: Put this version's changelog in the draft
-        if: matrix.os == 'ubuntu-22.04'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
         run: |
-          version="${TAG#v}"
-          awk -v heading="## [$version]" '
+          VERSION="${GITHUB_REF_NAME#v}"
+          bun scripts/rune-release.ts sign "dist/Lyre_${VERSION}_amd64.AppImage" linux-x86_64
+
+      - name: Sign (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          $version = $env:GITHUB_REF_NAME -replace '^v',''
+          bun scripts/rune-release.ts sign "dist/Lyre_${version}_x64-setup.exe" windows-x86_64
+
+      # The universal build serves both Apple silicon and Intel, so it carries
+      # both darwin keys; the updater asks for the one matching its arch.
+      - name: Sign (macOS)
+        if: matrix.platform == 'macos'
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          bun scripts/rune-release.ts sign dist/Lyre_universal.app.tar.gz darwin-x86_64
+          bun scripts/rune-release.ts sign dist/Lyre_universal.app.tar.gz darwin-aarch64
+
+      - name: Upload installer and fragment
+        uses: actions/upload-artifact@v4
+        with:
+          name: rune-${{ matrix.platform }}
+          path: |
+            dist/*.AppImage
+            dist/*-setup.exe
+            dist/*.app.tar.gz
+            dist/*.json
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.4
+
+      - name: Collect platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: rune-*
+          merge-multiple: true
+          path: dist
+
+      # The changelog is the release notes, so the draft is built from it rather
+      # than a second copy that can drift.
+      - name: Release notes from the changelog
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v heading="## [$VERSION]" '
             index($0, heading) == 1 { copying = 1; next }
             copying && /^## \[/ { exit }
             copying { print }
-          ' CHANGELOG.md > section.md
-
-          if [ ! -s section.md ]; then
-            echo "CHANGELOG.md has no section for $version; leaving the notes as they are."
-            exit 0
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "No changelog section for $VERSION; see the assets below." > notes.md
           fi
 
-          gh release view "$TAG" --json body --jq .body > body.md
-          { cat body.md; printf '\n\n---\n\n## What changed in %s\n' "$version"; cat section.md; } > combined.md
-          gh release edit "$TAG" --notes-file combined.md
+      - name: Merge the update manifest
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          bun scripts/rune-release.ts manifest "$VERSION" notes.md dist/latest.json dist/*.json
+
+      - name: Create the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo "A fast, cross-platform file manager in the Windows 11 Explorer design language."
+            echo
+            echo '| Platform | File |'
+            echo '| --- | --- |'
+            echo '| Linux | `Lyre_<version>_amd64.AppImage` (no install) |'
+            echo '| Windows | `Lyre_<version>_x64-setup.exe` (NSIS) |'
+            echo '| macOS | `Lyre_universal.app.tar.gz` (Apple silicon and Intel) |'
+            echo
+            echo "Nothing is code-signed yet. On Windows expect a SmartScreen prompt"
+            echo "(More info, then Run anyway); on macOS the app is unsigned and not"
+            echo "notarised, so the first launch needs a right-click and Open."
+            echo
+            echo "---"
+            echo
+            cat notes.md
+          } > body.md
+          gh release create "$GITHUB_REF_NAME" \
+            --draft \
+            --title "Lyre $GITHUB_REF_NAME" \
+            --notes-file body.md \
+            dist/*.AppImage dist/*-setup.exe dist/*.app.tar.gz dist/latest.json

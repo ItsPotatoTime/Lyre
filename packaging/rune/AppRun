@@ -1,0 +1,4 @@
+#!/bin/sh
+# AppImage entry point: run the bundled binary with the mount as the working dir.
+HERE="$(dirname "$(readlink -f "$0")")"
+exec "$HERE/usr/bin/lyre-rune" "$@"

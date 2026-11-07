@@ -4,8 +4,10 @@ Lyre updates from its own GitHub releases. **More → Check for updates** asks
 `https://github.com/ItsPotatoTime/Lyre/releases/latest/download/latest.json`
 whether there is a newer build, and if there is, offers it: the version, the
 notes from that release, and an Install button that downloads it and hands it to
-the platform's installer. Nothing happens at startup, because a file manager that
-reaches the network before it shows a folder is slower than it looks.
+the platform's installer. The same check runs quietly once at launch — off the UI
+thread, so the window opens first — and only interrupts when there is something
+newer. **More → Check for updates at startup** turns that off (and back on), and
+the update dialog has a **Don't check at startup** link; the choice is remembered.
 
 ## The signature is not optional
 
@@ -24,10 +26,11 @@ bunx tauri signer generate -w ~/.tauri/lyre.key
 That writes the private key to `~/.tauri/lyre.key` and prints the public key. Two
 things follow from it:
 
-1. **The public key goes in [tauri.conf.json](../src-tauri/tauri.conf.json)**,
-   under `plugins.updater.pubkey`. Right now it is an empty string, which is why
-   this build can check for an update and download it but will refuse to install
-   one: an empty key matches nothing.
+1. **The public key is compiled into the app** — `PUBKEY` in
+   [rune-ui/src/updates.rs](../rune-ui/src/updates.rs), the same key as
+   `plugins.updater.pubkey` in [tauri.conf.json](../src-tauri/tauri.conf.json). A
+   build with an empty key can check and download but refuses to install, because
+   an empty key matches nothing.
 2. **The private key goes in the repository's secrets**, as
    `TAURI_SIGNING_PRIVATE_KEY` (the file's contents) and, if it was generated
    with a password, `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
@@ -42,14 +45,18 @@ rejected by every installed copy.
 
 ## Making a release
 
-1. Bump the version in three places: `src-tauri/tauri.conf.json`,
-   `src-tauri/Cargo.toml` and `package.json`. They have to agree, because the
-   updater compares the announced version against the one compiled into the
-   running build, and a mismatched bundle name is how a release fails to install.
-2. Commit, then tag: `git tag v0.2.0 && git push origin v0.2.0`.
-3. The [release workflow](../.github/workflows/release.yml) builds every
-   platform, signs the artifacts, and attaches them plus `latest.json` to a draft
-   release.
+The [release workflow](../.github/workflows/release.yml) ships the native crate
+(`rune-ui/`): each platform builds `lyre-rune`, packages the format the updater
+installs (NSIS setup on Windows, AppImage on Linux, a universal `.app.tar.gz` on
+macOS), signs it with `tauri signer sign` using the key above, and uploads a
+manifest fragment. A publish job merges the fragments into `latest.json` and
+attaches everything to a draft release.
+
+1. Bump the version in `rune-ui/Cargo.toml`. The updater compares the announced
+   version against `CARGO_PKG_VERSION` compiled into the running build, so it must
+   be higher than what people have for an offer to appear.
+2. Add a `## [0.3.0]` section to `CHANGELOG.md`; it becomes the release notes.
+3. Commit, then tag: `git tag v0.3.0 && git push origin v0.3.0`.
 4. **Publish the draft.** `releases/latest/download/latest.json` only resolves to
    published releases, so an unpublished draft is invisible to every installed
    copy. This is the step that ships the update.

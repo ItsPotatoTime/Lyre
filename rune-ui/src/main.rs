@@ -3433,17 +3433,27 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
             base()
                 .child(text("Rename").font(TILE_TEXT).color(p.text))
                 .child(
-                    text_input(edit, UI_TEXT)
-                        .key("dialog-edit")
+                    row()
                         .w_full()
                         .h(FIELD_H)
-                        .single_line()
-                        .color(p.text)
-                        .on_edit(|s: &mut App| match &mut s.dialog {
-                            Some(Dialog::Rename { edit, .. }) => edit,
-                            _ => unreachable!(),
-                        })
-                        .on_submit(|s: &mut App, _tx: &mut Tx| commit_rename(s)),
+                        .radius(4.0)
+                        .fill(p.field)
+                        .border(p.hair, p.field_line)
+                        .px(10.0)
+                        .items_center()
+                        .child(
+                            text_input(edit, UI_TEXT)
+                                .key("dialog-edit")
+                                .grow(1.0)
+                                .min_w(0.0)
+                                .single_line()
+                                .color(p.text)
+                                .on_edit(|s: &mut App| match &mut s.dialog {
+                                    Some(Dialog::Rename { edit, .. }) => edit,
+                                    _ => unreachable!(),
+                                })
+                                .on_submit(|s: &mut App, _tx: &mut Tx| commit_rename(s)),
+                        ),
                 )
                 .child(
                     row().w_full().gap(8.0).child(el().grow(1.0))
@@ -3455,17 +3465,27 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
             base()
                 .child(text("New folder").font(TILE_TEXT).color(p.text))
                 .child(
-                    text_input(edit, UI_TEXT)
-                        .key("dialog-edit")
+                    row()
                         .w_full()
                         .h(FIELD_H)
-                        .single_line()
-                        .color(p.text)
-                        .on_edit(|s: &mut App| match &mut s.dialog {
-                            Some(Dialog::NewFolder { edit, .. }) => edit,
-                            _ => unreachable!(),
-                        })
-                        .on_submit(|s: &mut App, _tx: &mut Tx| commit_new_folder(s)),
+                        .radius(4.0)
+                        .fill(p.field)
+                        .border(p.hair, p.field_line)
+                        .px(10.0)
+                        .items_center()
+                        .child(
+                            text_input(edit, UI_TEXT)
+                                .key("dialog-edit")
+                                .grow(1.0)
+                                .min_w(0.0)
+                                .single_line()
+                                .color(p.text)
+                                .on_edit(|s: &mut App| match &mut s.dialog {
+                                    Some(Dialog::NewFolder { edit, .. }) => edit,
+                                    _ => unreachable!(),
+                                })
+                                .on_submit(|s: &mut App, _tx: &mut Tx| commit_new_folder(s)),
+                        ),
                 )
                 .child(
                     row().w_full().gap(8.0).child(el().grow(1.0))
@@ -3663,6 +3683,15 @@ fn selected_paths(s: &App) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Whether an item is on the clipboard as a cut, so the list can ghost it. A
+/// copy replaces the clipboard, which clears the cut mark automatically.
+fn is_cut(s: &App, path: &str) -> bool {
+    match &s.clipboard {
+        Some((paths, fileops::Mode::Cut)) => paths.iter().any(|p| p.as_path() == Path::new(path)),
+        _ => false,
+    }
+}
+
 fn copy_selection(s: &mut App) {
     let paths = selected_paths(s);
     if !paths.is_empty() {
@@ -3732,6 +3761,20 @@ fn begin_paste(s: &mut App) {
         return;
     }
     let target = s.root.clone();
+    // Cutting into the folder an item already lives in is a no-op, not a conflict.
+    let sources: Vec<PathBuf> = if mode == fileops::Mode::Cut {
+        sources
+            .into_iter()
+            .filter(|src| src.parent() != Some(target.as_path()))
+            .collect()
+    } else {
+        sources
+    };
+    if sources.is_empty() {
+        s.menu = None;
+        s.notice = "Those items are already in this folder".into();
+        return;
+    }
     let conflict_exists = sources.iter().any(|src| {
         src.file_name().map(|n| target.join(n).exists()).unwrap_or(false)
     });
@@ -3940,7 +3983,8 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
         .h(row_h(s))
         .items_center()
         .fill(if selected { p.row_sel } else { Color::TRANSPARENT })
-        .hover(p.hover);
+        .hover(p.hover)
+        .opacity(if is_cut(s, &e.path) { 0.4 } else { 1.0 });
     if focused && selected {
         line = line.border(p.hair, p.focus_line);
     }
@@ -4117,6 +4161,7 @@ fn grid_tile(s: &App, i: usize, p: Paint) -> El {
         .px(6.0)
         .gap(6.0)
         .items_center()
+        .opacity(if is_cut(s, &e.path) { 0.4 } else { 1.0 })
         .child(preview)
         .child(
             text(e.name.as_str())
@@ -4179,6 +4224,7 @@ fn list_item(s: &App, i: usize, p: Paint) -> El {
         .px(6.0)
         .gap(8.0)
         .items_center()
+        .opacity(if is_cut(s, &e.path) { 0.4 } else { 1.0 })
         .child(entry_icon(s, e, p, 16.0))
         .child(
             text(e.name.as_str())
@@ -4237,6 +4283,7 @@ fn tile_item(s: &App, i: usize, p: Paint) -> El {
         .px(8.0)
         .gap(10.0)
         .items_center()
+        .opacity(if is_cut(s, &e.path) { 0.4 } else { 1.0 })
         .child(if previewable(e) {
             thumb_rect(s, e, p, 40.0, 40.0, 64)
         } else {
@@ -4911,6 +4958,22 @@ fn main() {
                     total_bytes: 1000,
                     stopping: false,
                 });
+            }),
+            ("cut", |s| {
+                s.view = View::Files;
+                s.mode = Mode::Details;
+                if let Some(e) = s.entries.first() {
+                    s.clipboard = Some((vec![PathBuf::from(&e.path)], fileops::Mode::Cut));
+                }
+            }),
+            ("renamedlg", |s| {
+                s.view = View::Files;
+                s.mode = Mode::Details;
+                if let Some(e) = s.entries.first() {
+                    let mut edit = TextEdit::default();
+                    edit.text = e.name.clone();
+                    s.dialog = Some(Dialog::Rename { path: PathBuf::from(&e.path), edit });
+                }
             }),
         ],
         poll: Some(poll),

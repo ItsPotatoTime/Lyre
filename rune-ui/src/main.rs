@@ -25,6 +25,8 @@ use rune::{
     text_input,
 };
 
+mod shell;
+
 // Metrics and colours sampled from the four reference captures. The chrome is
 // three distinct bands, not one surface: a near-black tab strip, a Mica-tinted
 // address row, and a command bar that shares the work area's neutral charcoal.
@@ -402,7 +404,15 @@ struct App {
     pinned: Vec<String>,
     /// Context-menu item ids the person turned off in the customize dialog.
     menu_hidden: Vec<String>,
+    /// Default-off shell verbs the person turned on in the customize dialog.
+    menu_shown: Vec<String>,
+    /// Built-in rail places (3..=8) the person unpinned from the sidebar.
+    hidden_places: Vec<usize>,
     customize_open: bool,
+    /// The target the customize dialog lists shell verbs for.
+    customize_path: Option<String>,
+    customize_is_dir: bool,
+    customize_background: bool,
     /// Signature of the persisted state; poll writes to disk when it changes.
     prefs_sig: String,
     /// Trigger and window rects in window points, read to anchor and clamp menus.
@@ -645,6 +655,12 @@ fn load_prefs(s: &mut App) {
     if let Some(m) = prefs.get::<Vec<String>>("menu_hidden") {
         s.menu_hidden = m;
     }
+    if let Some(m) = prefs.get::<Vec<String>>("menu_shown") {
+        s.menu_shown = m;
+    }
+    if let Some(h) = prefs.get::<Vec<usize>>("hidden_places") {
+        s.hidden_places = h;
+    }
 }
 
 /// Write the whole view state and collections; poll calls this once per change.
@@ -666,12 +682,14 @@ fn persist(s: &App) {
     let _ = prefs.set("favorites", &s.favorites);
     let _ = prefs.set("pinned", &s.pinned);
     let _ = prefs.set("menu_hidden", &s.menu_hidden);
+    let _ = prefs.set("menu_shown", &s.menu_shown);
+    let _ = prefs.set("hidden_places", &s.hidden_places);
 }
 
 /// A cheap fingerprint of everything persisted, so poll saves only on change.
 fn prefs_signature(s: &App) -> String {
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}",
         s.sort,
         s.sort_desc,
         s.preview,
@@ -684,7 +702,9 @@ fn prefs_signature(s: &App) -> String {
         s.dark,
         s.favorites,
         s.pinned,
-        s.menu_hidden
+        s.menu_hidden,
+        s.menu_shown,
+        s.hidden_places
     )
 }
 
@@ -712,9 +732,38 @@ fn toggle_pin(s: &mut App, path: &str) {
     }
 }
 
-/// Whether a context-menu item survives the person's customize choices.
+/// Whether a context-menu item survives the person's customize choices. Lyre's
+/// own items start on; another program's verbs start off and are turned on one
+/// at a time, so installing software never silently changes a right-click.
+fn item_shown(s: &App, id: &str, default_on: bool) -> bool {
+    if s.menu_hidden.iter().any(|x| x == id) {
+        false
+    } else if s.menu_shown.iter().any(|x| x == id) {
+        true
+    } else {
+        default_on
+    }
+}
+
 fn menu_visible(s: &App, id: &str) -> bool {
-    !s.menu_hidden.iter().any(|x| x == id)
+    item_shown(s, id, true)
+}
+
+/// Toggle a customize choice: default-on items go into menu_hidden, default-off
+/// shell verbs into menu_shown.
+fn toggle_menu_item(s: &mut App, id: &str, default_on: bool) {
+    let shown = item_shown(s, id, default_on);
+    if default_on {
+        if shown {
+            s.menu_hidden.push(id.to_string());
+        } else {
+            s.menu_hidden.retain(|x| x != id);
+        }
+    } else if shown {
+        s.menu_shown.retain(|x| x != id);
+    } else {
+        s.menu_shown.push(id.to_string());
+    }
 }
 
 /// The list stays virtualised: this only holds indices, never built rows.
@@ -1158,7 +1207,12 @@ fn init() -> App {
         favorites: Vec::new(),
         pinned: Vec::new(),
         menu_hidden: Vec::new(),
+        menu_shown: Vec::new(),
+        hidden_places: Vec::new(),
         customize_open: false,
+        customize_path: None,
+        customize_is_dir: false,
+        customize_background: false,
         prefs_sig: String::new(),
         rect_new: Live::new([0.0; 4]),
         rect_sort: Live::new([0.0; 4]),
@@ -2427,6 +2481,42 @@ fn menu_heading(p: Paint, label: &str) -> El {
         .child(text(label).font(CAPTION).color(p.tertiary))
 }
 
+/// The other-program verbs the person has turned on, as menu rows credited to
+/// their source. Empty (and no separator) when none are enabled.
+fn shell_verb_rows(
+    s: &App,
+    p: Paint,
+    path: Option<&str>,
+    is_dir: bool,
+    background: bool,
+) -> (Vec<El>, f32) {
+    let mut rows = Vec::new();
+    let mut h = 0.0;
+    let enabled: Vec<shell::Verb> = shell::verbs(path, is_dir, background)
+        .into_iter()
+        .filter(|v| item_shown(s, &v.id, false))
+        .collect();
+    if enabled.is_empty() {
+        return (rows, h);
+    }
+    rows.push(menu_sep(p));
+    h += 9.0;
+    for v in enabled {
+        let verb = v.clone();
+        let target = path.unwrap_or("").to_string();
+        rows.push(
+            menu_item(p, &v.label, None, Some(v.source.as_str()), false).on_press(move |s: &mut App| {
+                if let Err(e) = shell::run(&verb, &target) {
+                    s.notice = e;
+                }
+                s.menu = None;
+            }),
+        );
+        h += MENU_ROW_H;
+    }
+    (rows, h)
+}
+
 /// Anchor a flyout just below its trigger, from the trigger's drawn rect.
 fn open_drop(s: &mut App, kind: DropMenu, r: [f32; 4]) {
     s.menu = Some(Menu::Drop { kind, x: r[0], y: r[1] + r[3] + 2.0 });
@@ -2617,6 +2707,14 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                         ),
                     );
                     h += MENU_ROW_H;
+                    rows.push(
+                        menu_item(p, "Restore sidebar folders", Some(Ico::Pin), None, s.hidden_places.is_empty())
+                            .on_press(|s: &mut App| {
+                                s.hidden_places.clear();
+                                s.menu = None;
+                            }),
+                    );
+                    h += MENU_ROW_H;
                     rows.push(menu_sep(p));
                     h += 9.0;
                     rows.push(menu_heading(p, "Theme"));
@@ -2651,12 +2749,13 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                     let path = s.entries.get(target).map(|e| e.path.clone()).unwrap_or_default();
                     if menu_visible(s, "open") {
                         let open = path.clone();
+                        let open_label = if is_dir { "Open" } else { "Open with default app" };
                         rows.push(
-                            menu_item(p, "Open", Some(Ico::Open), None, false).on_press(move |s: &mut App| {
+                            menu_item(p, open_label, Some(Ico::Open), Some("Enter"), false).on_press(move |s: &mut App| {
                                 if is_dir {
                                     go(s, PathBuf::from(&open));
-                                } else {
-                                    s.notice = "Opening files arrives with file operations".into();
+                                } else if let Err(e) = shell::open_default(&open) {
+                                    s.notice = e;
                                 }
                                 s.menu = None;
                             }),
@@ -2669,7 +2768,15 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                             h += MENU_ROW_H;
                         }
                     } else if menu_visible(s, "open-with") {
-                        rows.push(menu_item(p, "Open with…", None, None, true));
+                        let open = path.clone();
+                        rows.push(
+                            menu_item(p, "Open with…", None, None, false).on_press(move |s: &mut App| {
+                                if let Err(e) = shell::open_with_picker(&open) {
+                                    s.notice = e;
+                                }
+                                s.menu = None;
+                            }),
+                        );
                         h += MENU_ROW_H;
                     }
                     rows.push(menu_sep(p));
@@ -2720,6 +2827,9 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                             h += MENU_ROW_H;
                         }
                     }
+                    let (shell_rows, shell_h) = shell_verb_rows(s, p, Some(&path), is_dir, false);
+                    rows.extend(shell_rows);
+                    h += shell_h;
                     rows.push(menu_sep(p));
                     h += 9.0;
                     if menu_visible(s, "properties") {
@@ -2731,9 +2841,13 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                         );
                         h += MENU_ROW_H;
                     }
+                    let ctx_path = path.clone();
                     rows.push(
-                        menu_item(p, "Customize context menu…", Some(Ico::More), None, false).on_press(|s: &mut App| {
+                        menu_item(p, "Customize context menu…", Some(Ico::More), None, false).on_press(move |s: &mut App| {
                             s.customize_open = true;
+                            s.customize_path = Some(ctx_path.clone());
+                            s.customize_is_dir = is_dir;
+                            s.customize_background = false;
                             s.menu = None;
                         }),
                     );
@@ -2803,9 +2917,17 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                         );
                         h += MENU_ROW_H;
                     }
+                    let root = s.root.to_string_lossy().into_owned();
+                    let (shell_rows, shell_h) = shell_verb_rows(s, p, Some(&root), true, true);
+                    rows.extend(shell_rows);
+                    h += shell_h;
+                    let ctx_root = root.clone();
                     rows.push(
-                        menu_item(p, "Customize context menu…", Some(Ico::More), None, false).on_press(|s: &mut App| {
+                        menu_item(p, "Customize context menu…", Some(Ico::More), None, false).on_press(move |s: &mut App| {
                             s.customize_open = true;
+                            s.customize_path = Some(ctx_root.clone());
+                            s.customize_is_dir = true;
+                            s.customize_background = true;
                             s.menu = None;
                         }),
                     );
@@ -2824,7 +2946,8 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                     let path = place_path(target).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
                     let has_path = !path.is_empty();
                     let fav = is_favorite(s, &path);
-                    let pin = is_pinned(s, &path);
+                    let hideable = (3..=8).contains(&target);
+                    let place_hidden = s.hidden_places.contains(&target);
                     if menu_visible(s, "favorite") {
                         let fp = path.clone();
                         rows.push(
@@ -2836,12 +2959,15 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                         );
                         h += MENU_ROW_H;
                     }
-                    if menu_visible(s, "pin") {
-                        let pp = path.clone();
+                    if menu_visible(s, "pin") && hideable {
                         rows.push(
-                            menu_item(p, if pin { "Remove from sidebar" } else { "Pin to sidebar" }, Some(Ico::Pin), None, !has_path)
+                            menu_item(p, if place_hidden { "Pin to sidebar" } else { "Remove from sidebar" }, Some(Ico::Pin), None, false)
                                 .on_press(move |s: &mut App| {
-                                    toggle_pin(s, &pp);
+                                    if let Some(i) = s.hidden_places.iter().position(|&x| x == target) {
+                                        s.hidden_places.remove(i);
+                                    } else {
+                                        s.hidden_places.push(target);
+                                    }
                                     s.menu = None;
                                 }),
                         );
@@ -2940,6 +3066,51 @@ fn menu_overlay(s: &App, p: Paint) -> El {
         .children(rows)
 }
 
+/// One checkbox row of the customize dialog; `default_on` decides which list a
+/// toggle writes to (Lyre items start on, other apps' verbs start off).
+fn customize_row(
+    p: Paint,
+    label: &str,
+    source: Option<&str>,
+    shown: bool,
+    id: String,
+    default_on: bool,
+) -> El {
+    let check = if shown {
+        ico(p, Ico::Check, 12.0, Color::WHITE)
+    } else {
+        el().size(12.0, 12.0)
+    };
+    let mut text_row = row()
+        .grow(1.0)
+        .min_w(0.0)
+        .gap(6.0)
+        .items_center()
+        .child(text(label).font(UI_TEXT).color(p.text).grow(1.0).min_w(0.0).truncate());
+    if let Some(src) = source {
+        text_row = text_row.child(text(src).font(CAPTION).color(p.tertiary));
+    }
+    row()
+        .w_full()
+        .h(32.0)
+        .px(8.0)
+        .gap(10.0)
+        .radius(4.0)
+        .fill(Color::TRANSPARENT)
+        .hover(p.hover)
+        .items_center()
+        .child(
+            el().size(18.0, 18.0)
+                .radius(4.0)
+                .border(p.hair, p.menu_line)
+                .fill(if shown { p.accent_fill } else { Color::TRANSPARENT })
+                .center()
+                .child(check),
+        )
+        .child(text_row)
+        .on_press(move |s: &mut App| toggle_menu_item(s, &id, default_on))
+}
+
 /// A modal dialog toggling which context-menu items appear; choices persist.
 fn customize_dialog(s: &App, p: Paint) -> El {
     if !s.customize_open {
@@ -2947,40 +3118,21 @@ fn customize_dialog(s: &App, p: Paint) -> El {
     }
     let mut list = col().key("customize-list").w_full().gap(2.0);
     for (id, label) in CUSTOM_ITEMS {
-        let shown = menu_visible(s, id);
-        let id = (*id).to_string();
-        let check = if shown {
-            ico(p, Ico::Check, 12.0, Color::WHITE)
-        } else {
-            el().size(12.0, 12.0)
-        };
-        list = list.child(
-            row()
-                .w_full()
-                .h(32.0)
-                .px(8.0)
-                .gap(10.0)
-                .radius(4.0)
-                .fill(Color::TRANSPARENT)
-                .hover(p.hover)
-                .items_center()
-                .child(
-                    el().size(18.0, 18.0)
-                        .radius(4.0)
-                        .border(p.hair, p.menu_line)
-                        .fill(if shown { p.accent_fill } else { Color::TRANSPARENT })
-                        .center()
-                        .child(check),
-                )
-                .child(text(*label).font(UI_TEXT).color(p.text).grow(1.0).min_w(0.0))
-                .on_press(move |s: &mut App| {
-                    if let Some(i) = s.menu_hidden.iter().position(|x| x == &id) {
-                        s.menu_hidden.remove(i);
-                    } else {
-                        s.menu_hidden.push(id.clone());
-                    }
-                }),
-        );
+        list = list.child(customize_row(p, label, None, item_shown(s, id, true), id.to_string(), true));
+    }
+    let verbs = shell::verbs(s.customize_path.as_deref(), s.customize_is_dir, s.customize_background);
+    if !verbs.is_empty() {
+        list = list.child(menu_heading(p, "Other apps"));
+        for v in verbs {
+            list = list.child(customize_row(
+                p,
+                &v.label,
+                Some(&v.source),
+                item_shown(s, &v.id, false),
+                v.id.clone(),
+                false,
+            ));
+        }
     }
     el().key("customize-overlay")
         .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
@@ -3125,13 +3277,19 @@ fn nav_rail(s: &App, p: Paint) -> El {
         .instant_changes()
         .child(rail_item(s, p, 0, "Home", false, false))
         .child(rail_item(s, p, 1, "Gallery", false, false))
-        .child(el().w_full().h(p.hair).fill(p.soft_line).my(5.0).key("rail-sep-1"))
-        .child(rail_item(s, p, 3, "Desktop", false, true))
-        .child(rail_item(s, p, 4, "Downloads", false, true))
-        .child(rail_item(s, p, 5, "Documents", false, true))
-        .child(rail_item(s, p, 6, "Pictures", false, true))
-        .child(rail_item(s, p, 7, "Music", false, true))
-        .child(rail_item(s, p, 8, "Videos", false, true));
+        .child(el().w_full().h(p.hair).fill(p.soft_line).my(5.0).key("rail-sep-1"));
+    for (index, label) in [
+        (3, "Desktop"),
+        (4, "Downloads"),
+        (5, "Documents"),
+        (6, "Pictures"),
+        (7, "Music"),
+        (8, "Videos"),
+    ] {
+        if !s.hidden_places.contains(&index) {
+            rail = rail.child(rail_item(s, p, index, label, false, true));
+        }
+    }
     if !s.pinned.is_empty() {
         rail = rail.child(el().w_full().h(p.hair).fill(p.soft_line).my(5.0).key("rail-sep-pinned"));
         for (pi, path) in s.pinned.iter().enumerate() {
@@ -3204,8 +3362,7 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
         .h(row_h(s))
         .items_center()
         .fill(if selected { p.row_sel } else { Color::TRANSPARENT })
-        .hover(p.hover)
-        .motion(Spring::NONE);
+        .hover(p.hover);
     if focused && selected {
         line = line.border(p.hair, p.focus_line);
     }
@@ -3380,7 +3537,6 @@ fn grid_tile(s: &App, i: usize, p: Paint) -> El {
         .px(6.0)
         .gap(6.0)
         .items_center()
-        .motion(Spring::NONE)
         .child(preview)
         .child(
             text(e.name.as_str())
@@ -3443,7 +3599,6 @@ fn list_item(s: &App, i: usize, p: Paint) -> El {
         .px(6.0)
         .gap(8.0)
         .items_center()
-        .motion(Spring::NONE)
         .child(file_glyph(e, p, 16.0))
         .child(
             text(e.name.as_str())
@@ -3502,7 +3657,6 @@ fn tile_item(s: &App, i: usize, p: Paint) -> El {
         .px(8.0)
         .gap(10.0)
         .items_center()
-        .motion(Spring::NONE)
         .child(file_glyph(e, p, 32.0))
         .child(
             col()
@@ -4255,6 +4409,13 @@ fn main() {
             ("customize", |s| {
                 load(s, Fixture::Downloads);
                 s.customize_open = true;
+                s.customize_path = Some(s.root.to_string_lossy().into_owned());
+                s.customize_is_dir = true;
+                s.customize_background = true;
+            }),
+            ("context", |s| {
+                load(s, Fixture::Downloads);
+                s.menu = Some(Menu::Context { scope: CtxScope::Item, target: 0, x: 420.0, y: 200.0 });
             }),
         ],
         poll: Some(poll),

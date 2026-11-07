@@ -27,6 +27,7 @@ use rune::{
     canvas, col, el, row, run_windows, text, text_input,
 };
 
+mod frame;
 mod imagery;
 mod shell;
 
@@ -2283,8 +2284,8 @@ fn tab_strip(s: &App, p: Paint) -> El {
                 .child(ico(p, glyph, 13.0, p.secondary))
                 .help(label)
                 .on_press_tx(move |s: &mut App, tx: &mut Tx| match i {
-                    0 => winframe::minimize(),
-                    1 => s.zoom = winframe::toggle_maximize(),
+                    0 => frame::minimize(),
+                    1 => s.zoom = frame::toggle_maximize(),
                     _ => tx.close_window(),
                 }),
         );
@@ -4329,161 +4330,6 @@ fn load_fonts() -> &'static [&'static [u8]] {
     Box::leak(out.into_boxed_slice())
 }
 
-/// A borderless window has no system frame, so Rune's `Tx::minimize` refuses it
-/// and there is no `Tx::maximize`. Drive the HWND directly: DWM rounds the frame
-/// (Rune's corner radius is AppKit-only), `ShowWindow` minimizes and truly
-/// maximizes/restores, and a `WM_NCHITTEST` subclass hands the outer band back to
-/// the system as resize edges so the border drags smoothly. Everything links to
-/// system libraries by name, so this needs no extra crate.
-#[cfg(target_os = "windows")]
-mod winframe {
-    use rune::WindowHandle;
-    use rune::raw_window_handle::RawWindowHandle;
-    use std::sync::OnceLock;
-
-    static HWND: OnceLock<isize> = OnceLock::new();
-
-    #[repr(C)]
-    struct Rect {
-        left: i32,
-        top: i32,
-        right: i32,
-        bottom: i32,
-    }
-
-    type SubclassProc =
-        unsafe extern "system" fn(isize, u32, usize, isize, usize, usize) -> isize;
-
-    #[link(name = "dwmapi")]
-    unsafe extern "system" {
-        fn DwmSetWindowAttribute(
-            hwnd: isize,
-            attribute: u32,
-            value: *const core::ffi::c_void,
-            size: u32,
-        ) -> i32;
-    }
-    #[link(name = "user32")]
-    unsafe extern "system" {
-        fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
-        fn IsZoomed(hwnd: isize) -> i32;
-        fn GetWindowRect(hwnd: isize, rect: *mut Rect) -> i32;
-        fn DefSubclassProc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
-    }
-    #[link(name = "comctl32")]
-    unsafe extern "system" {
-        fn SetWindowSubclass(hwnd: isize, proc: SubclassProc, id: usize, data: usize) -> i32;
-    }
-
-    const WM_NCHITTEST: u32 = 0x0084;
-    const SW_MINIMIZE: i32 = 6;
-    const SW_MAXIMIZE: i32 = 3;
-    const SW_RESTORE: i32 = 9;
-    const HTLEFT: isize = 10;
-    const HTRIGHT: isize = 11;
-    const HTTOP: isize = 12;
-    const HTTOPLEFT: isize = 13;
-    const HTTOPRIGHT: isize = 14;
-    const HTBOTTOM: isize = 15;
-    const HTBOTTOMLEFT: isize = 16;
-    const HTBOTTOMRIGHT: isize = 17;
-    const BORDER: i32 = 8;
-
-    /// Claim the outer band as resize edges; leave the rest to Rune's own proc.
-    unsafe extern "system" fn hit_test(
-        hwnd: isize,
-        msg: u32,
-        wparam: usize,
-        lparam: isize,
-        _id: usize,
-        _data: usize,
-    ) -> isize {
-        unsafe {
-            if msg == WM_NCHITTEST && IsZoomed(hwnd) == 0 {
-                let x = (lparam as u16) as i16 as i32;
-                let y = ((lparam >> 16) as u16) as i16 as i32;
-                let mut r = Rect { left: 0, top: 0, right: 0, bottom: 0 };
-                if GetWindowRect(hwnd, &mut r) != 0 {
-                    let left = x < r.left + BORDER;
-                    let right = x >= r.right - BORDER;
-                    let top = y < r.top + BORDER;
-                    let bottom = y >= r.bottom - BORDER;
-                    let code = match (top, bottom, left, right) {
-                        (true, _, true, _) => HTTOPLEFT,
-                        (true, _, _, true) => HTTOPRIGHT,
-                        (_, true, true, _) => HTBOTTOMLEFT,
-                        (_, true, _, true) => HTBOTTOMRIGHT,
-                        (true, _, _, _) => HTTOP,
-                        (_, true, _, _) => HTBOTTOM,
-                        (_, _, true, _) => HTLEFT,
-                        (_, _, _, true) => HTRIGHT,
-                        _ => 0,
-                    };
-                    if code != 0 {
-                        return code;
-                    }
-                }
-            }
-            DefSubclassProc(hwnd, msg, wparam, lparam)
-        }
-    }
-
-    /// Round the frame and install the resize-edge subclass once the HWND exists.
-    pub fn install(handle: &WindowHandle) {
-        let _ = handle.with_raw_handle(|raw| {
-            if let RawWindowHandle::Win32(win) = raw.as_raw() {
-                let hwnd = win.hwnd.get();
-                let _ = HWND.set(hwnd);
-                const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
-                const DWMWCP_ROUND: u32 = 2;
-                let preference = DWMWCP_ROUND;
-                unsafe {
-                    DwmSetWindowAttribute(
-                        hwnd,
-                        DWMWA_WINDOW_CORNER_PREFERENCE,
-                        (&preference as *const u32).cast(),
-                        core::mem::size_of::<u32>() as u32,
-                    );
-                    SetWindowSubclass(hwnd, hit_test, 1, 0);
-                }
-            }
-        });
-    }
-
-    pub fn minimize() {
-        if let Some(&hwnd) = HWND.get() {
-            unsafe {
-                ShowWindow(hwnd, SW_MINIMIZE);
-            }
-        }
-    }
-
-    /// Maximize when restored, restore when maximized; returns the new zoom state.
-    pub fn toggle_maximize() -> bool {
-        let Some(&hwnd) = HWND.get() else {
-            return false;
-        };
-        unsafe {
-            if IsZoomed(hwnd) != 0 {
-                ShowWindow(hwnd, SW_RESTORE);
-                false
-            } else {
-                ShowWindow(hwnd, SW_MAXIMIZE);
-                true
-            }
-        }
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-mod winframe {
-    pub fn install(_handle: &rune::WindowHandle) {}
-    pub fn minimize() {}
-    pub fn toggle_maximize() -> bool {
-        false
-    }
-}
-
 fn main() {
     let spec = AppSpec::<App> {
         scenes: &[
@@ -4550,13 +4396,20 @@ fn main() {
     // drawn minimize/maximize/close controls and window_drag own that job;
     // leaving decorations on would stack a second, native bar above it.
     run_windows(|_displays| {
-        let window = WindowSpec::new("main", spec).options(WindowOptions {
-            borderless: true,
-            resizable: true,
-            min_size: Some((760.0, 480.0)),
-            ..Default::default()
-        });
-        let window = window.on_created(|handle| winframe::install(&handle));
+        // macOS rounds a transparent borderless window through Rune's own corner
+        // radius; Windows rounds through DWM in frame::install; Linux leaves the
+        // corners to the compositor.
+        let window = WindowSpec::new("main", spec).configured_options(
+            WindowOptions {
+                borderless: true,
+                resizable: true,
+                min_size: Some((760.0, 480.0)),
+                transparent: cfg!(target_os = "macos"),
+                ..Default::default()
+            }
+            .macos(rune::MacWindowOptions::default().corner_radius(8.0)),
+        );
+        let window = window.on_created(|handle| frame::install(&handle));
         [window.boxed()]
     });
 }

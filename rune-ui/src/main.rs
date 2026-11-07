@@ -44,6 +44,8 @@ const NAME_W: f32 = 260.0;
 const DATE_W: f32 = 140.0;
 const TYPE_W: f32 = 120.0;
 const SIZE_W: f32 = 80.0;
+const MENU_W: f32 = 248.0;
+const MENU_ROW_H: f32 = 30.0;
 
 // Explorer sets its body and chrome text in 14px Segoe UI; only the quiet
 // secondary lines (status, "Stored locally", preview details) drop to 12px.
@@ -86,6 +88,8 @@ struct Paint {
     thumb_bg: Color,
     pill_off: Color,
     close_hover: Color,
+    menu: Color,
+    menu_line: Color,
     hair: f32,
 }
 
@@ -120,6 +124,8 @@ fn paint(dark: bool, scale: f32) -> Paint {
             thumb_bg: c("#222222"),
             pill_off: c("#272727"),
             close_hover: c("#c42b1c"),
+            menu: c("#2b2b2b"),
+            menu_line: c("#454545"),
             hair,
         }
     } else {
@@ -151,6 +157,8 @@ fn paint(dark: bool, scale: f32) -> Paint {
             thumb_bg: c("#f0f0f0"),
             pill_off: c("#f0f0f0"),
             close_hover: c("#c42b1c"),
+            menu: c("#ffffff"),
+            menu_line: c("#e5e5e5"),
             hair,
         }
     }
@@ -254,7 +262,76 @@ enum View {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Details,
+    List,
+    Tiles,
     Grid,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Filter {
+    All,
+    Folders,
+    Documents,
+    Images,
+    Video,
+    Audio,
+    Archives,
+    Code,
+}
+
+impl Filter {
+    fn label(self) -> &'static str {
+        match self {
+            Filter::All => "All items",
+            Filter::Folders => "Folders",
+            Filter::Documents => "Documents",
+            Filter::Images => "Images",
+            Filter::Video => "Video",
+            Filter::Audio => "Audio",
+            Filter::Archives => "Compressed archives",
+            Filter::Code => "Code and programs",
+        }
+    }
+
+    fn matches(self, e: &Entry) -> bool {
+        match self {
+            Filter::All => true,
+            Filter::Folders => e.is_dir,
+            Filter::Documents => matches!(
+                e.kind,
+                Kind::Pdf | Kind::Document | Kind::Sheet | Kind::Slides | Kind::Text
+            ),
+            Filter::Images => e.kind == Kind::Image,
+            Filter::Video => e.kind == Kind::Video,
+            Filter::Audio => e.kind == Kind::Audio,
+            Filter::Archives => e.kind == Kind::Archive,
+            Filter::Code => matches!(e.kind, Kind::Code | Kind::App),
+        }
+    }
+}
+
+/// A command-bar flyout, anchored below its trigger in window points.
+#[derive(Clone, Copy)]
+enum DropMenu {
+    New,
+    Sort,
+    View,
+    Filter,
+    More,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CtxScope {
+    Item,
+    Background,
+    Place,
+}
+
+/// The one open menu: a command-bar flyout or a right-click context menu.
+#[derive(Clone)]
+enum Menu {
+    Drop { kind: DropMenu, x: f32, y: f32 },
+    Context { scope: CtxScope, target: usize, x: f32, y: f32 },
 }
 
 #[derive(Clone, Copy)]
@@ -291,6 +368,21 @@ struct App {
     history: Vec<PathBuf>,
     forward: Vec<PathBuf>,
     sort: u8,
+    sort_desc: bool,
+    group_by_date: bool,
+    filter: Filter,
+    compact: bool,
+    show_hidden: bool,
+    nav_open: bool,
+    /// The single open flyout or context menu, if any.
+    menu: Option<Menu>,
+    /// Trigger and window rects in window points, read to anchor and clamp menus.
+    rect_new: Live<[f32; 4]>,
+    rect_sort: Live<[f32; 4]>,
+    rect_view: Live<[f32; 4]>,
+    rect_filter: Live<[f32; 4]>,
+    rect_more: Live<[f32; 4]>,
+    rect_window: Live<[f32; 4]>,
     /// Fixture views arrive in the authored order of the reference captures;
     /// only a real directory scan is sorted by the active column.
     keep_order: bool,
@@ -349,9 +441,6 @@ fn scan(path: &Path) -> (Vec<Entry>, f64) {
     if let Ok(reader) = fs::read_dir(path) {
         for item in reader.flatten() {
             let name = item.file_name().to_string_lossy().into_owned();
-            if name.starts_with('.') {
-                continue;
-            }
             let Ok(meta) = item.metadata() else { continue };
             let is_dir = meta.is_dir();
             let modified = meta
@@ -429,11 +518,33 @@ fn place_path(index: usize) -> Option<PathBuf> {
 }
 
 /// Recompute the row order after a scan, a search keystroke, or a sort click.
+/// Open a folder by path, or report that launching files is still deferred.
+fn open_entry(s: &mut App, path: &str) {
+    if let Some(at) = s.entries.iter().position(|e| e.path == path) {
+        if s.entries[at].is_dir {
+            let next = PathBuf::from(&s.entries[at].path);
+            go(s, next);
+        } else {
+            s.notice = "Opening files arrives with file operations".into();
+        }
+    }
+}
+
+/// Details/List row height: Compact view tightens the rows Explorer-style.
+fn row_h(s: &App) -> f32 {
+    if s.compact { 22.0 } else { ROW_H }
+}
+
 /// The list stays virtualised: this only holds indices, never built rows.
 fn refresh_visible(s: &mut App) {
     let q = s.search_edit.text.to_lowercase();
     let mut order: Vec<usize> = (0..s.entries.len())
-        .filter(|&i| q.is_empty() || s.entries[i].name.to_lowercase().contains(&q))
+        .filter(|&i| {
+            let e = &s.entries[i];
+            (q.is_empty() || e.name.to_lowercase().contains(&q))
+                && (s.show_hidden || !e.name.starts_with('.'))
+                && s.filter.matches(e)
+        })
         .collect();
     if !s.keep_order {
         match s.sort {
@@ -445,6 +556,33 @@ fn refresh_visible(s: &mut App) {
                     .cmp(&(!s.entries[b].is_dir, s.entries[b].name.to_lowercase()))
             }),
         }
+        if s.sort_desc {
+            order.reverse();
+        }
+    }
+    // Grouping: fixtures keep their authored blocks; a real folder groups by the
+    // day each entry was modified when asked, sorting by date so days stay whole.
+    if s.keep_order {
+        // authored groups already set by the fixture
+    } else if s.group_by_date && s.view == View::Files {
+        order.sort_by(|&a, &b| s.entries[b].modified.cmp(&s.entries[a].modified));
+        let mut groups: Vec<(usize, String)> = Vec::new();
+        let mut last = String::new();
+        for (i, &ei) in order.iter().enumerate() {
+            let day = s.entries[ei]
+                .modified
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            if day != last {
+                groups.push((i, day.clone()));
+                last = day;
+            }
+        }
+        s.groups = groups;
+    } else {
+        s.groups.clear();
     }
     s.count = s.count_override.unwrap_or(order.len());
     s.visible = order;
@@ -819,6 +957,19 @@ fn init() -> App {
         history: Vec::new(),
         forward: Vec::new(),
         sort: 0,
+        sort_desc: false,
+        group_by_date: false,
+        filter: Filter::All,
+        compact: false,
+        show_hidden: false,
+        nav_open: true,
+        menu: None,
+        rect_new: Live::new([0.0; 4]),
+        rect_sort: Live::new([0.0; 4]),
+        rect_view: Live::new([0.0; 4]),
+        rect_filter: Live::new([0.0; 4]),
+        rect_more: Live::new([0.0; 4]),
+        rect_window: Live::new([0.0; 4]),
         keep_order: false,
         count_override: None,
         zoom: false,
@@ -896,6 +1047,9 @@ enum Ico {
     Clock,
     Grid,
     List,
+    Tiles,
+    Check,
+    Open,
 }
 
 fn ico(p: Paint, which: Ico, size: f32, ink: Color) -> El {
@@ -1216,6 +1370,20 @@ fn ico(p: Paint, which: Ico, size: f32, ink: Color) -> El {
             .line([9.0, 6.0], [20.0, 6.0], W, LineCap::Round, ink)
             .line([9.0, 12.0], [20.0, 12.0], W, LineCap::Round, ink)
             .line([9.0, 18.0], [20.0, 18.0], W, LineCap::Round, ink),
+        Ico::Tiles => Shape::new()
+            .fill(vec![[4.0, 5.0], [9.0, 5.0], [9.0, 10.0], [4.0, 10.0]], ink)
+            .line([11.0, 6.0], [20.0, 6.0], W, LineCap::Round, ink)
+            .line([11.0, 9.0], [17.0, 9.0], W, LineCap::Round, ink)
+            .fill(vec![[4.0, 14.0], [9.0, 14.0], [9.0, 19.0], [4.0, 19.0]], ink)
+            .line([11.0, 15.0], [20.0, 15.0], W, LineCap::Round, ink)
+            .line([11.0, 18.0], [17.0, 18.0], W, LineCap::Round, ink),
+        Ico::Check => stroke(vec![[5.0, 12.0], [10.0, 17.0], [19.0, 7.0]], ink),
+        Ico::Open => stroke(
+            vec![[4.0, 11.0], [4.0, 20.0], [20.0, 20.0], [20.0, 11.0]],
+            ink,
+        )
+        .line([12.0, 15.0], [12.0, 4.0], W, LineCap::Round, ink)
+        .stroke(vec![[8.0, 8.0], [12.0, 4.0], [16.0, 8.0]], W, ink),
     };
     let _ = p;
     canvas(sh.view_box(24.0, 24.0)).size(size, size)
@@ -1648,12 +1816,14 @@ fn view(s: &App, cx: &mut Cx<App>) -> El {
         .w_full()
         .h_full()
         .fill(p.title)
+        .drawn_rect_into(&s.rect_window)
         .child(tab_strip(s, p))
         .child(address_row(s, p))
         .child(command_bar(s, p))
         .child(body(s, p))
         .child(status_bar(s, p))
         .child(scroll_thumb(s, p))
+        .child(menu_overlay(s, p))
 }
 
 /// The drawn scrollbar thumb. Its rect and visibility arrive from the scroll
@@ -1917,9 +2087,12 @@ fn command_bar(s: &App, p: Paint) -> El {
         .items_center()
         .child(
             text_button(p, Ico::New, "New", true, false)
+                .key("cmd-new")
+                .drawn_rect_into(&s.rect_new)
                 .help("New item")
                 .on_press(|s: &mut App| {
-                    s.notice = "New is not implemented in this slice".into();
+                    let r = s.rect_new.get();
+                    open_drop(s, DropMenu::New, r);
                 }),
         )
         .child(el().w(p.hair).h(20.0).fill(p.line).mx(6.0));
@@ -1939,39 +2112,35 @@ fn command_bar(s: &App, p: Paint) -> El {
     bar = bar
         .child(el().w(p.hair).h(20.0).fill(p.line).mx(6.0))
         .child(
-            text_button(p, Ico::Sort, "Sort", true, s.view == View::Home)
+            text_button(p, Ico::Sort, "Sort", true, false)
+                .key("cmd-sort")
+                .drawn_rect_into(&s.rect_sort)
                 .help("Sort")
                 .on_press(|s: &mut App| {
-                    s.sort = (s.sort + 1) % 4;
-                    s.groups.clear();
-                    s.keep_order = false;
-                    refresh_visible(s);
-                    s.notice = format!(
-                        "Sorted by {}",
-                        ["name", "date", "type", "size"][s.sort as usize]
-                    );
+                    let r = s.rect_sort.get();
+                    open_drop(s, DropMenu::Sort, r);
                 }),
         )
         .child(
             text_button(p, Ico::View, "View", true, false)
+                .key("cmd-view")
+                .drawn_rect_into(&s.rect_view)
                 .help("View")
                 .on_press(|s: &mut App| {
-                    s.mode = if s.mode == Mode::Details {
-                        Mode::Grid
-                    } else {
-                        Mode::Details
-                    };
+                    let r = s.rect_view.get();
+                    open_drop(s, DropMenu::View, r);
                 }),
         );
-    if s.view == View::Home {
-        bar = bar.child(
-            text_button(p, Ico::Filter, "Filter", true, false)
-                .help("Filter")
-                .on_press(|s: &mut App| {
-                    s.notice = "Filter is not implemented in this slice".into();
-                }),
-        );
-    }
+    bar = bar.child(
+        text_button(p, Ico::Filter, "Filter", true, false)
+            .key("cmd-filter")
+            .drawn_rect_into(&s.rect_filter)
+            .help("Filter by type")
+            .on_press(|s: &mut App| {
+                let r = s.rect_filter.get();
+                open_drop(s, DropMenu::Filter, r);
+            }),
+    );
     if s.contextual {
         bar = bar
             .child(el().w(p.hair).h(20.0).fill(p.line).mx(6.0))
@@ -1997,8 +2166,11 @@ fn command_bar(s: &App, p: Paint) -> El {
         .child(el().w(p.hair).h(20.0).fill(p.line).mx(6.0))
         .child(
             icon_button(p, Ico::More, false, "More")
+                .key("cmd-more")
+                .drawn_rect_into(&s.rect_more)
                 .on_press(|s: &mut App| {
-                    s.notice = "More commands are not implemented in this slice".into();
+                    let r = s.rect_more.get();
+                    open_drop(s, DropMenu::More, r);
                 }),
         )
         .child(el().grow(1.0));
@@ -2012,6 +2184,431 @@ fn command_bar(s: &App, p: Paint) -> El {
     } else {
         details
     })
+}
+
+// ----------------------------------------------------------------- menus ----
+
+/// One row of a flyout or context menu. `leading` is the check/icon column; the
+/// caller attaches the press action. Disabled rows draw dimmed and inert.
+fn menu_item(p: Paint, label: &str, leading: Option<Ico>, hint: Option<&str>, disabled: bool) -> El {
+    let ink = if disabled { p.disabled } else { p.text };
+    let mark = match leading {
+        Some(w) => ico(p, w, 15.0, if disabled { p.disabled } else { p.secondary }),
+        None => el().size(15.0, 15.0),
+    };
+    let mut r = row()
+        .w_full()
+        .h(MENU_ROW_H)
+        .px(8.0)
+        .gap(8.0)
+        .radius(4.0)
+        .fill(Color::TRANSPARENT)
+        .items_center()
+        .child(el().w(18.0).center().child(mark))
+        .child(text(label).font(UI_TEXT).color(ink).grow(1.0).min_w(0.0).truncate());
+    if let Some(h) = hint {
+        r = r.child(text(h).font(CAPTION).color(p.tertiary));
+    }
+    if !disabled {
+        r = r.hover(p.hover).press(p.press);
+    }
+    r
+}
+
+fn menu_sep(p: Paint) -> El {
+    el().w_full().h(p.hair).fill(p.menu_line).my(4.0)
+}
+
+fn menu_heading(p: Paint, label: &str) -> El {
+    row()
+        .w_full()
+        .h(24.0)
+        .px(12.0)
+        .items_center()
+        .child(text(label).font(CAPTION).color(p.tertiary))
+}
+
+/// Anchor a flyout just below its trigger, from the trigger's drawn rect.
+fn open_drop(s: &mut App, kind: DropMenu, r: [f32; 4]) {
+    s.menu = Some(Menu::Drop { kind, x: r[0], y: r[1] + r[3] + 2.0 });
+}
+
+/// The open menu as a window-level overlay: a full-window scrim that closes it
+/// on any outside press, and the panel itself, clamped to the window edges.
+fn menu_overlay(s: &App, p: Paint) -> El {
+    let Some(menu) = s.menu.clone() else {
+        return el().key("menu-none");
+    };
+    let win = s.rect_window.get();
+    let (ww, wh) = (win[2], win[3]);
+    let mut rows: Vec<El> = Vec::new();
+    let mut h = 8.0;
+    let (ax, ay) = match &menu {
+        Menu::Drop { x, y, .. } | Menu::Context { x, y, .. } => (*x, *y),
+    };
+
+    match &menu {
+        Menu::Drop { kind, .. } => {
+            match kind {
+                DropMenu::New => {
+                    rows.push(menu_item(p, "Folder", Some(Ico::New), None, true));
+                    rows.push(menu_item(p, "Shortcut", Some(Ico::New), None, true));
+                    h += MENU_ROW_H * 2.0;
+                }
+                DropMenu::Sort => {
+                    for (k, label) in [(0u8, "Name"), (1, "Date modified"), (2, "Type"), (3, "Size")] {
+                        let leading = (s.sort == k).then_some(Ico::Check);
+                        rows.push(
+                            menu_item(p, label, leading, None, false).on_press(move |s: &mut App| {
+                                s.sort = k;
+                                s.keep_order = false;
+                                refresh_visible(s);
+                                s.menu = None;
+                            }),
+                        );
+                        h += MENU_ROW_H;
+                    }
+                    rows.push(menu_sep(p));
+                    h += 9.0;
+                    for (desc, label) in [(false, "Ascending"), (true, "Descending")] {
+                        let leading = (s.sort_desc == desc).then_some(Ico::Check);
+                        rows.push(
+                            menu_item(p, label, leading, None, false).on_press(move |s: &mut App| {
+                                s.sort_desc = desc;
+                                s.keep_order = false;
+                                refresh_visible(s);
+                                s.menu = None;
+                            }),
+                        );
+                        h += MENU_ROW_H;
+                    }
+                    rows.push(menu_sep(p));
+                    h += 9.0;
+                    let g = s.group_by_date;
+                    rows.push(
+                        menu_item(p, "Group by date", g.then_some(Ico::Check), None, false).on_press(
+                            move |s: &mut App| {
+                                s.group_by_date = !g;
+                                refresh_visible(s);
+                                s.menu = None;
+                            },
+                        ),
+                    );
+                    h += MENU_ROW_H;
+                }
+                DropMenu::View => {
+                    for (m, label, icon) in [
+                        (Mode::Details, "Details", Ico::Details),
+                        (Mode::List, "List", Ico::List),
+                        (Mode::Tiles, "Tiles", Ico::Tiles),
+                        (Mode::Grid, "Large icons", Ico::Grid),
+                    ] {
+                        let leading = if s.mode == m { Some(Ico::Check) } else { Some(icon) };
+                        rows.push(
+                            menu_item(p, label, leading, None, false)
+                                .on_press(move |s: &mut App| {
+                                    s.mode = m;
+                                    s.menu = None;
+                                }),
+                        );
+                        h += MENU_ROW_H;
+                    }
+                    rows.push(menu_sep(p));
+                    h += 9.0;
+                    let c = s.compact;
+                    rows.push(
+                        menu_item(p, "Compact view", c.then_some(Ico::Check), None, false).on_press(
+                            move |s: &mut App| {
+                                s.compact = !c;
+                                s.menu = None;
+                            },
+                        ),
+                    );
+                    h += MENU_ROW_H;
+                    rows.push(menu_sep(p));
+                    h += 9.0;
+                    let sh = s.show_hidden;
+                    rows.push(
+                        menu_item(p, "Show hidden items", sh.then_some(Ico::Check), None, false)
+                            .on_press(move |s: &mut App| {
+                                s.show_hidden = !sh;
+                                refresh_visible(s);
+                                s.menu = None;
+                            }),
+                    );
+                    h += MENU_ROW_H;
+                    let pr = s.preview;
+                    rows.push(
+                        menu_item(p, "Preview pane", pr.then_some(Ico::Check), None, false).on_press(
+                            move |s: &mut App| {
+                                s.preview = !pr;
+                                s.menu = None;
+                            },
+                        ),
+                    );
+                    h += MENU_ROW_H;
+                    let nv = s.nav_open;
+                    rows.push(
+                        menu_item(p, "Navigation pane", nv.then_some(Ico::Check), None, false)
+                            .on_press(move |s: &mut App| {
+                                s.nav_open = !nv;
+                                s.menu = None;
+                            }),
+                    );
+                    h += MENU_ROW_H;
+                }
+                DropMenu::Filter => {
+                    for f in [
+                        Filter::All,
+                        Filter::Folders,
+                        Filter::Documents,
+                        Filter::Images,
+                        Filter::Video,
+                        Filter::Audio,
+                        Filter::Archives,
+                        Filter::Code,
+                    ] {
+                        let leading = (s.filter == f).then_some(Ico::Check);
+                        rows.push(
+                            menu_item(p, f.label(), leading, None, false).on_press(move |s: &mut App| {
+                                s.filter = f;
+                                refresh_visible(s);
+                                s.menu = None;
+                            }),
+                        );
+                        h += MENU_ROW_H;
+                    }
+                }
+                DropMenu::More => {
+                    rows.push(
+                        menu_item(p, "Refresh", Some(Ico::Refresh), Some("F5"), false).on_press(
+                            |s: &mut App| {
+                                if s.view == View::Files {
+                                    let r = s.root.clone();
+                                    set_location(s, r);
+                                } else {
+                                    refresh_visible(s);
+                                }
+                                s.menu = None;
+                            },
+                        ),
+                    );
+                    h += MENU_ROW_H;
+                    rows.push(
+                        menu_item(p, "Select all", None, Some("Ctrl+A"), false).on_press(
+                            |s: &mut App| {
+                                s.notice = "Select all arrives with multi-selection".into();
+                                s.menu = None;
+                            },
+                        ),
+                    );
+                    h += MENU_ROW_H;
+                    let path = s.selected.map(|i| s.entries[i].path.clone()).unwrap_or_default();
+                    let has_sel = s.selected.is_some();
+                    let copy = path.clone();
+                    rows.push(
+                        menu_item(p, "Copy path", None, None, !has_sel).on_press_tx(
+                            move |s: &mut App, tx: &mut Tx| {
+                                if !copy.is_empty() {
+                                    tx.copy(copy.clone());
+                                    s.notice = "Path copied to clipboard".into();
+                                }
+                                s.menu = None;
+                            },
+                        ),
+                    );
+                    h += MENU_ROW_H;
+                    rows.push(menu_sep(p));
+                    h += 9.0;
+                    rows.push(menu_heading(p, "Theme"));
+                    h += 24.0;
+                    let dark = s.dark;
+                    rows.push(
+                        menu_item(p, "Light", (!dark).then_some(Ico::Check), None, false).on_press(
+                            move |s: &mut App| {
+                                s.dark = false;
+                                s.menu = None;
+                            },
+                        ),
+                    );
+                    h += MENU_ROW_H;
+                    rows.push(
+                        menu_item(p, "Dark", dark.then_some(Ico::Check), None, false).on_press(
+                            move |s: &mut App| {
+                                s.dark = true;
+                                s.menu = None;
+                            },
+                        ),
+                    );
+                    h += MENU_ROW_H;
+                }
+            }
+        }
+        Menu::Context { scope, target, .. } => {
+            let target = *target;
+            match scope {
+                CtxScope::Item => {
+                    let is_dir = s.entries.get(target).map(|e| e.is_dir).unwrap_or(false);
+                    let path = s.entries.get(target).map(|e| e.path.clone()).unwrap_or_default();
+                    let open = path.clone();
+                    rows.push(
+                        menu_item(p, "Open", Some(Ico::Open), None, false).on_press(move |s: &mut App| {
+                            if is_dir {
+                                go(s, PathBuf::from(&open));
+                            } else {
+                                s.notice = "Opening files arrives with file operations".into();
+                            }
+                            s.menu = None;
+                        }),
+                    );
+                    h += MENU_ROW_H;
+                    if is_dir {
+                        rows.push(
+                            menu_item(p, "Open in new tab", None, None, true),
+                        );
+                        h += MENU_ROW_H;
+                    } else {
+                        rows.push(menu_item(p, "Open with…", None, None, true));
+                        h += MENU_ROW_H;
+                    }
+                    rows.push(menu_sep(p));
+                    h += 9.0;
+                    rows.push(menu_item(p, "Add to favorites", Some(Ico::Star), None, true));
+                    rows.push(menu_item(p, "Pin to sidebar", Some(Ico::Pin), None, true));
+                    h += MENU_ROW_H * 2.0;
+                    let copy = path.clone();
+                    rows.push(
+                        menu_item(p, "Copy path", None, None, false).on_press_tx(move |s: &mut App, tx: &mut Tx| {
+                            tx.copy(copy.clone());
+                            s.notice = "Path copied to clipboard".into();
+                            s.menu = None;
+                        }),
+                    );
+                    h += MENU_ROW_H;
+                    rows.push(menu_item(p, "Rename", Some(Ico::Rename), None, true));
+                    rows.push(menu_item(p, "Cut", Some(Ico::Cut), None, true));
+                    rows.push(menu_item(p, "Copy", Some(Ico::Copy), None, true));
+                    rows.push(menu_item(p, "Delete", Some(Ico::Delete), None, true));
+                    h += MENU_ROW_H * 4.0;
+                    rows.push(menu_sep(p));
+                    h += 9.0;
+                    rows.push(
+                        menu_item(p, "Properties", Some(Ico::Info), None, false).on_press(|s: &mut App| {
+                            s.preview = true;
+                            s.menu = None;
+                        }),
+                    );
+                    h += MENU_ROW_H;
+                }
+                CtxScope::Background => {
+                    rows.push(menu_item(p, "New folder", Some(Ico::New), None, true));
+                    rows.push(menu_item(p, "Paste", Some(Ico::Paste), None, true));
+                    h += MENU_ROW_H * 2.0;
+                    rows.push(menu_sep(p));
+                    h += 9.0;
+                    rows.push(menu_heading(p, "Sort by"));
+                    h += 24.0;
+                    for (k, label) in [(0u8, "Name"), (1, "Date modified"), (2, "Type"), (3, "Size")] {
+                        let leading = (s.sort == k).then_some(Ico::Check);
+                        rows.push(
+                            menu_item(p, label, leading, None, false).on_press(move |s: &mut App| {
+                                s.sort = k;
+                                s.keep_order = false;
+                                refresh_visible(s);
+                                s.menu = None;
+                            }),
+                        );
+                        h += MENU_ROW_H;
+                    }
+                    rows.push(menu_sep(p));
+                    h += 9.0;
+                    rows.push(menu_heading(p, "View"));
+                    h += 24.0;
+                    for (m, label) in [(Mode::Details, "Details"), (Mode::Grid, "Large icons")] {
+                        let leading = (s.mode == m).then_some(Ico::Check);
+                        rows.push(
+                            menu_item(p, label, leading, None, false).on_press(move |s: &mut App| {
+                                s.mode = m;
+                                s.menu = None;
+                            }),
+                        );
+                        h += MENU_ROW_H;
+                    }
+                    rows.push(menu_sep(p));
+                    h += 9.0;
+                    rows.push(
+                        menu_item(p, "Refresh", Some(Ico::Refresh), Some("F5"), false).on_press(|s: &mut App| {
+                            if s.view == View::Files {
+                                let r = s.root.clone();
+                                set_location(s, r);
+                            } else {
+                                refresh_visible(s);
+                            }
+                            s.menu = None;
+                        }),
+                    );
+                    h += MENU_ROW_H;
+                    rows.push(
+                        menu_item(p, "Select all", None, Some("Ctrl+A"), false).on_press(|s: &mut App| {
+                            s.notice = "Select all arrives with multi-selection".into();
+                            s.menu = None;
+                        }),
+                    );
+                    h += MENU_ROW_H;
+                }
+                CtxScope::Place => {
+                    rows.push(
+                        menu_item(p, "Open", Some(Ico::Open), None, false).on_press(move |s: &mut App| {
+                            navigate(s, target);
+                            s.menu = None;
+                        }),
+                    );
+                    h += MENU_ROW_H;
+                    rows.push(menu_sep(p));
+                    h += 9.0;
+                    rows.push(menu_item(p, "Add to favorites", Some(Ico::Star), None, true));
+                    rows.push(menu_item(p, "Pin to sidebar", Some(Ico::Pin), None, true));
+                    h += MENU_ROW_H * 2.0;
+                    let path = place_path(target).map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+                    let has_path = !path.is_empty();
+                    rows.push(
+                        menu_item(p, "Copy path", None, None, !has_path).on_press_tx(move |s: &mut App, tx: &mut Tx| {
+                            if !path.is_empty() {
+                                tx.copy(path.clone());
+                                s.notice = "Path copied to clipboard".into();
+                            }
+                            s.menu = None;
+                        }),
+                    );
+                    h += MENU_ROW_H;
+                }
+            }
+        }
+    }
+
+    let x = ax.clamp(8.0, (ww - MENU_W - 8.0).max(8.0));
+    let y = ay.clamp(8.0, (wh - h - 8.0).max(8.0));
+    el().key("menu-overlay")
+        .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+        .child(
+            el().key("menu-scrim")
+                .w_full()
+                .h_full()
+                .on_press(|s: &mut App| s.menu = None),
+        )
+        .child(
+            col()
+                .key("menu-panel")
+                .absolute(x, y)
+                .w(MENU_W)
+                .py(4.0)
+                .px(4.0)
+                .fill(p.menu)
+                .border(p.hair, p.menu_line)
+                .radius(8.0)
+                .shadow(6.0, 18.0, Color::BLACK.alpha(0.45))
+                .children(rows),
+        )
 }
 
 fn rail_item(
@@ -2060,6 +2657,9 @@ fn rail_item(
     item.on_press_tx(move |s: &mut App, tx: &mut Tx| {
         navigate(s, index);
         tx.instant();
+    })
+    .on_secondary_press(move |s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
+        s.menu = Some(Menu::Context { scope: CtxScope::Place, target: index, x: at.x, y: at.y });
     })
 }
 
@@ -2145,7 +2745,7 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
     let mut line = row()
         .key(format!("row-{i}"))
         .w_full()
-        .h(ROW_H)
+        .h(row_h(s))
         .items_center()
         .fill(if selected { p.row_sel } else { Color::TRANSPARENT })
         .hover(p.hover)
@@ -2212,6 +2812,10 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
                 go(s, next);
             }
         }
+    })
+    .on_secondary_press(move |s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
+        select_entry(s, ei);
+        s.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
     })
 }
 
@@ -2287,7 +2891,7 @@ fn details_rows(s: &App, p: Paint) -> El {
             .growth(GrowthSpec::default())
             .virtual_rows(
                 s.visible.len(),
-                ROW_H,
+                row_h(s),
                 |s: &App, i| Cow::Borrowed(s.entries[s.visible[i]].path.as_str()),
                 move |s: &App, i| file_row(s, i, p),
             )
@@ -2333,10 +2937,25 @@ fn grid_tile(s: &App, i: usize, p: Paint) -> El {
     if selected {
         tile = tile.border(p.hair, p.focus_line);
     }
+    let double_path = path.clone();
     tile.on_press(move |s: &mut App| {
         if let Some(at) = s.entries.iter().position(|entry| entry.path == path) {
             select_entry(s, at);
         }
+    })
+    .on_double_press(move |s: &mut App| {
+        if let Some(at) = s.entries.iter().position(|entry| entry.path == double_path) {
+            if s.entries[at].is_dir {
+                let next = PathBuf::from(&s.entries[at].path);
+                go(s, next);
+            } else {
+                s.notice = "Opening files arrives with file operations".into();
+            }
+        }
+    })
+    .on_secondary_press(move |s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
+        select_entry(s, ei);
+        s.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
     })
 }
 
@@ -2349,6 +2968,119 @@ fn grid_rows(s: &App, p: Paint) -> El {
         .px(16.0)
         .gap(8.0)
         .children((0..s.visible.len()).map(|i| grid_tile(s, i, p)));
+    scrollable(s, tiles)
+}
+
+/// List view: a compact small-icon + name flow, denser under Compact view.
+fn list_item(s: &App, i: usize, p: Paint) -> El {
+    let ei = s.visible.get(i).copied().unwrap_or(i);
+    let e = &s.entries[ei];
+    let selected = s.selected == Some(ei);
+    let path = e.path.clone();
+    let mut item = row()
+        .key(format!("list-{i}"))
+        .w(230.0)
+        .h(if s.compact { 22.0 } else { 26.0 })
+        .radius(4.0)
+        .fill(if selected { p.rail_sel } else { Color::TRANSPARENT })
+        .hover(p.hover)
+        .px(6.0)
+        .gap(8.0)
+        .items_center()
+        .motion(Spring::NONE)
+        .child(file_glyph(e, p, 16.0))
+        .child(
+            text(e.name.as_str())
+                .font(ROW_TEXT)
+                .color(p.text)
+                .grow(1.0)
+                .min_w(0.0)
+                .truncate(),
+        );
+    if selected {
+        item = item.border(p.hair, p.focus_line);
+    }
+    let double_path = path.clone();
+    item.on_press(move |s: &mut App| {
+        if let Some(at) = s.entries.iter().position(|en| en.path == path) {
+            select_entry(s, at);
+        }
+    })
+    .on_double_press(move |s: &mut App| open_entry(s, &double_path))
+    .on_secondary_press(move |s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
+        select_entry(s, ei);
+        s.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
+    })
+}
+
+fn list_rows(s: &App, p: Paint) -> El {
+    let items = row()
+        .key("list-items")
+        .w_full()
+        .flex_wrap()
+        .pt(8.0)
+        .px(12.0)
+        .gap(2.0)
+        .children((0..s.visible.len()).map(|i| list_item(s, i, p)));
+    scrollable(s, items)
+}
+
+/// Tiles view: a medium icon with the name and a type/size subtitle.
+fn tile_item(s: &App, i: usize, p: Paint) -> El {
+    let ei = s.visible.get(i).copied().unwrap_or(i);
+    let e = &s.entries[ei];
+    let selected = s.selected == Some(ei);
+    let path = e.path.clone();
+    let subtitle = if e.is_dir {
+        e.type_label.clone()
+    } else {
+        format!("{}  {}", e.type_label, e.size_label())
+    };
+    let mut tile = row()
+        .key(format!("tileitem-{i}"))
+        .w(268.0)
+        .h(64.0)
+        .radius(4.0)
+        .fill(if selected { p.rail_sel } else { Color::TRANSPARENT })
+        .hover(p.hover)
+        .px(8.0)
+        .gap(10.0)
+        .items_center()
+        .motion(Spring::NONE)
+        .child(file_glyph(e, p, 32.0))
+        .child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .gap(2.0)
+                .child(text(e.name.as_str()).font(ROW_TEXT).color(p.text).w_full().truncate())
+                .child(text(subtitle.as_str()).font(CAPTION).color(p.tertiary).w_full().truncate()),
+        );
+    if selected {
+        tile = tile.border(p.hair, p.focus_line);
+    }
+    let double_path = path.clone();
+    tile.on_press(move |s: &mut App| {
+        if let Some(at) = s.entries.iter().position(|en| en.path == path) {
+            select_entry(s, at);
+        }
+    })
+    .on_double_press(move |s: &mut App| open_entry(s, &double_path))
+    .on_secondary_press(move |s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
+        select_entry(s, ei);
+        s.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
+    })
+}
+
+fn tiles_rows(s: &App, p: Paint) -> El {
+    let tiles = row()
+        .key("tiles-view")
+        .w_full()
+        .flex_wrap()
+        .pt(12.0)
+        .px(16.0)
+        .gap(8.0)
+        .children((0..s.visible.len()).map(|i| tile_item(s, i, p)));
     scrollable(s, tiles)
 }
 
@@ -2720,6 +3452,9 @@ fn content(s: &App, p: Paint) -> El {
             .min_h(0.0)
             .w_full()
             .fill(p.content)
+            .on_secondary_press(|s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
+                s.menu = Some(Menu::Context { scope: CtxScope::Background, target: 0, x: at.x, y: at.y });
+            })
             .child(if s.mode == Mode::Details {
                 column_header(
                     p,
@@ -2736,30 +3471,22 @@ fn content(s: &App, p: Paint) -> El {
                 el().w_full().h(p.hair)
             })
             .child(el().w_full().h(p.hair).fill(p.line))
-            .child(if s.mode == Mode::Details {
-                details_rows(s, p)
-            } else {
-                grid_rows(s, p)
+            .child(match s.mode {
+                Mode::Details => details_rows(s, p),
+                Mode::List => list_rows(s, p),
+                Mode::Tiles => tiles_rows(s, p),
+                Mode::Grid => grid_rows(s, p),
             }),
     };
-    if s.preview {
-        row()
-            .key("body")
-            .w_full()
-            .grow(1.0)
-            .min_h(0.0)
-            .child(nav_rail(s, p))
-            .child(main)
-            .child(preview_pane(s, p))
-    } else {
-        row()
-            .key("body")
-            .w_full()
-            .grow(1.0)
-            .min_h(0.0)
-            .child(nav_rail(s, p))
-            .child(main)
+    let mut body = row().key("body").w_full().grow(1.0).min_h(0.0);
+    if s.nav_open {
+        body = body.child(nav_rail(s, p));
     }
+    body = body.child(main);
+    if s.preview {
+        body = body.child(preview_pane(s, p));
+    }
+    body
 }
 
 fn body(s: &App, p: Paint) -> El {
@@ -2814,7 +3541,7 @@ fn status_bar(s: &App, p: Paint) -> El {
                 .py(1.0)
                 .radius(4.0)
                 .border(p.hair, p.line)
-                .child(toggle(Ico::List, s.mode == Mode::Details, false))
+                .child(toggle(Ico::Details, s.mode == Mode::Details, false))
                 .child(toggle(Ico::Grid, s.mode == Mode::Grid, true)),
         )
 }
@@ -3004,6 +3731,18 @@ fn main() {
             ("downloads", |s| load(s, Fixture::Downloads)),
             ("pictures", |s| load(s, Fixture::Screenshots)),
             ("thispc", |s| load(s, Fixture::ThisPc)),
+            ("list", |s| {
+                load(s, Fixture::Downloads);
+                s.mode = Mode::List;
+            }),
+            ("tiles", |s| {
+                load(s, Fixture::Downloads);
+                s.mode = Mode::Tiles;
+            }),
+            ("menu", |s| {
+                load(s, Fixture::Downloads);
+                s.menu = Some(Menu::Drop { kind: DropMenu::Sort, x: 336.0, y: 132.0 });
+            }),
         ],
         poll: Some(poll),
         fonts: load_fonts(),

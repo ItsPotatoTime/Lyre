@@ -10,13 +10,12 @@
 //!   cargo run -- --snap downloads.png --scene downloads --size 1076x600 --scale 1
 //!
 //! Out of scope for this slice: independent tab history, file operations, OS
-//! drag-and-drop, system context menus, real shell thumbnails, the reveal
-//! highlight, and true OS maximize.
+//! drag-and-drop, system context menus, real shell thumbnails, and the reveal
+//! highlight.
 
 use std::borrow::Cow;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::time::{Instant, UNIX_EPOCH};
 
 use rune::color::hex;
@@ -298,7 +297,6 @@ struct App {
     /// Home/This PC report the authored item count, not just the rows drawn.
     count_override: Option<usize>,
     zoom: bool,
-    zoom_size: (f32, f32),
     scan_ms: f64,
     /// Home's Recent/Favorites pill pair.
     home_tab: u8,
@@ -410,10 +408,6 @@ fn make_entry(name: &str, modified: &str, type_label: &str, size: &str, kind: Ki
     }
 }
 
-/// Primary display work area in points. A borderless window has no system zoom
-/// button, so the drawn one needs a size to grow into.
-static WORK_AREA: OnceLock<(f32, f32)> = OnceLock::new();
-
 fn home_dir() -> Option<PathBuf> {
     std::env::var_os("USERPROFILE")
         .or_else(|| std::env::var_os("HOME"))
@@ -498,7 +492,10 @@ fn set_location(s: &mut App, path: PathBuf) {
 }
 
 fn go(s: &mut App, path: PathBuf) {
-    if path == s.root {
+    // Home and This PC are fixture overlays that keep the last real root, so a
+    // return to that same folder must still reload; only a no-op while already
+    // showing it as a file list.
+    if path == s.root && s.view == View::Files {
         return;
     }
     s.history.push(s.root.clone());
@@ -825,7 +822,6 @@ fn init() -> App {
         keep_order: false,
         count_override: None,
         zoom: false,
-        zoom_size: WORK_AREA.get().copied().unwrap_or((1600.0, 900.0)),
         scan_ms,
         home_tab: 0,
         scroll_track: Live::new([0.0; 4]),
@@ -889,6 +885,7 @@ enum Ico {
     Monitor,
     Minimize,
     Maximize,
+    Restore,
     Close,
     Info,
     ShareSmall,
@@ -1110,6 +1107,15 @@ fn ico(p: Paint, which: Ico, size: f32, ink: Color) -> El {
         Ico::Minimize => stroke(vec![[6.0, 12.0], [18.0, 12.0]], ink),
         Ico::Maximize => closed(
             vec![[6.0, 6.0], [18.0, 6.0], [18.0, 18.0], [6.0, 18.0]],
+            ink,
+        ),
+        Ico::Restore => closed(
+            vec![[5.0, 9.0], [15.0, 9.0], [15.0, 19.0], [5.0, 19.0]],
+            ink,
+        )
+        .stroke(
+            vec![[9.0, 9.0], [9.0, 5.0], [19.0, 5.0], [19.0, 15.0], [15.0, 15.0]],
+            W,
             ink,
         ),
         Ico::Close => stroke(vec![[6.0, 6.0], [18.0, 18.0]], ink).stroke(
@@ -1746,21 +1752,19 @@ fn tab_strip(s: &App, p: Paint) -> El {
     ];
     for (i, (which, key, tip)) in controls.iter().enumerate() {
         let close = i == 2;
+        let zoomed = i == 1 && s.zoom;
+        let glyph = if zoomed { Ico::Restore } else { *which };
+        let label = if zoomed { "Restore" } else { *tip };
         strip = strip.child(
             el().key(*key)
                 .size(46.0, TAB_H)
                 .hover(if close { p.close_hover } else { p.hover })
                 .center()
-                .child(ico(p, *which, 13.0, p.secondary))
-                .help(*tip)
+                .child(ico(p, glyph, 13.0, p.secondary))
+                .help(label)
                 .on_press_tx(move |s: &mut App, tx: &mut Tx| match i {
-                    0 => tx.minimize(),
-                    1 => {
-                        s.zoom = !s.zoom;
-                        let size = if s.zoom { s.zoom_size } else { (1076.0, 600.0) };
-                        tx.resize_window(size);
-                        tx.center_window();
-                    }
+                    0 => winframe::minimize(),
+                    1 => s.zoom = winframe::toggle_maximize(),
                     _ => tx.close_window(),
                 }),
         );
@@ -2830,15 +2834,30 @@ fn load_fonts() -> &'static [&'static [u8]] {
     Box::leak(out.into_boxed_slice())
 }
 
-/// Windows 11 rounds a borderless frame through DWM; Rune's own corner radius is
-/// AppKit-only. Reach the HWND behind the raw handle and set the system round
-/// preference, which clips the swapchain to the curve so the chrome keeps its
-/// square layout while the frame reads as a native Explorer window. dwmapi is a
-/// system library linked by name, so this needs no extra crate.
+/// A borderless window has no system frame, so Rune's `Tx::minimize` refuses it
+/// and there is no `Tx::maximize`. Drive the HWND directly: DWM rounds the frame
+/// (Rune's corner radius is AppKit-only), `ShowWindow` minimizes and truly
+/// maximizes/restores, and a `WM_NCHITTEST` subclass hands the outer band back to
+/// the system as resize edges so the border drags smoothly. Everything links to
+/// system libraries by name, so this needs no extra crate.
 #[cfg(target_os = "windows")]
 mod winframe {
     use rune::WindowHandle;
     use rune::raw_window_handle::RawWindowHandle;
+    use std::sync::OnceLock;
+
+    static HWND: OnceLock<isize> = OnceLock::new();
+
+    #[repr(C)]
+    struct Rect {
+        left: i32,
+        top: i32,
+        right: i32,
+        bottom: i32,
+    }
+
+    type SubclassProc =
+        unsafe extern "system" fn(isize, u32, usize, isize, usize, usize) -> isize;
 
     #[link(name = "dwmapi")]
     unsafe extern "system" {
@@ -2849,23 +2868,124 @@ mod winframe {
             size: u32,
         ) -> i32;
     }
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
+        fn IsZoomed(hwnd: isize) -> i32;
+        fn GetWindowRect(hwnd: isize, rect: *mut Rect) -> i32;
+        fn DefSubclassProc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
+    }
+    #[link(name = "comctl32")]
+    unsafe extern "system" {
+        fn SetWindowSubclass(hwnd: isize, proc: SubclassProc, id: usize, data: usize) -> i32;
+    }
 
-    pub fn round_corners(handle: &WindowHandle) {
-        const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
-        const DWMWCP_ROUND: u32 = 2;
+    const WM_NCHITTEST: u32 = 0x0084;
+    const SW_MINIMIZE: i32 = 6;
+    const SW_MAXIMIZE: i32 = 3;
+    const SW_RESTORE: i32 = 9;
+    const HTLEFT: isize = 10;
+    const HTRIGHT: isize = 11;
+    const HTTOP: isize = 12;
+    const HTTOPLEFT: isize = 13;
+    const HTTOPRIGHT: isize = 14;
+    const HTBOTTOM: isize = 15;
+    const HTBOTTOMLEFT: isize = 16;
+    const HTBOTTOMRIGHT: isize = 17;
+    const BORDER: i32 = 8;
+
+    /// Claim the outer band as resize edges; leave the rest to Rune's own proc.
+    unsafe extern "system" fn hit_test(
+        hwnd: isize,
+        msg: u32,
+        wparam: usize,
+        lparam: isize,
+        _id: usize,
+        _data: usize,
+    ) -> isize {
+        unsafe {
+            if msg == WM_NCHITTEST && IsZoomed(hwnd) == 0 {
+                let x = (lparam as u16) as i16 as i32;
+                let y = ((lparam >> 16) as u16) as i16 as i32;
+                let mut r = Rect { left: 0, top: 0, right: 0, bottom: 0 };
+                if GetWindowRect(hwnd, &mut r) != 0 {
+                    let left = x < r.left + BORDER;
+                    let right = x >= r.right - BORDER;
+                    let top = y < r.top + BORDER;
+                    let bottom = y >= r.bottom - BORDER;
+                    let code = match (top, bottom, left, right) {
+                        (true, _, true, _) => HTTOPLEFT,
+                        (true, _, _, true) => HTTOPRIGHT,
+                        (_, true, true, _) => HTBOTTOMLEFT,
+                        (_, true, _, true) => HTBOTTOMRIGHT,
+                        (true, _, _, _) => HTTOP,
+                        (_, true, _, _) => HTBOTTOM,
+                        (_, _, true, _) => HTLEFT,
+                        (_, _, _, true) => HTRIGHT,
+                        _ => 0,
+                    };
+                    if code != 0 {
+                        return code;
+                    }
+                }
+            }
+            DefSubclassProc(hwnd, msg, wparam, lparam)
+        }
+    }
+
+    /// Round the frame and install the resize-edge subclass once the HWND exists.
+    pub fn install(handle: &WindowHandle) {
         let _ = handle.with_raw_handle(|raw| {
             if let RawWindowHandle::Win32(win) = raw.as_raw() {
+                let hwnd = win.hwnd.get();
+                let _ = HWND.set(hwnd);
+                const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+                const DWMWCP_ROUND: u32 = 2;
                 let preference = DWMWCP_ROUND;
                 unsafe {
                     DwmSetWindowAttribute(
-                        win.hwnd.get(),
+                        hwnd,
                         DWMWA_WINDOW_CORNER_PREFERENCE,
                         (&preference as *const u32).cast(),
                         core::mem::size_of::<u32>() as u32,
                     );
+                    SetWindowSubclass(hwnd, hit_test, 1, 0);
                 }
             }
         });
+    }
+
+    pub fn minimize() {
+        if let Some(&hwnd) = HWND.get() {
+            unsafe {
+                ShowWindow(hwnd, SW_MINIMIZE);
+            }
+        }
+    }
+
+    /// Maximize when restored, restore when maximized; returns the new zoom state.
+    pub fn toggle_maximize() -> bool {
+        let Some(&hwnd) = HWND.get() else {
+            return false;
+        };
+        unsafe {
+            if IsZoomed(hwnd) != 0 {
+                ShowWindow(hwnd, SW_RESTORE);
+                false
+            } else {
+                ShowWindow(hwnd, SW_MAXIMIZE);
+                true
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+mod winframe {
+    pub fn install(_handle: &rune::WindowHandle) {}
+    pub fn minimize() {}
+    pub fn toggle_maximize() -> bool {
+        false
     }
 }
 
@@ -2900,25 +3020,14 @@ fn main() {
     // One window, no system frame. The tab strip is the titlebar now, so the
     // drawn minimize/maximize/close controls and window_drag own that job;
     // leaving decorations on would stack a second, native bar above it.
-    run_windows(|displays| {
-        if let Some(display) = displays
-            .iter()
-            .find(|d| d.primary)
-            .or_else(|| displays.first())
-        {
-            let scale = display.scale.max(1.0) as f32;
-            let width = display.size.0 as f32 / scale - 16.0;
-            let height = display.size.1 as f32 / scale - 48.0;
-            let _ = WORK_AREA.set((width.max(1076.0), height.max(600.0)));
-        }
+    run_windows(|_displays| {
         let window = WindowSpec::new("main", spec).options(WindowOptions {
             borderless: true,
             resizable: true,
             min_size: Some((760.0, 480.0)),
             ..Default::default()
         });
-        #[cfg(target_os = "windows")]
-        let window = window.on_created(|handle| winframe::round_corners(&handle));
+        let window = window.on_created(|handle| winframe::install(&handle));
         [window.boxed()]
     });
 }

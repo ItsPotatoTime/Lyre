@@ -46,10 +46,13 @@ const DATE_W: f32 = 140.0;
 const TYPE_W: f32 = 120.0;
 const SIZE_W: f32 = 80.0;
 
+// Explorer sets its body and chrome text in 14px Segoe UI; only the quiet
+// secondary lines (status, "Stored locally", preview details) drop to 12px.
 const CAPTION: TextStyle = TextStyle::new(12.0, 400.0).lh(16.0);
-const ROW_TEXT: TextStyle = TextStyle::new(12.0, 400.0).lh(16.0);
-const TILE_TEXT: TextStyle = TextStyle::new(12.0, 600.0).lh(16.0);
-const GROUP_TEXT: TextStyle = TextStyle::new(12.0, 600.0).lh(16.0);
+const UI_TEXT: TextStyle = TextStyle::new(14.0, 400.0).lh(20.0);
+const ROW_TEXT: TextStyle = TextStyle::new(14.0, 400.0).lh(20.0);
+const TILE_TEXT: TextStyle = TextStyle::new(14.0, 600.0).lh(20.0);
+const GROUP_TEXT: TextStyle = TextStyle::new(14.0, 600.0).lh(20.0);
 
 fn c(s: &str) -> Color {
     hex(s).expect("authored hex literal")
@@ -102,8 +105,8 @@ fn paint(dark: bool, scale: f32) -> Paint {
             line: c("#3a3a3a"),
             soft_line: c("#2b2b2b"),
             text: c("#ffffff"),
-            secondary: c("#c9c9c9"),
-            tertiary: c("#9a9a9a"),
+            secondary: c("#e3e3e3"),
+            tertiary: c("#adadad"),
             disabled: c("#6e6e6e"),
             accent: c("#4cc2ff"),
             accent_fill: c("#0078d4"),
@@ -133,8 +136,8 @@ fn paint(dark: bool, scale: f32) -> Paint {
             line: c("#e2e2e2"),
             soft_line: c("#ededed"),
             text: c("#1b1b1b"),
-            secondary: c("#5d5d5d"),
-            tertiary: c("#8a8a8a"),
+            secondary: c("#484848"),
+            tertiary: c("#6c6c6c"),
             disabled: c("#a2a2a2"),
             accent: c("#005fb8"),
             accent_fill: c("#0067c0"),
@@ -1807,7 +1810,7 @@ fn address_row(s: &App, p: Paint) -> El {
     for (i, part) in s.crumbs.iter().enumerate() {
         crumb = crumb
             .child(ico(p, Ico::ChevronRight, 10.0, p.tertiary))
-            .child(text(part.as_str()).font(CAPTION).color(p.text).truncate());
+            .child(text(part.as_str()).font(UI_TEXT).color(p.text).truncate());
         if i + 1 == s.crumbs.len() {
             crumb = crumb.child(ico(p, Ico::ChevronRight, 10.0, p.tertiary));
         }
@@ -1839,7 +1842,7 @@ fn address_row(s: &App, p: Paint) -> El {
                 .gap(6.0)
                 .items_center()
                 .child(
-                    text_input(&s.search_edit, CAPTION)
+                    text_input(&s.search_edit, UI_TEXT)
                         .key("search-field")
                         .grow(1.0)
                         .min_w(0.0)
@@ -1876,7 +1879,7 @@ fn text_button(p: Paint, which: Ico, label: &str, chevron: bool, dim: bool) -> E
         .child(ico(p, which, 16.0, ink))
         .child(
             text(label)
-                .font(CAPTION)
+                .font(UI_TEXT)
                 .color(if dim { p.disabled } else { p.text }),
         );
     if chevron {
@@ -1895,7 +1898,7 @@ fn accent_button(p: Paint, which: Ico, label: &str) -> El {
         .press(p.press)
         .items_center()
         .child(ico(p, which, 16.0, p.accent))
-        .child(text(label).font(CAPTION).color(p.text))
+        .child(text(label).font(UI_TEXT).color(p.text))
 }
 
 fn command_bar(s: &App, p: Paint) -> El {
@@ -2403,7 +2406,7 @@ fn home_content(s: &App, p: Paint) -> El {
                 .gap(7.0)
                 .items_center()
                 .child(ico(p, Ico::Clock, 14.0, if recent_on { p.accent_ink } else { p.secondary }))
-                .child(text("Recent").font(CAPTION).color(if recent_on { p.accent_ink } else { p.text }))
+                .child(text("Recent").font(UI_TEXT).color(if recent_on { p.accent_ink } else { p.text }))
                 .on_press(|s: &mut App| s.home_tab = 0),
         )
         .child(
@@ -2416,7 +2419,7 @@ fn home_content(s: &App, p: Paint) -> El {
                 .gap(7.0)
                 .items_center()
                 .child(ico(p, Ico::Star, 14.0, if recent_on { p.secondary } else { p.accent_ink }))
-                .child(text("Favorites").font(CAPTION).color(if recent_on { p.text } else { p.accent_ink }))
+                .child(text("Favorites").font(UI_TEXT).color(if recent_on { p.text } else { p.accent_ink }))
                 .on_press(|s: &mut App| s.home_tab = 1),
         );
     let mut table = col().w_full().pt(14.0);
@@ -2827,6 +2830,45 @@ fn load_fonts() -> &'static [&'static [u8]] {
     Box::leak(out.into_boxed_slice())
 }
 
+/// Windows 11 rounds a borderless frame through DWM; Rune's own corner radius is
+/// AppKit-only. Reach the HWND behind the raw handle and set the system round
+/// preference, which clips the swapchain to the curve so the chrome keeps its
+/// square layout while the frame reads as a native Explorer window. dwmapi is a
+/// system library linked by name, so this needs no extra crate.
+#[cfg(target_os = "windows")]
+mod winframe {
+    use rune::WindowHandle;
+    use rune::raw_window_handle::RawWindowHandle;
+
+    #[link(name = "dwmapi")]
+    unsafe extern "system" {
+        fn DwmSetWindowAttribute(
+            hwnd: isize,
+            attribute: u32,
+            value: *const core::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+
+    pub fn round_corners(handle: &WindowHandle) {
+        const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
+        const DWMWCP_ROUND: u32 = 2;
+        let _ = handle.with_raw_handle(|raw| {
+            if let RawWindowHandle::Win32(win) = raw.as_raw() {
+                let preference = DWMWCP_ROUND;
+                unsafe {
+                    DwmSetWindowAttribute(
+                        win.hwnd.get(),
+                        DWMWA_WINDOW_CORNER_PREFERENCE,
+                        (&preference as *const u32).cast(),
+                        core::mem::size_of::<u32>() as u32,
+                    );
+                }
+            }
+        });
+    }
+}
+
 fn main() {
     let spec = AppSpec::<App> {
         scenes: &[
@@ -2869,11 +2911,14 @@ fn main() {
             let height = display.size.1 as f32 / scale - 48.0;
             let _ = WORK_AREA.set((width.max(1076.0), height.max(600.0)));
         }
-        [WindowSpec::new("main", spec)
-            .options(WindowOptions {
-                borderless: true,
-                ..Default::default()
-            })
-            .boxed()]
+        let window = WindowSpec::new("main", spec).options(WindowOptions {
+            borderless: true,
+            resizable: true,
+            min_size: Some((760.0, 480.0)),
+            ..Default::default()
+        });
+        #[cfg(target_os = "windows")]
+        let window = window.on_created(|handle| winframe::round_corners(&handle));
+        [window.boxed()]
     });
 }

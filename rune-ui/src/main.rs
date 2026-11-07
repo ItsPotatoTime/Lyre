@@ -27,11 +27,13 @@ use rune::{
     WindowOptions, WindowSpec, canvas, col, el, row, run_windows, text, text_input,
 };
 
+mod defaultmanager;
 mod fileops;
 mod frame;
 mod imagery;
 mod search;
 mod shell;
+mod updates;
 
 // Metrics and colours sampled from the four reference captures. The chrome is
 // three distinct bands, not one surface: a near-black tab strip, a Mica-tinted
@@ -389,12 +391,22 @@ enum OpMsg {
     Done(Result<usize, String>),
 }
 
-/// A modal dialog: delete confirmation, paste conflict, rename or new folder.
+/// Messages from the update worker thread, drained in `poll`.
+enum UpdateMsg {
+    Checked(Result<Option<updates::Offer>, String>),
+    Progress(u64, Option<u64>),
+    Installing,
+    Done(Result<(), String>),
+}
+
+/// A modal dialog: delete confirmation, paste conflict, rename, new folder, default manager, update.
 enum Dialog {
     Delete { permanent: bool, paths: Vec<PathBuf> },
     PasteConflict { mode: fileops::Mode, sources: Vec<PathBuf>, target: PathBuf },
     Rename { path: PathBuf, edit: TextEdit },
     NewFolder { parent: PathBuf, edit: TextEdit },
+    DefaultManager,
+    Update,
 }
 
 struct App {
@@ -467,6 +479,12 @@ struct App {
     search_query: String,
     search_rx: Option<std::sync::mpsc::Receiver<search::Event>>,
     search_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Auto-update: the worker channel, the offered build, and download progress.
+    update_rx: Option<std::sync::mpsc::Receiver<UpdateMsg>>,
+    update_offer: Option<updates::Offer>,
+    update_busy: bool,
+    update_progress: Option<(u64, Option<u64>)>,
+    update_installing: bool,
     /// Trigger and window rects in window points, read to anchor and clamp menus.
     rect_new: Live<[f32; 4]>,
     rect_sort: Live<[f32; 4]>,
@@ -879,6 +897,10 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
     if s.search_busy {
         tx.wake_after(std::time::Duration::from_millis(40));
     }
+    changed |= drain_update(s);
+    if s.update_busy {
+        tx.wake_after(std::time::Duration::from_millis(60));
+    }
     if s.search_edit.text != s.search_query {
         let q = s.search_edit.text.clone();
         if q.trim().is_empty() {
@@ -1218,7 +1240,9 @@ fn load(s: &mut App, f: Fixture) {
 fn init() -> App {
     let root = std::env::var("LYRE_RUNE_PATH")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        .ok()
+        .or_else(|| defaultmanager::startup_path().map(PathBuf::from))
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     let (entries, scan_ms) = scan(&root);
     let crumbs: Vec<String> = root
         .components()
@@ -1284,6 +1308,11 @@ fn init() -> App {
         search_query: String::new(),
         search_rx: None,
         search_cancel: None,
+        update_rx: None,
+        update_offer: None,
+        update_busy: false,
+        update_progress: None,
+        update_installing: false,
         rect_new: Live::new([0.0; 4]),
         rect_sort: Live::new([0.0; 4]),
         rect_view: Live::new([0.0; 4]),
@@ -2887,6 +2916,42 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                     h += MENU_ROW_H;
                     rows.push(menu_sep(p));
                     h += 9.0;
+                    let ms = defaultmanager::state();
+                    if ms.unsupported.is_some() {
+                        rows.push(menu_item(p, "Open folders with Lyre", Some(Ico::ThisPc), None, true));
+                        h += MENU_ROW_H;
+                    } else if ms.is_default {
+                        rows.push(
+                            menu_item(p, "Stop opening folders with Lyre", Some(Ico::ThisPc), None, false)
+                                .on_press(|s: &mut App| {
+                                    match defaultmanager::restore() {
+                                        Ok(_) => s.notice = "Folders open with the previous file manager again".into(),
+                                        Err(e) => s.notice = e,
+                                    }
+                                    s.menu = None;
+                                }),
+                        );
+                        h += MENU_ROW_H;
+                    } else {
+                        rows.push(
+                            menu_item(p, "Open folders with Lyre…", Some(Ico::ThisPc), None, false)
+                                .on_press(|s: &mut App| {
+                                    s.dialog = Some(Dialog::DefaultManager);
+                                    s.menu = None;
+                                }),
+                        );
+                        h += MENU_ROW_H;
+                    }
+                    rows.push(
+                        menu_item(p, "Check for updates", Some(Ico::Refresh), None, s.update_busy)
+                            .on_press(|s: &mut App| {
+                                start_update_check(s);
+                                s.menu = None;
+                            }),
+                    );
+                    h += MENU_ROW_H;
+                    rows.push(menu_sep(p));
+                    h += 9.0;
                     rows.push(menu_heading(p, "Theme"));
                     h += 24.0;
                     let dark = s.dark;
@@ -3515,6 +3580,75 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
                         .child(dialog_button(p, "Create", true).on_press(|s: &mut App| commit_new_folder(s))),
                 )
         }
+        Dialog::DefaultManager => {
+            base()
+                .child(text("Open folders with Lyre?").font(TILE_TEXT).color(p.text))
+                .child(
+                    text("Lyre can open folders instead of your current file manager. This changes a few per-user settings and can be undone at any time from the More menu.")
+                        .font(UI_TEXT)
+                        .color(p.secondary)
+                        .w_full(),
+                )
+                .child(
+                    row().w_full().gap(8.0).child(el().grow(1.0))
+                        .child(dialog_button(p, "Cancel", false).on_press(|s: &mut App| s.dialog = None))
+                        .child(dialog_button(p, "Make default", true).on_press(|s: &mut App| {
+                            match defaultmanager::make_default() {
+                                Ok(_) => s.notice = "Lyre now opens folders".into(),
+                                Err(e) => s.notice = e,
+                            }
+                            s.dialog = None;
+                        })),
+                )
+        }
+        Dialog::Update => {
+            let offer = s.update_offer.clone();
+            let busy = s.update_busy;
+            let installing = s.update_installing;
+            let progress = s.update_progress;
+            let mut panel = base().child(text("Update available").font(TILE_TEXT).color(p.text));
+            if let Some(o) = &offer {
+                panel = panel.child(text(format!("Version {}  →  {}", o.current, o.version)).font(UI_TEXT).color(p.secondary));
+                if let Some(notes) = &o.notes {
+                    if !notes.is_empty() {
+                        panel = panel.child(text(notes.as_str()).font(CAPTION).color(p.tertiary).w_full().max_lines(6));
+                    }
+                }
+            }
+            if busy {
+                let frac = match progress {
+                    Some((done, Some(total))) if total > 0 => (done as f64 / total as f64).min(1.0) as f32,
+                    _ => 0.0,
+                };
+                let label = if installing {
+                    "Installing…".to_string()
+                } else {
+                    match progress {
+                        Some((_, Some(total))) if total > 0 => format!("{}%", (frac * 100.0) as u32),
+                        Some((done, _)) => format!("{:.1} MB", done as f64 / 1_048_576.0),
+                        None => "Downloading…".to_string(),
+                    }
+                };
+                panel = panel.child(
+                    row().w_full().gap(8.0).items_center()
+                        .child(el().w(200.0).h(6.0).radius(3.0).fill(p.line).child(el().w_frac(frac).h_full().radius(3.0).fill(p.accent_fill)))
+                        .child(text(label.as_str()).font(CAPTION).color(p.secondary)),
+                );
+            }
+            panel.child(
+                row().w_full().gap(8.0).child(el().grow(1.0))
+                    .child(dialog_button(p, "Cancel", false).on_press(move |s: &mut App| {
+                        if !busy {
+                            s.dialog = None;
+                        }
+                    }))
+                    .child(dialog_button(p, if installing { "Installing…" } else { "Install" }, true).on_press(move |s: &mut App| {
+                        if !busy {
+                            start_update_install(s);
+                        }
+                    })),
+            )
+        }
     };
     el().key("dialog-overlay")
         .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
@@ -3870,6 +4004,99 @@ fn clear_search(s: &mut App) {
     s.selected = None;
     s.focused = None;
     s.selection_detail.clear();
+}
+
+// ----------------------------------------------------------- auto-update ----
+
+/// Ask the release page whether there is a newer build, off the UI thread.
+fn start_update_check(s: &mut App) {
+    if s.update_busy {
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    s.update_rx = Some(rx);
+    s.update_busy = true;
+    s.notice = "Checking for updates…".into();
+    std::thread::spawn(move || {
+        let _ = tx.send(UpdateMsg::Checked(updates::check()));
+    });
+}
+
+/// Download and install the offered build, reporting progress off the UI thread.
+fn start_update_install(s: &mut App) {
+    let Some(offer) = s.update_offer.clone() else { return };
+    if s.update_busy {
+        return;
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    s.update_rx = Some(rx);
+    s.update_busy = true;
+    s.update_progress = Some((0, None));
+    std::thread::spawn(move || {
+        let result = updates::download_and_install(&offer, |ev| match ev {
+            updates::UpdateEvent::Progress { downloaded, total } => {
+                let _ = tx.send(UpdateMsg::Progress(downloaded, total));
+            }
+            updates::UpdateEvent::Installing => {
+                let _ = tx.send(UpdateMsg::Installing);
+            }
+        });
+        let _ = tx.send(UpdateMsg::Done(result));
+    });
+}
+
+/// Drain the update worker's messages; true to redraw.
+fn drain_update(s: &mut App) -> bool {
+    let mut changed = false;
+    let mut finished = false;
+    if let Some(rx) = &s.update_rx {
+        while let Ok(msg) = rx.try_recv() {
+            match msg {
+                UpdateMsg::Checked(result) => {
+                    s.update_busy = false;
+                    finished = true;
+                    match result {
+                        Ok(Some(offer)) => {
+                            s.update_offer = Some(offer);
+                            s.dialog = Some(Dialog::Update);
+                            s.notice.clear();
+                        }
+                        Ok(None) => {
+                            s.notice = format!("You're up to date (version {})", env!("CARGO_PKG_VERSION"));
+                        }
+                        Err(e) => s.notice = e,
+                    }
+                    changed = true;
+                }
+                UpdateMsg::Progress(downloaded, total) => {
+                    s.update_progress = Some((downloaded, total));
+                    changed = true;
+                }
+                UpdateMsg::Installing => {
+                    s.update_installing = true;
+                    changed = true;
+                }
+                UpdateMsg::Done(result) => {
+                    s.update_busy = false;
+                    s.update_installing = false;
+                    s.update_progress = None;
+                    finished = true;
+                    match result {
+                        Ok(()) => {
+                            s.notice = "Update installed; restart to finish".into();
+                            s.dialog = None;
+                        }
+                        Err(e) => s.notice = e,
+                    }
+                    changed = true;
+                }
+            }
+        }
+    }
+    if finished {
+        s.update_rx = None;
+    }
+    changed
 }
 
 fn copy_selection(s: &mut App) {
@@ -5083,6 +5310,11 @@ fn load_fonts() -> &'static [&'static [u8]] {
 }
 
 fn main() {
+    // A launch the shell meant for Explorer itself (a /select reveal, a shell
+    // namespace) is handed back rather than opened as a folder.
+    if defaultmanager::forward_unhostable_launch() {
+        return;
+    }
     let spec = AppSpec::<App> {
         scenes: &[
             ("dark", |s| {
@@ -5180,6 +5412,26 @@ fn main() {
                 s.search_hits = s.entries.iter().take(3).enumerate().map(|(i, e)| {
                     search::Hit { entry: e.clone(), score: 100 - i as u32, indices: vec![0, 1] }
                 }).collect();
+            }),
+            ("moremenu", |s| {
+                s.view = View::Files;
+                s.mode = Mode::Details;
+                s.menu = Some(Menu::Drop { kind: DropMenu::More, x: 820.0, y: 120.0 });
+            }),
+            ("defaultdlg", |s| {
+                s.view = View::Files;
+                s.dialog = Some(Dialog::DefaultManager);
+            }),
+            ("updatedlg", |s| {
+                s.view = View::Files;
+                s.update_offer = Some(updates::Offer {
+                    version: "0.3.0".into(),
+                    current: "0.2.0".into(),
+                    notes: Some("Faster folder loads, real shell icons, and the new search engine.".into()),
+                    url: "https://example.invalid/lyre.exe".into(),
+                    signature: String::new(),
+                });
+                s.dialog = Some(Dialog::Update);
             }),
         ],
         poll: Some(poll),

@@ -494,6 +494,8 @@ struct App {
     startup_check_done: bool,
     /// Whether the running check stays quiet (startup) or reports (manual).
     update_silent: bool,
+    /// Whether to offer to become the default file manager at launch; persisted.
+    prompt_default_manager: bool,
     /// Trigger and window rects in window points, read to anchor and clamp menus.
     rect_new: Live<[f32; 4]>,
     rect_sort: Live<[f32; 4]>,
@@ -730,6 +732,9 @@ fn load_prefs(s: &mut App) {
     if let Some(v) = prefs.get::<bool>("update_check_startup") {
         s.update_check_startup = v;
     }
+    if let Some(v) = prefs.get::<bool>("prompt_default_manager") {
+        s.prompt_default_manager = v;
+    }
 }
 
 /// Write the whole view state and collections; poll calls this once per change.
@@ -754,12 +759,13 @@ fn persist(s: &App) {
     let _ = prefs.set("menu_shown", &s.menu_shown);
     let _ = prefs.set("hidden_places", &s.hidden_places);
     let _ = prefs.set("update_check_startup", &s.update_check_startup);
+    let _ = prefs.set("prompt_default_manager", &s.prompt_default_manager);
 }
 
 /// A cheap fingerprint of everything persisted, so poll saves only on change.
 fn prefs_signature(s: &App) -> String {
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}",
         s.sort,
         s.sort_desc,
         s.preview,
@@ -775,7 +781,8 @@ fn prefs_signature(s: &App) -> String {
         s.menu_hidden,
         s.menu_shown,
         s.hidden_places,
-        s.update_check_startup
+        s.update_check_startup,
+        s.prompt_default_manager
     )
 }
 
@@ -902,13 +909,23 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
         persist(s);
         s.prefs_sig = sig;
     }
-    // Check once at launch, quietly, unless the person opted out or this is a
-    // headless scene render. The window is already up; the work is off-thread.
+    // Once at launch, unless this is a headless scene render: check quietly for
+    // a newer build, and offer to take over folder opening until the person
+    // accepts or declines for good. The window is already up; the check is
+    // off-thread and the offer only appears where it is actually possible.
     if !s.startup_check_done {
         s.startup_check_done = true;
         let headless = std::env::args().any(|a| a == "--snap" || a == "--scene");
-        if s.update_check_startup && !headless {
-            start_update_check(s, true);
+        if !headless {
+            if s.update_check_startup {
+                start_update_check(s, true);
+            }
+            if s.prompt_default_manager {
+                let ms = defaultmanager::state();
+                if !ms.is_default && ms.unsupported.is_none() {
+                    s.dialog = Some(Dialog::DefaultManager);
+                }
+            }
         }
     }
     let mut changed = drain_op(s);
@@ -1339,6 +1356,7 @@ fn init() -> App {
         update_check_startup: true,
         startup_check_done: false,
         update_silent: false,
+        prompt_default_manager: true,
         rect_new: Live::new([0.0; 4]),
         rect_sort: Live::new([0.0; 4]),
         rect_view: Live::new([0.0; 4]),
@@ -2968,6 +2986,15 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                         );
                         h += MENU_ROW_H;
                     }
+                    if ms.unsupported.is_none() {
+                        rows.push(
+                            menu_item(p, "Ask to be default at startup", s.prompt_default_manager.then_some(Ico::Check), None, false)
+                                .on_press(|s: &mut App| {
+                                    s.prompt_default_manager = !s.prompt_default_manager;
+                                }),
+                        );
+                        h += MENU_ROW_H;
+                    }
                     rows.push(
                         menu_item(p, "Check for updates", Some(Ico::Refresh), None, s.update_busy)
                             .on_press(|s: &mut App| {
@@ -3628,7 +3655,17 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
                         .wrap(),
                 )
                 .child(
-                    row().w_full().gap(8.0).child(el().grow(1.0))
+                    row().w_full().gap(8.0).items_center()
+                        .child(
+                            text("Don't ask again")
+                                .font(CAPTION)
+                                .color(p.tertiary)
+                                .on_press(|s: &mut App| {
+                                    s.prompt_default_manager = false;
+                                    s.dialog = None;
+                                }),
+                        )
+                        .child(el().grow(1.0))
                         .child(dialog_button(p, "Cancel", false).on_press(|s: &mut App| s.dialog = None))
                         .child(dialog_button(p, "Make default", true).on_press(|s: &mut App| {
                             match defaultmanager::make_default() {
@@ -4112,7 +4149,12 @@ fn drain_update(s: &mut App) -> bool {
                     match result {
                         Ok(Some(offer)) => {
                             s.update_offer = Some(offer);
-                            s.dialog = Some(Dialog::Update);
+                            // A quiet launch check must not interrupt another
+                            // dialog (the default-manager offer); a manual check
+                            // always shows what it found.
+                            if !s.update_silent || s.dialog.is_none() {
+                                s.dialog = Some(Dialog::Update);
+                            }
                             s.notice.clear();
                         }
                         Ok(None) => {

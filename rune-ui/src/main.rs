@@ -22,8 +22,8 @@ use std::time::{Instant, UNIX_EPOCH};
 
 use rune::color::hex;
 use rune::{
-    Align, AppSpec, Color, Cx, El, GrowthSpec, Image, ImageCache, Key, KeyEvent, LineCap, Live,
-    Phase, Pixels, ScrollSpec, Shape, Span, Spring, SurfaceFit, TextEdit, TextStyle, Tx,
+    Align, AppSpec, Color, Cursor, Cx, El, GrowthSpec, Image, ImageCache, Key, KeyEvent, LineCap,
+    Live, Phase, Pixels, ScrollSpec, Shape, Span, Spring, SurfaceFit, TextEdit, TextStyle, Tx,
     WindowOptions, WindowSpec, canvas, col, el, row, run_windows, text, text_input,
 };
 
@@ -55,7 +55,7 @@ const DATE_W: f32 = 140.0;
 const TYPE_W: f32 = 120.0;
 const SIZE_W: f32 = 80.0;
 /// The column-divider grab zone: a hairline centred in a wider drag target.
-const COL_SEP_W: f32 = 6.0;
+const COL_SEP_W: f32 = 8.0;
 const MENU_W: f32 = 248.0;
 /// The More and context menus carry longer labels ("Stop opening folders with
 /// Lyre", shell verbs) than the command-bar flyouts, so they get extra room.
@@ -349,7 +349,7 @@ impl Filter {
 }
 
 /// A command-bar flyout, anchored below its trigger in window points.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum DropMenu {
     New,
     Sort,
@@ -2854,7 +2854,12 @@ fn shell_verb_rows(
 }
 
 /// Anchor a flyout just below its trigger, from the trigger's drawn rect.
+/// Pressing the same trigger again closes it, as a menu button should.
 fn open_drop(s: &mut App, kind: DropMenu, r: [f32; 4]) {
+    if matches!(&s.menu, Some(Menu::Drop { kind: open, .. }) if *open == kind) {
+        s.menu = None;
+        return;
+    }
     s.menu = Some(Menu::Drop { kind, x: r[0], y: r[1] + r[3] + 2.0 });
 }
 
@@ -3493,9 +3498,9 @@ fn menu_overlay(s: &App, p: Paint) -> El {
     };
     let x = ax.clamp(8.0, (ww - mw - 8.0).max(8.0));
     let y = ay.clamp(8.0, (wh - h - 8.0).max(8.0));
-    // No blocking scrim: a press elsewhere both dismisses the menu (the shared
-    // action helpers clear it) and reaches its target, so navigation and switching
-    // menus take a single click. Empty space is caught by the root's own press.
+    // The panel swallows a press on its own padding so a near miss neither
+    // picks an item nor dismisses. Outside it, the body scrim (see `content`)
+    // closes the menu and keeps the press from the rows behind.
     col()
         .key("menu-panel")
         .absolute(x, y)
@@ -3506,6 +3511,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
         .border(p.hair, p.menu_line)
         .radius(8.0)
         .shadow(6.0, 18.0, Color::BLACK.alpha(0.45))
+        .on_press(|_s: &mut App| {})
         .children(rows)
 }
 
@@ -4022,24 +4028,14 @@ fn column_header(p: Paint, cols: &[(&str, f32)], right_last: bool, separators: b
 }
 
 /// The Details column header with drag-resizable dividers. Each divider widens
-/// the column to its left; the widths persist in `col_w`.
+/// the column to its left; the widths persist in `col_w`. The Size column gets
+/// its own right-edge divider, as in Explorer, so all four columns resize.
 fn details_header(s: &App, p: Paint) -> El {
     let labels = ["Name", "Date modified", "Type", "Size"];
     let mut h = row().key("header").w_full().h(HEADER_H).items_center();
     for (i, label) in labels.iter().enumerate() {
         if i > 0 {
-            let idx = i - 1;
-            h = h.child(
-                el().w(COL_SEP_W)
-                    .h_full()
-                    .center()
-                    .child(el().w(p.hair).h(16.0).fill(p.line))
-                    .on_drag(move |s: &mut App, d: &mut rune::Drag, _tx: &mut Tx| match d.phase {
-                        Phase::Down => d.data = s.col_w[idx],
-                        Phase::Move => s.col_w[idx] = (d.data + d.dx).clamp(60.0, 600.0),
-                        _ => {}
-                    }),
-            );
+            h = h.child(column_divider(p, i - 1));
         }
         let t = text(*label).font(CAPTION).color(p.secondary);
         h = h.child(col().w(s.col_w[i]).pl(12.0).pr(8.0).child(if i == 3 {
@@ -4048,7 +4044,32 @@ fn details_header(s: &App, p: Paint) -> El {
             t
         }));
     }
+    h = h.child(column_divider(p, 3));
     h.child(el().grow(1.0))
+}
+
+/// A column divider: a hairline centred in a wider grab zone that resizes the
+/// column to its left. `idx` is that column's index.
+fn column_divider(p: Paint, idx: usize) -> El {
+    el()
+        .w(COL_SEP_W)
+        .h_full()
+        .hover(p.hover)
+        .cursor(Cursor::ResizeColumn)
+        .center()
+        .child(el().w(p.hair).h(16.0).fill(p.line))
+        .on_drag(move |s: &mut App, d: &mut rune::Drag, _tx: &mut Tx| match d.phase {
+            Phase::Down => d.data = s.col_w[idx],
+            Phase::Move => s.col_w[idx] = (d.data + d.dx).clamp(60.0, 600.0),
+            _ => {}
+        })
+}
+
+/// The Details row's width: the four columns and their separators, ending at
+/// the Size column's right edge. Everything to its right is list background,
+/// which is what a rubber-band drag needs to start on.
+fn row_width(s: &App) -> f32 {
+    s.col_w.iter().sum::<f32>() + COL_SEP_W * 4.0
 }
 
 fn group_header(p: Paint, label: &str) -> El {
@@ -4212,17 +4233,31 @@ fn move_focus(s: &mut App, target: usize, mods: rune::Mods, tx: &mut Tx) {
     tx.scroll_into_view(row_key(s, row));
 }
 
-/// Drive the rubber-band selection from a drag on empty list space. In the
-/// linear views rows are full-width bands, so the band selects by vertical
-/// overlap; a press that lands on a row is left to the row.
-fn marquee_drag(s: &mut App, d: &mut rune::Drag, tx: &mut Tx) {
+/// The vertical extent of each visible row in the rows' content coordinates,
+/// group headers included when the grouped branch drew them, so a rubber-band
+/// can map its range onto rows.
+fn row_y_ranges(s: &App, grouped: bool) -> Vec<(f32, f32)> {
     let rh = row_h(s);
-    let content_h = display_len(s) as f32 * rh;
+    let mut y = 0.0;
+    let mut next_group = 0;
+    let mut out = Vec::with_capacity(s.visible.len());
+    for i in 0..s.visible.len() {
+        if grouped && next_group < s.groups.len() && s.groups[next_group].0 == i {
+            y += GROUP_H;
+            next_group += 1;
+        }
+        out.push((y, y + rh));
+        y += rh;
+    }
+    out
+}
+
+/// Drive the rubber-band selection from a drag on the list's background. A
+/// press that lands on a row is left to the row, so the drag only ever starts
+/// on empty space; the band selects every row whose vertical extent it crosses.
+fn marquee_drag(s: &mut App, d: &mut rune::Drag, tx: &mut Tx) {
     match d.phase {
         Phase::Down => {
-            if d.y < content_h {
-                return;
-            }
             let additive = tx.mods().cmd || tx.mods().ctrl;
             let base = if additive { s.selected.clone() } else { Vec::new() };
             if !additive {
@@ -4238,13 +4273,14 @@ fn marquee_drag(s: &mut App, d: &mut rune::Drag, tx: &mut Tx) {
             let Some(m) = s.marquee.as_ref() else { return };
             let lo = m.y0.min(m.y1);
             let hi = m.y0.max(m.y1);
+            let ranges = row_y_ranges(s, !s.groups.is_empty() && !s.searching);
             let mut sel = m.base.clone();
-            let first = (lo / rh).floor().max(0.0) as usize;
-            let last = ((hi / rh).floor() as usize).min(display_len(s).saturating_sub(1));
-            for row in first..=last {
-                let ei = ei_at_row(s, row);
-                if !sel.contains(&ei) {
-                    sel.push(ei);
+            for (row, &(y0, y1)) in ranges.iter().enumerate() {
+                if y1 >= lo && y0 <= hi {
+                    let ei = ei_at_row(s, row);
+                    if !sel.contains(&ei) {
+                        sel.push(ei);
+                    }
                 }
             }
             s.selected = sel;
@@ -4880,7 +4916,7 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
     let focused = s.focused == Some(ei);
     let mut line = row()
         .key(format!("row-{i}"))
-        .w_full()
+        .w(row_width(s))
         .h(row_h(s))
         .items_center()
         .fill(if selected { p.row_sel } else { Color::TRANSPARENT })
@@ -4934,7 +4970,7 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
                     .align(Align::End),
             ),
         )
-        .child(el().grow(1.0));
+        .child(el().w(COL_SEP_W).h(16.0).center().child(el().w(p.hair).h(16.0).fill(p.soft_line)));
     line.on_press_tx(move |s: &mut App, tx: &mut Tx| {
         click_select(s, ei, tx.mods());
     })
@@ -5015,7 +5051,7 @@ fn details_rows(s: &App, p: Paint) -> El {
             }
             list = list.child(file_row(s, i, p));
         }
-        list
+        list.on_drag(|s: &mut App, d: &mut rune::Drag, tx: &mut Tx| marquee_drag(s, d, tx))
     } else {
         col()
             .key("rows")
@@ -5658,13 +5694,30 @@ fn content(s: &App, p: Paint) -> El {
             View::Files => files_list(s, p),
         }
     };
+    // While a flyout or context menu is open, the work area is inert: a row or
+    // rail item behind the menu neither takes the press nor lights up. The top
+    // bar stays live, so its buttons still switch or close the menu in one press.
+    let inert = s.menu.is_some();
     let mut body = row().key("body").w_full().grow(1.0).min_h(0.0);
     if s.nav_open {
-        body = body.child(nav_rail(s, p));
+        let rail = nav_rail(s, p);
+        body = body.child(if inert { rail.inert() } else { rail });
     }
-    body = body.child(main);
+    body = body.child(if inert { main.inert() } else { main });
     if s.preview {
-        body = body.child(preview_pane(s, p));
+        let pane = preview_pane(s, p);
+        body = body.child(if inert { pane.inert() } else { pane });
+    }
+    if inert {
+        body = body.child(
+            el()
+                .key("menu-scrim")
+                .absolute(0.0, 0.0)
+                .w_full()
+                .h_full()
+                .fill(Color::TRANSPARENT)
+                .on_press(|s: &mut App| s.menu = None),
+        );
     }
     body
 }

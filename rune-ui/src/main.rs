@@ -419,7 +419,8 @@ enum Dialog {
 }
 
 /// A rubber-band selection in the rows' content coordinates. `base` is the
-/// selection kept when the drag adds to it with Ctrl/Cmd held.
+/// selection kept when the drag adds to it with Ctrl/Cmd held, and `auto_scroll`
+/// is the direction the band is pushing the viewport (-1 up, 1 down, 0 none).
 #[derive(Clone)]
 struct Marquee {
     x0: f32,
@@ -427,6 +428,7 @@ struct Marquee {
     x1: f32,
     y1: f32,
     base: Vec<usize>,
+    auto_scroll: i8,
 }
 
 struct App {
@@ -550,6 +552,12 @@ struct App {
     scroll_vis: Live<f32>,
     scroll_max: Live<f32>,
     scroll_off: Live<f32>,
+    /// The scroll viewport's drawn rect and offset, for the rubber band: a
+    /// drag's local point is the viewport's origin less the scroll offset.
+    viewport_rect: Live<[f32; 4]>,
+    /// Each marquee-able item's drawn rect in window points, recorded by its
+    /// `on_layout`. The index is the visible row, matching `visible`.
+    marquee_rects: RefCell<Vec<[f32; 4]>>,
 }
 
 fn format_size(n: u64) -> String {
@@ -1032,6 +1040,24 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
             tx.wake_after(std::time::Duration::from_millis(50));
         }
     }
+    // A rubber band held near the viewport's edge keeps scrolling the list and
+    // extends itself, so one drag can cross a long folder. The band's local y
+    // moves with the scroll: the pointer's window point stays put.
+    let auto_scroll = s.marquee.as_ref().map_or(0, |m| m.auto_scroll);
+    if auto_scroll != 0 {
+        let max = s.scroll_max.get();
+        let off = s.scroll_off.get();
+        let next = (off + auto_scroll as f32 * 28.0).clamp(0.0, max);
+        if next != off {
+            tx.scroll_to_instant("viewport", 0.0, next);
+            if let Some(m) = s.marquee.as_mut() {
+                m.y1 += next - off;
+            }
+            apply_marquee_at(s, next);
+            changed = true;
+        }
+        tx.wake_after(std::time::Duration::from_millis(16));
+    }
     if s.search_edit.text != s.search_query {
         let q = s.search_edit.text.clone();
         if q.trim().is_empty() {
@@ -1469,6 +1495,8 @@ fn init() -> App {
         scroll_vis: Live::new(0.0),
         scroll_max: Live::new(0.0),
         scroll_off: Live::new(0.0),
+        viewport_rect: Live::new([0.0; 4]),
+        marquee_rects: RefCell::new(Vec::new()),
     };
     load_prefs(&mut app);
     refresh_visible(&mut app);
@@ -4233,28 +4261,76 @@ fn move_focus(s: &mut App, target: usize, mods: rune::Mods, tx: &mut Tx) {
     tx.scroll_into_view(row_key(s, row));
 }
 
-/// The vertical extent of each visible row in the rows' content coordinates,
-/// group headers included when the grouped branch drew them, so a rubber-band
-/// can map its range onto rows.
-fn row_y_ranges(s: &App, grouped: bool) -> Vec<(f32, f32)> {
-    let rh = row_h(s);
-    let mut y = 0.0;
-    let mut next_group = 0;
-    let mut out = Vec::with_capacity(s.visible.len());
-    for i in 0..s.visible.len() {
-        if grouped && next_group < s.groups.len() && s.groups[next_group].0 == i {
-            y += GROUP_H;
-            next_group += 1;
+/// Record a marquee-able item's drawn rect, in window points, at its visible
+/// row. `on_layout` reports `[x, y, w, h]`; the band stores the edges.
+/// `tx.live_only()` keeps the report from re-running the view.
+fn marquee_track(el: El, i: usize) -> El {
+    el.on_layout_tx(move |s: &mut App, [x, y, w, h], tx| {
+        let mut rects = s.marquee_rects.borrow_mut();
+        if rects.len() <= i {
+            rects.resize(i + 1, [0.0; 4]);
         }
-        out.push((y, y + rh));
-        y += rh;
+        rects[i] = [x, y, x + w, y + h];
+        tx.live_only();
+    })
+}
+
+/// Select every visible row whose drawn rect the band crosses, at a given
+/// scroll offset (the live one, or the offset a poll is about to scroll to).
+fn apply_marquee_at(s: &mut App, off: f32) {
+    let Some(m) = s.marquee.as_ref() else { return };
+    let vp = s.viewport_rect.get();
+    let [mx0, my0, mx1, my1] = [
+        vp[0] + m.x0.min(m.x1),
+        vp[1] - off + m.y0.min(m.y1),
+        vp[0] + m.x0.max(m.x1),
+        vp[1] - off + m.y0.max(m.y1),
+    ];
+    let base = m.base.clone();
+    let len = display_len(s);
+    let rects = s.marquee_rects.borrow();
+    let mut sel = base;
+    for (row, r) in rects.iter().take(len).enumerate() {
+        if r[2] >= mx0 && r[0] <= mx1 && r[3] >= my0 && r[1] <= my1 {
+            let ei = ei_at_row(s, row);
+            if !sel.contains(&ei) {
+                sel.push(ei);
+            }
+        }
     }
-    out
+    drop(rects);
+    s.selected = sel;
+    update_selection_detail(s);
+}
+
+/// Select every visible row whose drawn rect the band crosses.
+fn apply_marquee(s: &mut App) {
+    let off = s.scroll_off.get();
+    apply_marquee_at(s, off);
+}
+
+/// Which way the band should push the viewport: -1 up, 1 down, 0 none. The
+/// pointer's window y is compared with the viewport's edges.
+fn marquee_auto_scroll(s: &App, d: &rune::Drag) -> i8 {
+    let vp = s.viewport_rect.get();
+    if vp[3] <= 0.0 {
+        return 0;
+    }
+    let off = s.scroll_off.get();
+    let wy = vp[1] - off + d.y;
+    let edge = 48.0;
+    if wy < vp[1] + edge {
+        -1
+    } else if wy > vp[1] + vp[3] - edge {
+        1
+    } else {
+        0
+    }
 }
 
 /// Drive the rubber-band selection from a drag on the list's background. A
-/// press that lands on a row is left to the row, so the drag only ever starts
-/// on empty space; the band selects every row whose vertical extent it crosses.
+/// press that lands on an item is left to the item, so the drag only ever
+/// starts on empty space; the band selects every item whose rect it crosses.
 fn marquee_drag(s: &mut App, d: &mut rune::Drag, tx: &mut Tx) {
     match d.phase {
         Phase::Down => {
@@ -4263,28 +4339,17 @@ fn marquee_drag(s: &mut App, d: &mut rune::Drag, tx: &mut Tx) {
             if !additive {
                 clear_selection(s);
             }
-            s.marquee = Some(Marquee { x0: d.x, y0: d.y, x1: d.x, y1: d.y, base });
+            s.marquee = Some(Marquee { x0: d.x, y0: d.y, x1: d.x, y1: d.y, base, auto_scroll: 0 });
+            apply_marquee(s);
         }
         Phase::Move => {
+            let auto = marquee_auto_scroll(s, d);
             if let Some(m) = s.marquee.as_mut() {
                 m.x1 = d.x;
                 m.y1 = d.y;
+                m.auto_scroll = auto;
             }
-            let Some(m) = s.marquee.as_ref() else { return };
-            let lo = m.y0.min(m.y1);
-            let hi = m.y0.max(m.y1);
-            let ranges = row_y_ranges(s, !s.groups.is_empty() && !s.searching);
-            let mut sel = m.base.clone();
-            for (row, &(y0, y1)) in ranges.iter().enumerate() {
-                if y1 >= lo && y0 <= hi {
-                    let ei = ei_at_row(s, row);
-                    if !sel.contains(&ei) {
-                        sel.push(ei);
-                    }
-                }
-            }
-            s.selected = sel;
-            update_selection_detail(s);
+            apply_marquee(s);
         }
         Phase::Up => {
             s.marquee = None;
@@ -4971,19 +5036,22 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
             ),
         )
         .child(el().w(COL_SEP_W).h(16.0).center().child(el().w(p.hair).h(16.0).fill(p.soft_line)));
-    line.on_press_tx(move |s: &mut App, tx: &mut Tx| {
-        click_select(s, ei, tx.mods());
-    })
-    .on_double_press(move |s: &mut App| {
-        select_entry(s, ei);
-        open_selected(s);
-    })
-    .on_secondary_press(move |s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
-        if !is_selected(s, ei) {
+    marquee_track(
+        line.on_press_tx(move |s: &mut App, tx: &mut Tx| {
+            click_select(s, ei, tx.mods());
+        })
+        .on_double_press(move |s: &mut App| {
             select_entry(s, ei);
-        }
-        s.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
-    })
+            open_selected(s);
+        })
+        .on_secondary_press(move |s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
+            if !is_selected(s, ei) {
+                select_entry(s, ei);
+            }
+            s.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
+        }),
+        i,
+    )
 }
 
 /// Wrap list content in a scroll viewport plus a drawn scrollbar gutter. The
@@ -5016,7 +5084,8 @@ fn scrollable(s: &App, p: Paint, content: El) -> El {
             let h = (at.viewport[1] / (at.viewport[1] + at.max[1]) * t[3]).max(28.0);
             let y = t[1] + (at.offset[1] / at.max[1]) * (t[3] - h);
             thumb.set([t[0] + (GUTTER_W - 6.0) / 2.0, y, 6.0, h]);
-        });
+        })
+        .drawn_rect_into(&s.viewport_rect);
     row()
         .key("list-area")
         .w_full()
@@ -5104,19 +5173,22 @@ fn grid_tile(s: &App, i: usize, p: Paint) -> El {
     if selected {
         tile = tile.border(p.hair, p.focus_line);
     }
-    tile.on_press_tx(move |s: &mut App, tx: &mut Tx| {
-        click_select(s, ei, tx.mods());
-    })
-    .on_double_press(move |s: &mut App| {
-        select_entry(s, ei);
-        open_selected(s);
-    })
-    .on_secondary_press(move |s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
-        if !is_selected(s, ei) {
+    marquee_track(
+        tile.on_press_tx(move |s: &mut App, tx: &mut Tx| {
+            click_select(s, ei, tx.mods());
+        })
+        .on_double_press(move |s: &mut App| {
             select_entry(s, ei);
-        }
-        s.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
-    })
+            open_selected(s);
+        })
+        .on_secondary_press(move |s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
+            if !is_selected(s, ei) {
+                select_entry(s, ei);
+            }
+            s.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
+        }),
+        i,
+    )
 }
 
 fn grid_rows(s: &App, p: Paint) -> El {
@@ -5127,7 +5199,8 @@ fn grid_rows(s: &App, p: Paint) -> El {
         .pt(12.0)
         .px(16.0)
         .gap(8.0)
-        .children((0..display_len(s)).map(|i| grid_tile(s, i, p)));
+        .children((0..display_len(s)).map(|i| grid_tile(s, i, p)))
+        .on_drag(|s: &mut App, d: &mut rune::Drag, tx: &mut Tx| marquee_drag(s, d, tx));
     scrollable(s, p, tiles)
 }
 
@@ -5156,19 +5229,22 @@ fn list_item(s: &App, i: usize, p: Paint) -> El {
     if selected {
         item = item.border(p.hair, p.focus_line);
     }
-    item.on_press_tx(move |s: &mut App, tx: &mut Tx| {
-        click_select(s, ei, tx.mods());
-    })
-    .on_double_press(move |s: &mut App| {
-        select_entry(s, ei);
-        open_selected(s);
-    })
-    .on_secondary_press(move |s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
-        if !is_selected(s, ei) {
+    marquee_track(
+        item.on_press_tx(move |s: &mut App, tx: &mut Tx| {
+            click_select(s, ei, tx.mods());
+        })
+        .on_double_press(move |s: &mut App| {
             select_entry(s, ei);
-        }
-        s.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
-    })
+            open_selected(s);
+        })
+        .on_secondary_press(move |s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
+            if !is_selected(s, ei) {
+                select_entry(s, ei);
+            }
+            s.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
+        }),
+        i,
+    )
 }
 
 fn list_rows(s: &App, p: Paint) -> El {
@@ -5179,7 +5255,8 @@ fn list_rows(s: &App, p: Paint) -> El {
         .pt(8.0)
         .px(12.0)
         .gap(2.0)
-        .children((0..display_len(s)).map(|i| list_item(s, i, p)));
+        .children((0..display_len(s)).map(|i| list_item(s, i, p)))
+        .on_drag(|s: &mut App, d: &mut rune::Drag, tx: &mut Tx| marquee_drag(s, d, tx));
     scrollable(s, p, items)
 }
 
@@ -5219,19 +5296,22 @@ fn tile_item(s: &App, i: usize, p: Paint) -> El {
     if selected {
         tile = tile.border(p.hair, p.focus_line);
     }
-    tile.on_press_tx(move |s: &mut App, tx: &mut Tx| {
-        click_select(s, ei, tx.mods());
-    })
-    .on_double_press(move |s: &mut App| {
-        select_entry(s, ei);
-        open_selected(s);
-    })
-    .on_secondary_press(move |s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
-        if !is_selected(s, ei) {
+    marquee_track(
+        tile.on_press_tx(move |s: &mut App, tx: &mut Tx| {
+            click_select(s, ei, tx.mods());
+        })
+        .on_double_press(move |s: &mut App| {
             select_entry(s, ei);
-        }
-        s.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
-    })
+            open_selected(s);
+        })
+        .on_secondary_press(move |s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
+            if !is_selected(s, ei) {
+                select_entry(s, ei);
+            }
+            s.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
+        }),
+        i,
+    )
 }
 
 fn tiles_rows(s: &App, p: Paint) -> El {
@@ -5242,7 +5322,8 @@ fn tiles_rows(s: &App, p: Paint) -> El {
         .pt(12.0)
         .px(16.0)
         .gap(8.0)
-        .children((0..display_len(s)).map(|i| tile_item(s, i, p)));
+        .children((0..display_len(s)).map(|i| tile_item(s, i, p)))
+        .on_drag(|s: &mut App, d: &mut rune::Drag, tx: &mut Tx| marquee_drag(s, d, tx));
     scrollable(s, p, tiles)
 }
 
@@ -5985,7 +6066,7 @@ fn main() {
                 s.mode = Mode::Details;
                 s.groups.clear();
                 s.selected = s.visible.iter().take(4).copied().collect();
-                s.marquee = Some(Marquee { x0: 16.0, y0: 6.0, x1: 420.0, y1: 118.0, base: Vec::new() });
+                s.marquee = Some(Marquee { x0: 16.0, y0: 6.0, x1: 420.0, y1: 118.0, base: Vec::new(), auto_scroll: 0 });
             }),
         ],
         poll: Some(poll),

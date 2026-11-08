@@ -570,6 +570,172 @@ struct App {
     volumes: Vec<volumes::Volume>,
     volumes_selected: Option<usize>,
     volumes_at: Instant,
+    /// Every open tab's saved state, and which one is showing. The showing
+    /// tab's live state stays in the flat fields above; this holds the rest.
+    tabs: Vec<Tab>,
+    active_tab: usize,
+}
+
+/// One tab's navigation state: where it is, how it got there, and what it
+/// shows. Captured when the tab is left and restored when it is reopened.
+#[derive(Clone)]
+struct Tab {
+    root: PathBuf,
+    history: Vec<PathBuf>,
+    forward: Vec<PathBuf>,
+    view: View,
+    mode: Mode,
+    name: String,
+    crumbs: Vec<String>,
+    search: String,
+    entries: Vec<Entry>,
+    scan_ms: f64,
+    groups: Vec<(usize, String)>,
+    visible: Vec<usize>,
+    selected: Vec<usize>,
+    focused: Option<usize>,
+    anchor: Option<usize>,
+    reveal: Option<usize>,
+    reveal_at: Option<Instant>,
+    marquee: Option<Marquee>,
+    nav: usize,
+    count: usize,
+    selection_detail: String,
+    count_override: Option<usize>,
+    keep_order: bool,
+    contextual: bool,
+    preview: bool,
+    home_tab: u8,
+    volumes_selected: Option<usize>,
+}
+
+/// Snapshot the showing tab's state into a `Tab`.
+fn capture_tab(s: &App) -> Tab {
+    Tab {
+        root: s.root.clone(),
+        history: s.history.clone(),
+        forward: s.forward.clone(),
+        view: s.view,
+        mode: s.mode,
+        name: s.tab.clone(),
+        crumbs: s.crumbs.clone(),
+        search: s.search.clone(),
+        entries: s.entries.clone(),
+        scan_ms: s.scan_ms,
+        groups: s.groups.clone(),
+        visible: s.visible.clone(),
+        selected: s.selected.clone(),
+        focused: s.focused,
+        anchor: s.anchor,
+        reveal: s.reveal,
+        reveal_at: s.reveal_at,
+        marquee: s.marquee.clone(),
+        nav: s.nav,
+        count: s.count,
+        selection_detail: s.selection_detail.clone(),
+        count_override: s.count_override,
+        keep_order: s.keep_order,
+        contextual: s.contextual,
+        preview: s.preview,
+        home_tab: s.home_tab,
+        volumes_selected: s.volumes_selected,
+    }
+}
+
+/// Put a saved tab's state back into the showing fields.
+fn restore_tab(s: &mut App, tab: &Tab) {
+    s.root = tab.root.clone();
+    s.history = tab.history.clone();
+    s.forward = tab.forward.clone();
+    s.view = tab.view;
+    s.mode = tab.mode;
+    s.tab = tab.name.clone();
+    s.crumbs = tab.crumbs.clone();
+    s.search = tab.search.clone();
+    s.entries = tab.entries.clone();
+    s.scan_ms = tab.scan_ms;
+    s.groups = tab.groups.clone();
+    s.visible = tab.visible.clone();
+    s.selected = tab.selected.clone();
+    s.focused = tab.focused;
+    s.anchor = tab.anchor;
+    s.reveal = tab.reveal;
+    s.reveal_at = tab.reveal_at;
+    s.marquee = tab.marquee.clone();
+    s.nav = tab.nav;
+    s.count = tab.count;
+    s.selection_detail = tab.selection_detail.clone();
+    s.count_override = tab.count_override;
+    s.keep_order = tab.keep_order;
+    s.contextual = tab.contextual;
+    s.preview = tab.preview;
+    s.home_tab = tab.home_tab;
+    s.volumes_selected = tab.volumes_selected;
+}
+
+/// Show a saved tab, saving the one being left first.
+fn switch_tab(s: &mut App, index: usize) {
+    if index >= s.tabs.len() || index == s.active_tab {
+        return;
+    }
+    s.tabs[s.active_tab] = capture_tab(s);
+    s.active_tab = index;
+    let tab = s.tabs[index].clone();
+    restore_tab(s, &tab);
+    s.menu = None;
+    s.marquee = None;
+}
+
+/// Reset the showing tab's fields to a fresh Home, closing its history. The
+/// caller saves or replaces the tab's slot afterwards.
+fn reset_tab_home(s: &mut App) {
+    s.view = View::Home;
+    s.mode = Mode::Details;
+    s.tab = "Home".into();
+    s.crumbs = vec!["Home".into()];
+    s.search = "Search Home".into();
+    s.nav = 0;
+    s.preview = false;
+    s.contextual = false;
+    s.groups.clear();
+    clear_selection(s);
+    s.notice.clear();
+    s.menu = None;
+    s.marquee = None;
+    s.history.clear();
+    s.forward.clear();
+    s.keep_order = true;
+    s.count_override = None;
+    refresh_recent(s);
+}
+
+/// Open a new tab on Home.
+fn new_tab(s: &mut App) {
+    s.tabs[s.active_tab] = capture_tab(s);
+    reset_tab_home(s);
+    s.tabs.push(capture_tab(s));
+    s.active_tab = s.tabs.len() - 1;
+}
+
+/// Close a tab. The last one is reset to Home rather than closing the window.
+fn close_tab_at(s: &mut App, index: usize) {
+    if index >= s.tabs.len() {
+        return;
+    }
+    if s.tabs.len() <= 1 {
+        reset_tab_home(s);
+        s.tabs[0] = capture_tab(s);
+        return;
+    }
+    s.tabs.remove(index);
+    if index < s.active_tab {
+        s.active_tab -= 1;
+    } else if s.active_tab >= s.tabs.len() {
+        s.active_tab = s.tabs.len() - 1;
+    }
+    let tab = s.tabs[s.active_tab].clone();
+    restore_tab(s, &tab);
+    s.menu = None;
 }
 
 pub(crate) fn format_size(n: u64) -> String {
@@ -1574,9 +1740,13 @@ fn init() -> App {
         volumes: Vec::new(),
         volumes_selected: None,
         volumes_at: Instant::now(),
+        tabs: Vec::new(),
+        active_tab: 0,
     };
     load_prefs(&mut app);
     refresh_visible(&mut app);
+    app.tabs = vec![capture_tab(&app)];
+    app.active_tab = 0;
     app
 }
 
@@ -2549,20 +2719,26 @@ fn scroll_thumb(s: &App, p: Paint) -> El {
         })
 }
 
-fn tab_strip(s: &App, p: Paint) -> El {
-    let tab = row()
-        .key("tab")
+/// One tab in the strip: its place mark, name and close button. The active tab
+/// is filled; the others are transparent until hovered.
+fn tab_button(s: &App, p: Paint, index: usize, tab: &Tab) -> El {
+    let active = index == s.active_tab;
+    let name = tab.name.clone();
+    let nav = tab.nav;
+    let b = row()
+        .key(format!("tab-{index}"))
         .h(TAB_ITEM_H)
-        .w(230.0)
+        .w(180.0)
         .corners([8.0, 8.0, 0.0, 0.0])
-        .fill(p.tab)
+        .fill(if active { p.tab } else { Color::TRANSPARENT })
+        .hover(if active { Color::TRANSPARENT } else { p.hover })
         .pl(12.0)
         .pr(6.0)
         .gap(8.0)
         .items_center()
-        .child(place_glyph(s.nav, 16.0))
+        .child(place_glyph(nav, 16.0))
         .child(
-            text(s.tab.as_str())
+            text(name.as_str())
                 .font(CAPTION)
                 .color(p.text)
                 .grow(1.0)
@@ -2570,17 +2746,19 @@ fn tab_strip(s: &App, p: Paint) -> El {
                 .truncate(),
         )
         .child(
-            el().key("tab-close")
+            el().key(format!("tab-close-{index}"))
                 .size(22.0, 22.0)
                 .radius(4.0)
                 .hover(p.hover)
                 .center()
                 .child(ico(p, Ico::Close, 11.0, p.secondary))
                 .help("Close tab")
-                .on_press(|s: &mut App| {
-                    s.notice = "The last tab cannot be closed".into();
-                }),
+                .on_press(move |s: &mut App| close_tab_at(s, index)),
         );
+    b.on_press(move |s: &mut App| switch_tab(s, index))
+}
+
+fn tab_strip(s: &App, p: Paint) -> El {
     let mut strip = row()
         .key("tabs")
         .w_full()
@@ -2591,8 +2769,11 @@ fn tab_strip(s: &App, p: Paint) -> El {
         .gap(2.0)
         // A borderless window has no system titlebar. This band is it: drag to
         // move, double press to zoom, and the drawn controls below to close.
-        .window_drag()
-        .child(tab)
+        .window_drag();
+    for (index, tab) in s.tabs.iter().enumerate() {
+        strip = strip.child(tab_button(s, p, index, tab));
+    }
+    strip = strip
         .child(
             el().key("new-tab")
                 .size(30.0, 30.0)
@@ -2601,9 +2782,7 @@ fn tab_strip(s: &App, p: Paint) -> El {
                 .center()
                 .child(text("+").font(TextStyle::new(16.0, 400.0)).color(p.secondary))
                 .help("New tab")
-                .on_press(|s: &mut App| {
-                    s.notice = "New tabs are not implemented in this slice".into()
-                }),
+                .on_press(|s: &mut App| new_tab(s)),
         )
         .child(el().grow(1.0));
     let controls = [
@@ -5076,6 +5255,14 @@ fn handle_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
         select_all(s);
         return true;
     }
+    if ev.is_command('t') {
+        new_tab(s);
+        return true;
+    }
+    if ev.is_command('w') {
+        close_tab_at(s, s.active_tab);
+        return true;
+    }
     match ev.key {
         Key::Delete => {
             begin_delete(s, ev.mods.shift);
@@ -5107,6 +5294,14 @@ fn handle_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
         }
         Key::End => {
             move_focus(s, display_len(s).saturating_sub(1), ev.mods, tx);
+            true
+        }
+        Key::Tab if ev.mods.cmd || ev.mods.ctrl => {
+            let len = s.tabs.len();
+            if len > 1 {
+                let delta = if ev.mods.shift { len - 1 } else { 1 };
+                switch_tab(s, (s.active_tab + delta) % len);
+            }
             true
         }
         _ => false,

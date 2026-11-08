@@ -33,6 +33,7 @@ pub struct Request {
     pub query: String,
     pub recursive: bool,
     pub show_hidden: bool,
+    pub show_protected: bool,
 }
 
 #[derive(Clone)]
@@ -105,7 +106,7 @@ pub fn search<F: FnMut(Event) -> bool>(req: &Request, cancel: &AtomicBool, mut e
     let pattern = Pattern::parse(&folded_needle, CaseMatching::Ignore, Normalization::Smart);
 
     // Phase one: the folder on screen, straight from the snapshot in memory.
-    let (local, matched_local) = score_local(&pattern, &req.local, req.show_hidden);
+    let (local, matched_local) = score_local(&pattern, &req.local, req.show_hidden, req.show_protected);
     let laid_out = req.local.len();
     if !emit(Event::Local { items: local, matched: matched_local, elapsed_ms: started.elapsed().as_millis() as u64 }) {
         return;
@@ -133,13 +134,20 @@ pub fn search<F: FnMut(Event) -> bool>(req: &Request, cancel: &AtomicBool, mut e
 }
 
 /// Score the folder's entries and keep the best `LIMIT`, folders first.
-fn score_local(pattern: &Pattern, entries: &[crate::Entry], show_hidden: bool) -> (Vec<Hit>, usize) {
+fn score_local(pattern: &Pattern, entries: &[crate::Entry], show_hidden: bool, show_protected: bool) -> (Vec<Hit>, usize) {
     let mut matcher = Matcher::new(Config::DEFAULT);
     let mut buf = Vec::new();
     let mut folded = String::new();
     let mut scored: Vec<(u32, u32)> = Vec::new();
     for (i, entry) in entries.iter().enumerate() {
-        if !show_hidden && entry.name.starts_with('.') {
+        let visible = if entry.hidden && entry.system {
+            show_hidden && show_protected
+        } else if entry.hidden {
+            show_hidden
+        } else {
+            true
+        };
+        if !visible {
             continue;
         }
         fold_into(&entry.name, &mut folded);
@@ -294,6 +302,18 @@ fn describe(name: String, path: PathBuf, is_dir: bool) -> Option<crate::Entry> {
         .map(|d| crate::format_time(d.as_secs()))
         .unwrap_or_default();
     let kind = crate::classify(&name, is_dir);
+    let (hidden, system) = {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            let attrs = meta.file_attributes();
+            (attrs & 0x2 != 0, attrs & 0x4 != 0)
+        }
+        #[cfg(not(windows))]
+        {
+            (name.starts_with('.'), false)
+        }
+    };
     Some(crate::Entry {
         path: path.to_string_lossy().into_owned(),
         name,
@@ -302,6 +322,8 @@ fn describe(name: String, path: PathBuf, is_dir: bool) -> Option<crate::Entry> {
         modified,
         type_label: crate::kind_label(kind).to_string(),
         kind,
+        hidden,
+        system,
         fixture: false,
         fixture_size: String::new(),
     })
@@ -321,6 +343,8 @@ mod tests {
             modified: String::new(),
             type_label: crate::kind_label(kind).into(),
             kind,
+            hidden: name.starts_with('.'),
+            system: false,
             fixture: false,
             fixture_size: String::new(),
         }
@@ -336,7 +360,7 @@ mod tests {
     #[test]
     fn fuzzy_matches_subsequence_and_scores_contiguous_higher() {
         let entries = vec![entry("report.txt", false), entry("r_e_p_o_r_t.txt", false), entry("unrelated.md", false)];
-        let req = Request { path: "/folder".into(), local: entries, query: "report".into(), recursive: false, show_hidden: false };
+        let req = Request { path: "/folder".into(), local: entries, query: "report".into(), recursive: false, show_hidden: false, show_protected: false };
         let events = collect_events(&req);
         let items = match &events[0] { Event::Local { items, .. } => items, _ => panic!() };
         assert_eq!(items.len(), 2);
@@ -347,7 +371,7 @@ mod tests {
     #[test]
     fn folders_rank_before_files() {
         let entries = vec![entry("report.txt", false), entry("reports", true)];
-        let req = Request { path: "/folder".into(), local: entries, query: "report".into(), recursive: false, show_hidden: false };
+        let req = Request { path: "/folder".into(), local: entries, query: "report".into(), recursive: false, show_hidden: false, show_protected: false };
         let events = collect_events(&req);
         let items = match &events[0] { Event::Local { items, .. } => items, _ => panic!() };
         assert!(items[0].entry.is_dir, "folders lead even when a file scores similarly");
@@ -356,7 +380,7 @@ mod tests {
     #[test]
     fn accent_folding_matches_base_letters() {
         let entries = vec![entry("Țări.txt", false), entry("soseaua.doc", false)];
-        let req = Request { path: "/folder".into(), local: entries, query: "tari".into(), recursive: false, show_hidden: false };
+        let req = Request { path: "/folder".into(), local: entries, query: "tari".into(), recursive: false, show_hidden: false, show_protected: false };
         let events = collect_events(&req);
         let items = match &events[0] { Event::Local { items, .. } => items, _ => panic!() };
         assert!(items.iter().any(|h| h.entry.name == "Țări.txt"), "accent-folded match");
@@ -365,7 +389,7 @@ mod tests {
     #[test]
     fn hidden_files_are_skipped_unless_shown() {
         let entries = vec![entry(".hidden.txt", false), entry("visible.txt", false)];
-        let req = Request { path: "/folder".into(), local: entries, query: "txt".into(), recursive: false, show_hidden: false };
+        let req = Request { path: "/folder".into(), local: entries, query: "txt".into(), recursive: false, show_hidden: false, show_protected: false };
         let events = collect_events(&req);
         let items = match &events[0] { Event::Local { items, .. } => items, _ => panic!() };
         assert_eq!(items.len(), 1);
@@ -375,7 +399,7 @@ mod tests {
     #[test]
     fn single_character_does_not_walk() {
         let entries = vec![entry("a.txt", false)];
-        let req = Request { path: "/folder".into(), local: entries, query: "a".into(), recursive: true, show_hidden: false };
+        let req = Request { path: "/folder".into(), local: entries, query: "a".into(), recursive: true, show_hidden: false, show_protected: false };
         let events = collect_events(&req);
         // Local then Done, no Batch (no recursive walk for one character).
         assert!(matches!(events.last(), Some(Event::Done { .. })));

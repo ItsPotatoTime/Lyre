@@ -279,6 +279,10 @@ struct Entry {
     modified: String,
     type_label: String,
     kind: Kind,
+    /// The hidden attribute (a dotfile on Unix); `system` marks protected OS
+    /// files on Windows, which stay hidden unless both toggles allow them.
+    hidden: bool,
+    system: bool,
     /// Fixtures carry display-ready size strings; real scans carry byte counts.
     fixture: bool,
     fixture_size: String,
@@ -427,8 +431,13 @@ struct App {
     groups: Vec<(usize, String)>,
     /// Row indices into `entries` after search and sort. Never built rows.
     visible: Vec<usize>,
-    selected: Option<usize>,
+    selected: Vec<usize>,
     focused: Option<usize>,
+    /// The entry a Shift-click or Shift-arrow range extends from.
+    anchor: Option<usize>,
+    /// A row briefly flashed after keyboard navigation, and when it was lit.
+    reveal: Option<usize>,
+    reveal_at: Option<std::time::Instant>,
     nav: usize,
     count: usize,
     selection_detail: String,
@@ -442,6 +451,10 @@ struct App {
     filter: Filter,
     compact: bool,
     show_hidden: bool,
+    /// Show hidden+system (protected OS) files; meaningful on Windows only.
+    show_protected: bool,
+    /// Show file extensions in names; off hides the suffix for files.
+    show_extensions: bool,
     nav_open: bool,
     /// The single open flyout or context menu, if any.
     menu: Option<Menu>,
@@ -570,6 +583,18 @@ fn scan(path: &Path) -> (Vec<Entry>, f64) {
                 .map(|d| format_time(d.as_secs()))
                 .unwrap_or_default();
             let kind = classify(&name, is_dir);
+            let (hidden, system) = {
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::MetadataExt;
+                    let attrs = meta.file_attributes();
+                    (attrs & 0x2 != 0, attrs & 0x4 != 0)
+                }
+                #[cfg(not(windows))]
+                {
+                    (name.starts_with('.'), false)
+                }
+            };
             entries.push(Entry {
                 name: name.clone(),
                 path: item.path().to_string_lossy().into_owned(),
@@ -578,6 +603,8 @@ fn scan(path: &Path) -> (Vec<Entry>, f64) {
                 modified,
                 type_label: kind_label(kind).to_string(),
                 kind,
+                hidden,
+                system,
                 fixture: false,
                 fixture_size: String::new(),
             });
@@ -612,6 +639,8 @@ fn make_entry(name: &str, modified: &str, type_label: &str, size: &str, kind: Ki
         modified: modified.to_string(),
         type_label: type_label.to_string(),
         kind,
+        hidden: false,
+        system: false,
         fixture: true,
         fixture_size: size.to_string(),
     }
@@ -735,6 +764,12 @@ fn load_prefs(s: &mut App) {
     if let Some(v) = prefs.get::<bool>("prompt_default_manager") {
         s.prompt_default_manager = v;
     }
+    if let Some(v) = prefs.get::<bool>("show_protected") {
+        s.show_protected = v;
+    }
+    if let Some(v) = prefs.get::<bool>("show_extensions") {
+        s.show_extensions = v;
+    }
 }
 
 /// Write the whole view state and collections; poll calls this once per change.
@@ -760,12 +795,14 @@ fn persist(s: &App) {
     let _ = prefs.set("hidden_places", &s.hidden_places);
     let _ = prefs.set("update_check_startup", &s.update_check_startup);
     let _ = prefs.set("prompt_default_manager", &s.prompt_default_manager);
+    let _ = prefs.set("show_protected", &s.show_protected);
+    let _ = prefs.set("show_extensions", &s.show_extensions);
 }
 
 /// A cheap fingerprint of everything persisted, so poll saves only on change.
 fn prefs_signature(s: &App) -> String {
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{}",
         s.sort,
         s.sort_desc,
         s.preview,
@@ -782,7 +819,9 @@ fn prefs_signature(s: &App) -> String {
         s.menu_shown,
         s.hidden_places,
         s.update_check_startup,
-        s.prompt_default_manager
+        s.prompt_default_manager,
+        s.show_protected,
+        s.show_extensions
     )
 }
 
@@ -844,6 +883,19 @@ fn toggle_menu_item(s: &mut App, id: &str, default_on: bool) {
     }
 }
 
+/// Whether an entry passes the hidden/protected toggles. Protected OS files
+/// (hidden and system, a Windows notion) need both switches; ordinary hidden
+/// items need only the hidden one.
+fn entry_visible(s: &App, e: &Entry) -> bool {
+    if e.hidden && e.system {
+        s.show_hidden && s.show_protected
+    } else if e.hidden {
+        s.show_hidden
+    } else {
+        true
+    }
+}
+
 /// The list stays virtualised: this only holds indices, never built rows.
 fn refresh_visible(s: &mut App) {
     let q = s.search_edit.text.to_lowercase();
@@ -851,7 +903,7 @@ fn refresh_visible(s: &mut App) {
         .filter(|&i| {
             let e = &s.entries[i];
             (q.is_empty() || e.name.to_lowercase().contains(&q))
-                && (s.show_hidden || !e.name.starts_with('.'))
+                && entry_visible(s, e)
                 && s.filter.matches(e)
         })
         .collect();
@@ -941,6 +993,17 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
     if s.update_busy {
         tx.wake_after(std::time::Duration::from_millis(60));
     }
+    // The keyboard-navigation flash fades after a moment; keep frames coming
+    // until it clears so the redraw lands.
+    if let Some(at) = s.reveal_at {
+        if at.elapsed() >= std::time::Duration::from_millis(600) {
+            s.reveal = None;
+            s.reveal_at = None;
+            changed = true;
+        } else {
+            tx.wake_after(std::time::Duration::from_millis(50));
+        }
+    }
     if s.search_edit.text != s.search_query {
         let q = s.search_edit.text.clone();
         if q.trim().is_empty() {
@@ -973,9 +1036,7 @@ fn set_location(s: &mut App, path: PathBuf) {
     s.view = View::Files;
     s.contextual = false;
     s.groups.clear();
-    s.selected = None;
-    s.focused = None;
-    s.selection_detail.clear();
+    clear_selection(s);
     s.notice.clear();
     s.menu = None;
     s.keep_order = false;
@@ -1044,8 +1105,7 @@ fn load(s: &mut App, f: Fixture) {
     s.preview = false;
     s.contextual = false;
     s.mode = Mode::Details;
-    s.selected = None;
-    s.focused = None;
+    clear_selection(s);
     s.notice.clear();
     s.search_edit.text.clear();
     match f {
@@ -1210,7 +1270,7 @@ fn load(s: &mut App, f: Fixture) {
             s.search = "Search Screenshots".into();
             s.nav = 6;
             s.count = 5;
-            s.selected = Some(1);
+            s.selected = vec![1];
             s.focused = Some(1);
             s.selection_detail = "1 item selected  131 KB".into();
             let d = "11/6/2026 10:39 AM";
@@ -1304,8 +1364,11 @@ fn init() -> App {
         entries,
         groups: Vec::new(),
         visible: Vec::new(),
-        selected: None,
+        selected: Vec::new(),
         focused: None,
+        anchor: None,
+        reveal: None,
+        reveal_at: None,
         nav: 9,
         count,
         selection_detail: String::new(),
@@ -1319,6 +1382,8 @@ fn init() -> App {
         filter: Filter::All,
         compact: false,
         show_hidden: false,
+        show_protected: false,
+        show_extensions: true,
         nav_open: true,
         menu: None,
         favorites: Vec::new(),
@@ -2562,7 +2627,7 @@ fn accent_button(p: Paint, which: Ico, label: &str) -> El {
 }
 
 fn command_bar(s: &App, p: Paint) -> El {
-    let has_sel = s.selected.is_some();
+    let has_sel = !s.selected.is_empty();
     let mut bar = row()
         .key("command")
         .w_full()
@@ -2869,6 +2934,27 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                             }),
                     );
                     h += MENU_ROW_H;
+                    let se = s.show_extensions;
+                    rows.push(
+                        menu_item(p, "File name extensions", se.then_some(Ico::Check), None, false)
+                            .on_press(move |s: &mut App| {
+                                s.show_extensions = !se;
+                                s.menu = None;
+                            }),
+                    );
+                    h += MENU_ROW_H;
+                    if cfg!(target_os = "windows") {
+                        let sp = s.show_protected;
+                        rows.push(
+                            menu_item(p, "Show protected OS files", sp.then_some(Ico::Check), None, false)
+                                .on_press(move |s: &mut App| {
+                                    s.show_protected = !sp;
+                                    refresh_visible(s);
+                                    s.menu = None;
+                                }),
+                        );
+                        h += MENU_ROW_H;
+                    }
                     let pr = s.preview;
                     rows.push(
                         menu_item(p, "Preview pane", pr.then_some(Ico::Check), None, false).on_press(
@@ -2935,8 +3021,8 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                         ),
                     );
                     h += MENU_ROW_H;
-                    let path = s.selected.map(|i| s.entries[i].path.clone()).unwrap_or_default();
-                    let has_sel = s.selected.is_some();
+                    let path = s.selected.first().map(|&i| s.entries[i].path.clone()).unwrap_or_default();
+                    let has_sel = !s.selected.is_empty();
                     let copy = path.clone();
                     rows.push(
                         menu_item(p, "Copy path", None, None, !has_sel).on_press_tx(
@@ -3904,28 +3990,163 @@ fn group_header(p: Paint, label: &str) -> El {
 }
 
 /// Record a selection and the status-bar detail Explorer shows beside the count.
+/// Whether a row's entry is part of the current selection.
+fn is_selected(s: &App, ei: usize) -> bool {
+    s.selected.contains(&ei)
+}
+
+/// The status-bar detail Explorer shows beside the count: one item's size, or
+/// the number selected and their total.
+fn update_selection_detail(s: &mut App) {
+    let n = s.selected.len();
+    if n == 0 {
+        s.selection_detail.clear();
+        return;
+    }
+    if n == 1 {
+        let size = entry_by_index(s, s.selected[0]).size_label();
+        s.selection_detail = if size.is_empty() {
+            "1 item selected".into()
+        } else {
+            format!("1 item selected  {size}")
+        };
+    } else {
+        let total: u64 = s.selected.iter().map(|&i| entry_by_index(s, i).size).sum();
+        s.selection_detail = if total == 0 {
+            format!("{n} items selected")
+        } else {
+            format!("{n} items selected  {}", format_size(total))
+        };
+    }
+}
+
+/// Plain click: select just this entry and make it the range anchor.
 fn select_entry(s: &mut App, ei: usize) {
     s.menu = None;
-    s.selected = Some(ei);
+    s.selected = vec![ei];
+    s.focused = Some(ei);
+    s.anchor = Some(ei);
+    s.notice.clear();
+    update_selection_detail(s);
+}
+
+/// Ctrl/Cmd-click: toggle this entry in the selection.
+fn toggle_select(s: &mut App, ei: usize) {
+    s.menu = None;
+    if let Some(pos) = s.selected.iter().position(|&x| x == ei) {
+        s.selected.remove(pos);
+    } else {
+        s.selected.push(ei);
+    }
+    s.focused = Some(ei);
+    s.anchor = Some(ei);
+    s.notice.clear();
+    update_selection_detail(s);
+}
+
+/// The display row an entry index occupies, if it is on screen.
+fn row_of(s: &App, ei: usize) -> Option<usize> {
+    if s.searching {
+        (ei < s.search_hits.len()).then_some(ei)
+    } else {
+        s.visible.iter().position(|&x| x == ei)
+    }
+}
+
+/// The entry index a display row renders.
+fn ei_at_row(s: &App, row: usize) -> usize {
+    if s.searching {
+        row
+    } else {
+        s.visible.get(row).copied().unwrap_or(row)
+    }
+}
+
+/// Shift-click / Shift-arrow: select the row range from the anchor to here.
+fn range_select(s: &mut App, ei: usize) {
+    s.menu = None;
+    let anchor = s.anchor.or(s.focused).unwrap_or(ei);
+    if let (Some(a), Some(b)) = (row_of(s, anchor), row_of(s, ei)) {
+        let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
+        s.selected = (lo..=hi).map(|r| ei_at_row(s, r)).collect();
+    } else {
+        s.selected = vec![ei];
+    }
     s.focused = Some(ei);
     s.notice.clear();
-    let size = entry_by_index(s, ei).size_label();
-    s.selection_detail = if size.is_empty() {
-        "1 item selected".into()
+    update_selection_detail(s);
+}
+
+/// A click with the live modifier state: plain, toggle (Cmd/Ctrl) or range (Shift).
+fn click_select(s: &mut App, ei: usize, mods: rune::Mods) {
+    if mods.shift {
+        range_select(s, ei);
+    } else if mods.cmd || mods.ctrl {
+        toggle_select(s, ei);
     } else {
-        format!("1 item selected  {size}")
-    };
+        select_entry(s, ei);
+    }
+}
+
+/// Ctrl+A: every row on screen.
+fn select_all(s: &mut App) {
+    s.selected = (0..display_len(s)).map(|r| ei_at_row(s, r)).collect();
+    s.focused = s.selected.last().copied();
+    s.anchor = s.selected.first().copied();
+    update_selection_detail(s);
+}
+
+fn clear_selection(s: &mut App) {
+    s.selected.clear();
+    s.focused = None;
+    s.anchor = None;
+    s.selection_detail.clear();
+}
+
+/// The display row the focus sits on, defaulting to the first.
+fn focus_row(s: &App) -> usize {
+    s.focused.and_then(|ei| row_of(s, ei)).unwrap_or(0)
+}
+
+/// The element key a row is drawn under, per view, for scroll-into-view.
+fn row_key(s: &App, row: usize) -> String {
+    match s.mode {
+        Mode::List => format!("list-{row}"),
+        Mode::Grid | Mode::Tiles => format!("tile-{row}"),
+        Mode::Details => format!("row-{row}"),
+    }
+}
+
+/// Arrow-key navigation: move to a row, selecting plainly, extending with Shift,
+/// or moving the focus alone with Ctrl/Cmd; then flash and reveal the row.
+fn move_focus(s: &mut App, target: usize, mods: rune::Mods, tx: &mut Tx) {
+    let len = display_len(s);
+    if len == 0 {
+        return;
+    }
+    let row = target.min(len - 1);
+    let ei = ei_at_row(s, row);
+    if mods.shift {
+        range_select(s, ei);
+    } else if mods.cmd || mods.ctrl {
+        s.focused = Some(ei);
+    } else {
+        select_entry(s, ei);
+    }
+    s.reveal = Some(ei);
+    s.reveal_at = Some(std::time::Instant::now());
+    tx.scroll_into_view(row_key(s, row));
 }
 
 // ---------------------------------------------------------- file operations ----
 
 fn selected_paths(s: &App) -> Vec<PathBuf> {
-    let Some(i) = s.selected else { return Vec::new() };
-    let valid = if s.searching { i < s.search_hits.len() } else { i < s.entries.len() };
-    if !valid {
-        return Vec::new();
-    }
-    vec![PathBuf::from(&entry_by_index(s, i).path)]
+    let len = if s.searching { s.search_hits.len() } else { s.entries.len() };
+    s.selected
+        .iter()
+        .filter(|&&i| i < len)
+        .map(|&i| PathBuf::from(&entry_by_index(s, i).path))
+        .collect()
 }
 
 /// Whether an item is on the clipboard as a cut, so the list can ghost it. A
@@ -3966,12 +4187,30 @@ fn entry_by_index(s: &App, ei: usize) -> &crate::Entry {
     }
 }
 
+/// The name as shown: the extension is dropped for files when the toggle is off.
+/// Folders and dotfiles (`.gitignore`) keep their whole name.
+fn display_name(s: &App, e: &crate::Entry) -> String {
+    if !s.show_extensions && !e.is_dir {
+        if let Some(pos) = e.name.rfind('.') {
+            if pos > 0 {
+                return e.name[..pos].to_string();
+            }
+        }
+    }
+    e.name.clone()
+}
+
 /// The entry name as text, with the matched characters highlighted while searching.
 fn name_text(s: &App, e: &crate::Entry, ei: usize, font: TextStyle, color: Color, p: Paint) -> El {
-    let t = text(e.name.as_str()).font(font).color(color);
+    let name = display_name(s, e);
+    let t = text(name.as_str()).font(font).color(color);
     if s.searching {
         if let Some(hit) = s.search_hits.get(ei) {
-            let spans = highlight_spans(&e.name, &hit.indices, p.accent.alpha(0.35));
+            // Match offsets index the full name; the shown name is a prefix of it
+            // when the extension is hidden, so keep only offsets still in view.
+            let shown = name.chars().count();
+            let indices: Vec<u32> = hit.indices.iter().copied().filter(|&i| (i as usize) < shown).collect();
+            let spans = highlight_spans(&name, &indices, p.accent.alpha(0.35));
             if !spans.is_empty() {
                 return t.spans(spans);
             }
@@ -4017,6 +4256,7 @@ fn start_search(s: &mut App, query: String) {
         query: query.clone(),
         recursive: true,
         show_hidden: s.show_hidden,
+        show_protected: s.show_protected,
     };
     s.search_rx = Some(rx);
     s.search_cancel = Some(cancel);
@@ -4089,9 +4329,7 @@ fn clear_search(s: &mut App) {
     s.search_hits.clear();
     s.search_query.clear();
     s.search_busy = false;
-    s.selected = None;
-    s.focused = None;
-    s.selection_detail.clear();
+    clear_selection(s);
 }
 
 // ----------------------------------------------------------- auto-update ----
@@ -4306,7 +4544,7 @@ fn begin_delete(s: &mut App, permanent: bool) {
 }
 
 fn begin_rename(s: &mut App) {
-    let Some(e) = s.selected.and_then(|i| s.entries.get(i)) else { return };
+    let Some(e) = s.selected.first().and_then(|&i| s.entries.get(i)) else { return };
     let mut edit = TextEdit::default();
     edit.text = e.name.clone();
     s.menu = None;
@@ -4405,9 +4643,7 @@ fn drain_op(s: &mut App) -> bool {
         s.op_rx = None;
         s.op_cancel = None;
         s.transfer = None;
-        s.selected = None;
-        s.focused = None;
-        s.selection_detail.clear();
+        clear_selection(s);
         if s.view == View::Files {
             let root = s.root.clone();
             set_location(s, root);
@@ -4419,7 +4655,7 @@ fn drain_op(s: &mut App) -> bool {
 
 /// Open the selected item: a folder navigates, a file launches its default app.
 fn open_selected(s: &mut App) {
-    let Some(i) = s.selected else { return };
+    let Some(i) = s.focused.or_else(|| s.selected.first().copied()) else { return };
     let valid = if s.searching { i < s.search_hits.len() } else { i < s.entries.len() };
     if !valid {
         return;
@@ -4436,7 +4672,7 @@ fn open_selected(s: &mut App) {
 
 /// Global shortcuts. Returns true when the key was handled. Editing keys are
 /// left to a focused field or an open dialog.
-fn handle_key(s: &mut App, ev: &KeyEvent, _tx: &mut Tx) -> bool {
+fn handle_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
     if ev.key == Key::Escape {
         if s.dialog.is_some() {
             s.dialog = None;
@@ -4463,6 +4699,10 @@ fn handle_key(s: &mut App, ev: &KeyEvent, _tx: &mut Tx) -> bool {
         begin_paste(s);
         return true;
     }
+    if ev.is_command('a') {
+        select_all(s);
+        return true;
+    }
     match ev.key {
         Key::Delete => {
             begin_delete(s, ev.mods.shift);
@@ -4480,13 +4720,29 @@ fn handle_key(s: &mut App, ev: &KeyEvent, _tx: &mut Tx) -> bool {
             go_up(s);
             true
         }
+        Key::Up | Key::Left => {
+            move_focus(s, focus_row(s).saturating_sub(1), ev.mods, tx);
+            true
+        }
+        Key::Down | Key::Right => {
+            move_focus(s, focus_row(s) + 1, ev.mods, tx);
+            true
+        }
+        Key::Home => {
+            move_focus(s, 0, ev.mods, tx);
+            true
+        }
+        Key::End => {
+            move_focus(s, display_len(s).saturating_sub(1), ev.mods, tx);
+            true
+        }
         _ => false,
     }
 }
 
 fn file_row(s: &App, i: usize, p: Paint) -> El {
     let (ei, e) = display_entry(s, i);
-    let selected = s.selected == Some(ei);
+    let selected = is_selected(s, ei);
     let focused = s.focused == Some(ei);
     let mut line = row()
         .key(format!("row-{i}"))
@@ -4496,7 +4752,9 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
         .fill(if selected { p.row_sel } else { Color::TRANSPARENT })
         .hover(p.hover)
         .opacity(if is_cut(s, &e.path) { 0.4 } else { 1.0 });
-    if focused && selected {
+    if s.reveal == Some(ei) {
+        line = line.border(2.0, p.accent);
+    } else if focused && selected {
         line = line.border(p.hair, p.focus_line);
     }
     let line = line
@@ -4543,15 +4801,17 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
             ),
         )
         .child(el().grow(1.0));
-    line.on_press(move |s: &mut App| {
-        select_entry(s, ei);
+    line.on_press_tx(move |s: &mut App, tx: &mut Tx| {
+        click_select(s, ei, tx.mods());
     })
     .on_double_press(move |s: &mut App| {
         select_entry(s, ei);
         open_selected(s);
     })
     .on_secondary_press(move |s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
-        select_entry(s, ei);
+        if !is_selected(s, ei) {
+            select_entry(s, ei);
+        }
         s.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
     })
 }
@@ -4638,7 +4898,7 @@ fn details_rows(s: &App, p: Paint) -> El {
 
 fn grid_tile(s: &App, i: usize, p: Paint) -> El {
     let (ei, e) = display_entry(s, i);
-    let selected = s.selected == Some(ei);
+    let selected = is_selected(s, ei);
     let preview = if e.fixture && e.kind == Kind::Image {
         let at = ["095523", "103957", "104522", "111606", "111619"]
             .iter()
@@ -4672,15 +4932,17 @@ fn grid_tile(s: &App, i: usize, p: Paint) -> El {
     if selected {
         tile = tile.border(p.hair, p.focus_line);
     }
-    tile.on_press(move |s: &mut App| {
-        select_entry(s, ei);
+    tile.on_press_tx(move |s: &mut App, tx: &mut Tx| {
+        click_select(s, ei, tx.mods());
     })
     .on_double_press(move |s: &mut App| {
         select_entry(s, ei);
         open_selected(s);
     })
     .on_secondary_press(move |s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
-        select_entry(s, ei);
+        if !is_selected(s, ei) {
+            select_entry(s, ei);
+        }
         s.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
     })
 }
@@ -4700,7 +4962,7 @@ fn grid_rows(s: &App, p: Paint) -> El {
 /// List view: a compact small-icon + name flow, denser under Compact view.
 fn list_item(s: &App, i: usize, p: Paint) -> El {
     let (ei, e) = display_entry(s, i);
-    let selected = s.selected == Some(ei);
+    let selected = is_selected(s, ei);
     let mut item = row()
         .key(format!("list-{i}"))
         .w(230.0)
@@ -4722,15 +4984,17 @@ fn list_item(s: &App, i: usize, p: Paint) -> El {
     if selected {
         item = item.border(p.hair, p.focus_line);
     }
-    item.on_press(move |s: &mut App| {
-        select_entry(s, ei);
+    item.on_press_tx(move |s: &mut App, tx: &mut Tx| {
+        click_select(s, ei, tx.mods());
     })
     .on_double_press(move |s: &mut App| {
         select_entry(s, ei);
         open_selected(s);
     })
     .on_secondary_press(move |s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
-        select_entry(s, ei);
+        if !is_selected(s, ei) {
+            select_entry(s, ei);
+        }
         s.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
     })
 }
@@ -4750,7 +5014,7 @@ fn list_rows(s: &App, p: Paint) -> El {
 /// Tiles view: a medium icon with the name and a type/size subtitle.
 fn tile_item(s: &App, i: usize, p: Paint) -> El {
     let (ei, e) = display_entry(s, i);
-    let selected = s.selected == Some(ei);
+    let selected = is_selected(s, ei);
     let subtitle = if e.is_dir {
         e.type_label.clone()
     } else {
@@ -4783,15 +5047,17 @@ fn tile_item(s: &App, i: usize, p: Paint) -> El {
     if selected {
         tile = tile.border(p.hair, p.focus_line);
     }
-    tile.on_press(move |s: &mut App| {
-        select_entry(s, ei);
+    tile.on_press_tx(move |s: &mut App, tx: &mut Tx| {
+        click_select(s, ei, tx.mods());
     })
     .on_double_press(move |s: &mut App| {
         select_entry(s, ei);
         open_selected(s);
     })
     .on_secondary_press(move |s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
-        select_entry(s, ei);
+        if !is_selected(s, ei) {
+            select_entry(s, ei);
+        }
         s.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
     })
 }
@@ -5005,7 +5271,7 @@ fn home_content(s: &App, p: Paint) -> El {
 }
 
 fn this_pc_content(s: &App, p: Paint) -> El {
-    let selected = s.selected == Some(0);
+    let selected = is_selected(s, 0);
     let drive = row()
         .w(250.0)
         .h(64.0)
@@ -5104,7 +5370,7 @@ fn preview_pane(s: &App, p: Paint) -> El {
                     ),
             )
     } else {
-        let e = s.selected.and_then(|i| s.entries.get(i)).or_else(|| s.entries.first());
+        let e = s.selected.first().and_then(|&i| s.entries.get(i)).or_else(|| s.entries.first());
         let name = e.map(|x| x.name.as_str()).unwrap_or("");
         let thumb = match e {
             Some(entry) if previewable(entry) => {
@@ -5468,7 +5734,7 @@ fn main() {
             ("deletedlg", |s| {
                 s.view = View::Files;
                 s.mode = Mode::Details;
-                s.selected = Some(0);
+                s.selected = vec![0];
                 let paths = selected_paths(s);
                 s.dialog = Some(Dialog::Delete { permanent: false, paths });
             }),

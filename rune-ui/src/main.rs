@@ -485,6 +485,9 @@ struct App {
     /// Favorite paths (Home's Favorites tab) and pinned folder paths (the rail).
     favorites: Vec<String>,
     pinned: Vec<String>,
+    /// Files opened in Lyre, most recent first, rebuilt into `entries` on the
+    /// Home view so the rows behave like any other list.
+    recent: Vec<String>,
     /// Context-menu item ids the person turned off in the customize dialog.
     menu_hidden: Vec<String>,
     /// Default-off shell verbs the person turned on in the customize dialog.
@@ -786,6 +789,9 @@ fn load_prefs(s: &mut App) {
     if let Some(f) = prefs.get::<Vec<String>>("favorites") {
         s.favorites = f;
     }
+    if let Some(r) = prefs.get::<Vec<String>>("recent") {
+        s.recent = r;
+    }
     if let Some(p) = prefs.get::<Vec<String>>("pinned") {
         s.pinned = p;
     }
@@ -835,6 +841,7 @@ fn persist(s: &App) {
     );
     let _ = prefs.set("settings", &settings);
     let _ = prefs.set("favorites", &s.favorites);
+    let _ = prefs.set("recent", &s.recent);
     let _ = prefs.set("pinned", &s.pinned);
     let _ = prefs.set("menu_hidden", &s.menu_hidden);
     let _ = prefs.set("menu_shown", &s.menu_shown);
@@ -850,7 +857,7 @@ fn persist(s: &App) {
 /// A cheap fingerprint of everything persisted, so poll saves only on change.
 fn prefs_signature(s: &App) -> String {
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{:?}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{:?}|{}",
         s.sort,
         s.sort_desc,
         s.preview,
@@ -862,6 +869,7 @@ fn prefs_signature(s: &App) -> String {
         s.show_hidden,
         s.dark,
         s.favorites,
+        s.recent,
         s.pinned,
         s.menu_hidden,
         s.menu_shown,
@@ -889,6 +897,56 @@ fn toggle_favorite(s: &mut App, path: &str) {
     } else if !path.is_empty() {
         s.favorites.push(path.to_string());
     }
+}
+
+/// Remember a file the user opened, most recent first, capped so the list
+/// cannot grow without bound.
+fn record_recent(s: &mut App, path: &str) {
+    if path.is_empty() {
+        return;
+    }
+    s.recent.retain(|p| p != path);
+    s.recent.insert(0, path.to_string());
+    s.recent.truncate(50);
+}
+
+/// Rebuild the Recent rows from the remembered paths, dropping any that have
+/// since disappeared.
+fn refresh_recent(s: &mut App) {
+    let mut entries = Vec::new();
+    for path in s.recent.clone() {
+        let Ok(meta) = fs::metadata(&path) else { continue };
+        if meta.is_dir() {
+            continue;
+        }
+        let name = Path::new(&path)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.clone());
+        let kind = classify(&name, false);
+        let modified_at = meta.modified().ok();
+        let modified = modified_at
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| format_time(d.as_secs()))
+            .unwrap_or_default();
+        entries.push(Entry {
+            name,
+            path,
+            is_dir: false,
+            size: meta.len(),
+            modified,
+            modified_at,
+            type_label: kind_label(kind).to_string(),
+            kind,
+            hidden: false,
+            system: false,
+            fixture: false,
+            fixture_size: String::new(),
+        });
+    }
+    s.count = entries.len();
+    s.entries = entries;
+    s.visible = (0..s.entries.len()).collect();
 }
 
 fn toggle_pin(s: &mut App, path: &str) {
@@ -1205,24 +1263,9 @@ fn load(s: &mut App, f: Fixture) {
             s.crumbs = vec!["Home".into()];
             s.search = "Search Home".into();
             s.nav = 0;
-            s.count = 8;
+            s.count = 0;
             s.selection_detail.clear();
-            s.entries = vec![
-                make_entry(
-                    "cairn-export-20261101.tar",
-                    "11/6/2026  9:45 AM",
-                    "Downloads",
-                    "",
-                    Kind::Archive,
-                ),
-                make_entry(
-                    "HonorWorkStation 5.5.1.54(C233HONORSP5)_Client Softw...",
-                    "11/5/2026 10:12 PM",
-                    "Downloads",
-                    "",
-                    Kind::Archive,
-                ),
-            ];
+            refresh_recent(s);
         }
         Fixture::Downloads => {
             s.view = View::Files;
@@ -1474,6 +1517,7 @@ fn init() -> App {
         nav_open: true,
         menu: None,
         favorites: Vec::new(),
+        recent: Vec::new(),
         pinned: Vec::new(),
         menu_hidden: Vec::new(),
         menu_shown: Vec::new(),
@@ -4973,11 +5017,30 @@ fn open_selected(s: &mut App) {
     let e = entry_by_index(s, i);
     let path = e.path.clone();
     let is_dir = e.is_dir;
+    open_path(s, &path, is_dir);
+}
+
+/// Open one path: a folder navigates, a file opens with its default app. A
+/// file is remembered in Home's Recent list.
+fn open_path(s: &mut App, path: &str, is_dir: bool) {
     if is_dir {
-        go(s, PathBuf::from(&path));
-    } else if let Err(err) = shell::open_default(&path) {
-        s.notice = err;
+        go(s, PathBuf::from(path));
+    } else {
+        record_recent(s, path);
+        if let Err(err) = shell::open_default(path) {
+            s.notice = err;
+        }
     }
+}
+
+/// Open a Home Recent row, which is always a file.
+fn open_recent(s: &mut App, i: usize) {
+    let Some(e) = s.entries.get(i) else { return };
+    let path = e.path.clone();
+    let is_dir = e.is_dir;
+    open_path(s, &path, is_dir);
+    // The opened file moves to the front of the list.
+    refresh_recent(s);
 }
 
 /// Global shortcuts. Returns true when the key was handled. Editing keys are
@@ -5480,46 +5543,68 @@ fn home_content(s: &App, p: Paint) -> El {
     if recent_on {
         table = table.child(column_header(
             p,
-            &[("Name", 440.0), ("Date accessed", 240.0), ("Activity", 160.0)],
+            &[("Name", 440.0), ("Date modified", 240.0), ("Activity", 160.0)],
             false,
             false,
         ));
+        if s.entries.is_empty() {
+            table = table.child(
+                col()
+                    .w_full()
+                    .h(110.0)
+                    .center()
+                    .child(ico(p, Ico::Clock, 28.0, p.disabled))
+                    .child(text("No recent files yet").font(CAPTION).color(p.tertiary)),
+            );
+        }
         for &ei in s.visible.iter() {
             let e = &s.entries[ei];
-            table = table.child(
-                row()
-                    .w_full()
-                    .h(46.0)
-                    .items_center()
-                    .hover(p.hover)
-                    .child(
-                        row()
-                            .w(440.0)
-                            .pl(16.0)
-                            .gap(10.0)
-                            .items_center()
-                            .child(entry_icon(s, e, p, 24.0))
-                            .child(
-                                col()
-                                    .gap(1.0)
-                                    .child(
-                                        text(e.name.as_str())
-                                            .font(ROW_TEXT)
-                                            .color(p.text)
-                                            .truncate(),
-                                    )
-                                    .child(text(e.type_label.as_str()).font(CAPTION).color(p.tertiary)),
-                            ),
-                    )
-                    .child(
-                        col()
-                            .w(240.0)
-                            .pl(12.0)
-                            .child(text(e.modified.as_str()).font(ROW_TEXT).color(p.secondary)),
-                    )
-                    .child(col().w(160.0))
-                    .on_press(move |st: &mut App| select_entry(st, ei)),
-            );
+            let selected = is_selected(s, ei);
+            let mut row = row()
+                .w_full()
+                .h(46.0)
+                .items_center()
+                .fill(if selected { p.row_sel } else { Color::TRANSPARENT })
+                .hover(p.hover)
+                .child(
+                    row()
+                        .w(440.0)
+                        .pl(16.0)
+                        .gap(10.0)
+                        .items_center()
+                        .child(entry_icon(s, e, p, 24.0))
+                        .child(
+                            col()
+                                .gap(1.0)
+                                .child(
+                                    text(e.name.as_str())
+                                        .font(ROW_TEXT)
+                                        .color(p.text)
+                                        .truncate(),
+                                )
+                                .child(text(e.type_label.as_str()).font(CAPTION).color(p.tertiary)),
+                        ),
+                )
+                .child(
+                    col()
+                        .w(240.0)
+                        .pl(12.0)
+                        .child(text(e.modified.as_str()).font(ROW_TEXT).color(p.secondary)),
+                )
+                .child(col().w(160.0));
+            row = row
+                .on_press_tx(move |st: &mut App, tx: &mut Tx| click_select(st, ei, tx.mods()))
+                .on_double_press(move |st: &mut App| {
+                    select_entry(st, ei);
+                    open_recent(st, ei);
+                })
+                .on_secondary_press(move |st: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
+                    if !is_selected(st, ei) {
+                        select_entry(st, ei);
+                    }
+                    st.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
+                });
+            table = table.child(row);
         }
     } else if s.favorites.is_empty() {
         table = table.child(

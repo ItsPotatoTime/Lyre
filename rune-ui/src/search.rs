@@ -297,7 +297,8 @@ fn walk<F: FnMut(Event) -> bool>(
 fn describe(name: String, path: PathBuf, is_dir: bool) -> Option<crate::Entry> {
     let meta = fs::metadata(&path).ok()?;
     let size = if is_dir { 0 } else { meta.len() };
-    let modified = meta.modified().ok()
+    let modified_at = meta.modified().ok();
+    let modified = modified_at
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| crate::format_time(d.as_secs()))
         .unwrap_or_default();
@@ -320,6 +321,7 @@ fn describe(name: String, path: PathBuf, is_dir: bool) -> Option<crate::Entry> {
         is_dir,
         size,
         modified,
+        modified_at,
         type_label: crate::kind_label(kind).to_string(),
         kind,
         hidden,
@@ -341,6 +343,7 @@ mod tests {
             is_dir,
             size: 0,
             modified: String::new(),
+            modified_at: None,
             type_label: crate::kind_label(kind).into(),
             kind,
             hidden: name.starts_with('.'),

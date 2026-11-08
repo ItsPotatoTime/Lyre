@@ -278,6 +278,8 @@ struct Entry {
     is_dir: bool,
     size: u64,
     modified: String,
+    /// The raw modified time, for sorting and grouping a photo library.
+    modified_at: Option<std::time::SystemTime>,
     type_label: String,
     kind: Kind,
     /// The hidden attribute (a dotfile on Unix); `system` marks protected OS
@@ -294,6 +296,8 @@ enum View {
     Home,
     Files,
     ThisPc,
+    /// The Pictures library as a date-grouped photo grid.
+    Gallery,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -611,9 +615,8 @@ fn scan(path: &Path) -> (Vec<Entry>, f64) {
             let name = item.file_name().to_string_lossy().into_owned();
             let Ok(meta) = item.metadata() else { continue };
             let is_dir = meta.is_dir();
-            let modified = meta
-                .modified()
-                .ok()
+            let modified_at = meta.modified().ok();
+            let modified = modified_at
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map(|d| format_time(d.as_secs()))
                 .unwrap_or_default();
@@ -636,6 +639,7 @@ fn scan(path: &Path) -> (Vec<Entry>, f64) {
                 is_dir,
                 size: if is_dir { 0 } else { meta.len() },
                 modified,
+                modified_at,
                 type_label: kind_label(kind).to_string(),
                 kind,
                 hidden,
@@ -672,6 +676,7 @@ fn make_entry(name: &str, modified: &str, type_label: &str, size: &str, kind: Ki
         is_dir: kind == Kind::Folder,
         size: 0,
         modified: modified.to_string(),
+        modified_at: None,
         type_label: type_label.to_string(),
         kind,
         hidden: false,
@@ -1160,6 +1165,7 @@ fn navigate(s: &mut App, index: usize) {
             refresh_volumes(s);
         }
         10 => s.notice = "Network browsing is not implemented in this slice".into(),
+        1 => go_gallery(s),
         i => {
             s.nav = i;
             match place_path(i) {
@@ -5686,6 +5692,200 @@ fn this_pc_content(s: &App, p: Paint) -> El {
     list
 }
 
+/// The month a photo belongs to, for the Gallery's group headers.
+fn month_label(at: Option<std::time::SystemTime>) -> String {
+    const MONTHS: [&str; 12] = [
+        "January", "February", "March", "April", "May", "June", "July", "August", "September",
+        "October", "November", "December",
+    ];
+    let Some(at) = at else { return "Unknown date".to_string() };
+    let Ok(secs) = at.duration_since(UNIX_EPOCH) else { return "Unknown date".to_string() };
+    let (y, m, _) = civil_from_days((secs.as_secs() / 86_400) as i64);
+    format!("{} {}", MONTHS[(m - 1).clamp(0, 11) as usize], y)
+}
+
+/// Walk a folder for images, newest first, bounded so a large library cannot
+/// stall the view. Dot-folders are skipped.
+fn sweep_images(root: &Path, limit: usize, max_depth: usize) -> Vec<Entry> {
+    let mut out = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > max_depth || out.len() >= limit {
+            continue;
+        }
+        let Ok(reader) = fs::read_dir(&dir) else { continue };
+        for item in reader.flatten() {
+            if out.len() >= limit {
+                break;
+            }
+            let name = item.file_name().to_string_lossy().into_owned();
+            let Ok(meta) = item.metadata() else { continue };
+            if meta.is_dir() {
+                if !name.starts_with('.') {
+                    stack.push((item.path(), depth + 1));
+                }
+            } else {
+                let kind = classify(&name, false);
+                if kind != Kind::Image {
+                    continue;
+                }
+                let modified_at = meta.modified().ok();
+                let modified = modified_at
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| format_time(d.as_secs()))
+                    .unwrap_or_default();
+                out.push(Entry {
+                    name,
+                    path: item.path().to_string_lossy().into_owned(),
+                    is_dir: false,
+                    size: meta.len(),
+                    modified,
+                    modified_at,
+                    type_label: kind_label(kind).to_string(),
+                    kind,
+                    hidden: false,
+                    system: false,
+                    fixture: false,
+                    fixture_size: String::new(),
+                });
+            }
+        }
+    }
+    out.sort_by(|a, b| b.modified_at.cmp(&a.modified_at));
+    out
+}
+
+/// Re-read the Pictures library into the Gallery's entries.
+fn refresh_gallery(s: &mut App) {
+    let Some(home) = home_dir() else { return };
+    s.entries = sweep_images(&home.join("Pictures"), 4000, 8);
+    s.visible = (0..s.entries.len()).collect();
+    s.count = s.entries.len();
+    s.count_override = Some(s.count);
+    s.groups.clear();
+}
+
+/// Open the Gallery: the Pictures library as a photo grid. A re-click is a
+/// no-op, as with the other places.
+fn go_gallery(s: &mut App) {
+    s.menu = None;
+    if s.view == View::Gallery {
+        return;
+    }
+    let Some(home) = home_dir() else {
+        s.notice = "Pictures is not available here".into();
+        return;
+    };
+    let pictures = home.join("Pictures");
+    if !pictures.is_dir() {
+        s.notice = "Pictures is not available here".into();
+        return;
+    }
+    s.history.push(s.root.clone());
+    s.forward.clear();
+    s.root = pictures;
+    s.view = View::Gallery;
+    s.tab = "Gallery".into();
+    s.crumbs = vec!["Gallery".into()];
+    s.search = "Search Gallery".into();
+    s.nav = 1;
+    s.preview = true;
+    s.contextual = true;
+    s.groups.clear();
+    clear_selection(s);
+    s.notice.clear();
+    s.search_edit.text.clear();
+    s.keep_order = false;
+    s.count_override = None;
+    refresh_gallery(s);
+}
+
+/// One photo in the Gallery grid.
+fn gallery_cell(s: &App, i: usize, p: Paint) -> El {
+    let (ei, e) = display_entry(s, i);
+    let selected = is_selected(s, ei);
+    marquee_track(
+        col()
+            .key(format!("gcell-{i}"))
+            .w(148.0)
+            .radius(4.0)
+            .fill(if selected { p.row_sel } else { Color::TRANSPARENT })
+            .hover(p.hover)
+            .px(4.0)
+            .py(4.0)
+            .gap(4.0)
+            .items_center()
+            .child(thumb_rect(s, e, p, 140.0, 100.0, 160))
+            .child(
+                text(e.name.as_str())
+                    .font(CAPTION)
+                    .color(p.text)
+                    .w_full()
+                    .align(Align::Center)
+                    .max_lines(2),
+            )
+            .on_press_tx(move |s: &mut App, tx: &mut Tx| click_select(s, ei, tx.mods()))
+            .on_double_press(move |s: &mut App| {
+                select_entry(s, ei);
+                open_selected(s);
+            })
+            .on_secondary_press(move |s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
+                if !is_selected(s, ei) {
+                    select_entry(s, ei);
+                }
+                s.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
+            }),
+        i,
+    )
+}
+
+/// The Gallery: the Pictures library as a date-grouped photo grid.
+fn gallery_content(s: &App, p: Paint) -> El {
+    let mut out = col()
+        .key("gallery")
+        .grow(1.0)
+        .min_h(0.0)
+        .w_full()
+        .fill(p.content)
+        .pb(16.0);
+    let len = display_len(s);
+    if len == 0 {
+        out = out.child(
+            col()
+                .w_full()
+                .h(160.0)
+                .center()
+                .child(ico(p, Ico::Pictures, 30.0, p.disabled))
+                .child(text("No pictures found").font(CAPTION).color(p.tertiary)),
+        );
+    }
+    let mut month = String::new();
+    let mut cells: Vec<El> = Vec::new();
+    for i in 0..len {
+        let this = month_label(display_entry(s, i).1.modified_at);
+        if this != month {
+            if !cells.is_empty() {
+                out = out.child(
+                    row().w_full().flex_wrap().gap(4.0).px(16.0).children(cells.drain(..)),
+                );
+            }
+            out = out.child(
+                text(this.as_str())
+                    .font(TILE_TEXT)
+                    .color(p.text)
+                    .px(16.0)
+                    .pt(14.0),
+            );
+            month = this;
+        }
+        cells.push(gallery_cell(s, i, p));
+    }
+    if !cells.is_empty() {
+        out = out.child(row().w_full().flex_wrap().gap(4.0).px(16.0).pt(4.0).children(cells));
+    }
+    scrollable(s, p, out.on_drag(|s: &mut App, d: &mut rune::Drag, tx: &mut Tx| marquee_drag(s, d, tx)))
+}
+
 fn preview_pane(s: &App, p: Paint) -> El {
     let inner = if s.view == View::ThisPc {
         let title = s
@@ -5766,7 +5966,14 @@ fn preview_pane(s: &App, p: Paint) -> El {
                 .child(entry_icon(s, entry, p, 64.0)),
             None => col().w_full().h(210.0).fill(p.thumb_bg),
         };
-        let location = s.crumbs.join(" / ");
+        // A Gallery photo belongs to its own folder, not to the Gallery.
+        let location = if s.view == View::Gallery {
+            e.and_then(|x| Path::new(&x.path).parent())
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        } else {
+            s.crumbs.join(" / ")
+        };
         let mut details = col()
             .w_full()
             .px(24.0)
@@ -5883,6 +6090,7 @@ fn content(s: &App, p: Paint) -> El {
         match s.view {
             View::Home => home_content(s, p),
             View::ThisPc => this_pc_content(s, p),
+            View::Gallery => gallery_content(s, p),
             View::Files => files_list(s, p),
         }
     };

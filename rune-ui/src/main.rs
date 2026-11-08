@@ -34,6 +34,7 @@ mod imagery;
 mod search;
 mod shell;
 mod updates;
+mod volumes;
 
 // Metrics and colours sampled from the four reference captures. The chrome is
 // three distinct bands, not one surface: a near-black tab strip, a Mica-tinted
@@ -201,7 +202,6 @@ fn paint(dark: bool, scale: f32) -> Paint {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     Folder,
-    Drive,
     Image,
     Video,
     Audio,
@@ -244,7 +244,6 @@ fn classify(name: &str, is_dir: bool) -> Kind {
 fn kind_label(k: Kind) -> &'static str {
     match k {
         Kind::Folder => "File folder",
-        Kind::Drive => "Local Disk",
         Kind::Image => "PNG File",
         Kind::Video => "Video",
         Kind::Audio => "Audio",
@@ -365,6 +364,7 @@ enum CtxScope {
     Place,
     Favorite,
     Pinned,
+    Volume,
 }
 
 /// The one open menu: a command-bar flyout or a right-click context menu.
@@ -558,17 +558,26 @@ struct App {
     /// Each marquee-able item's drawn rect in window points, recorded by its
     /// `on_layout`. The index is the visible row, matching `visible`.
     marquee_rects: RefCell<Vec<[f32; 4]>>,
+    /// This PC's volumes, and which card is selected. Refreshed on entry and
+    /// every few seconds, so a stick plugged in appears on its own.
+    volumes: Vec<volumes::Volume>,
+    volumes_selected: Option<usize>,
+    volumes_at: Instant,
 }
 
-fn format_size(n: u64) -> String {
+pub(crate) fn format_size(n: u64) -> String {
     if n < 1024 {
         format!("{n} bytes")
     } else if n < 1024 * 1024 {
         format!("{:.0} KB", n as f64 / 1024.0)
     } else if n < 1024 * 1024 * 1024 {
         format!("{:.1} MB", n as f64 / (1024.0 * 1024.0))
-    } else {
+    } else if n < 1024 * 1024 * 1024 * 1024 {
         format!("{:.2} GB", n as f64 / (1024.0 * 1024.0 * 1024.0))
+    } else if n < 1024 * 1024 * 1024 * 1024 * 1024 {
+        format!("{:.2} TB", n as f64 / (1024.0 * 1024.0 * 1024.0 * 1024.0))
+    } else {
+        format!("{:.2} PB", n as f64 / (1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0))
     }
 }
 
@@ -1058,6 +1067,11 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
         }
         tx.wake_after(std::time::Duration::from_millis(16));
     }
+    // This PC notices a stick plugged in while the window is open.
+    if s.view == View::ThisPc && s.volumes_at.elapsed() >= std::time::Duration::from_secs(3) {
+        refresh_volumes(s);
+        changed = true;
+    }
     if s.search_edit.text != s.search_query {
         let q = s.search_edit.text.clone();
         if q.trim().is_empty() {
@@ -1141,7 +1155,10 @@ fn navigate(s: &mut App, index: usize) {
     s.menu = None;
     match index {
         0 => load(s, Fixture::Home),
-        9 => load(s, Fixture::ThisPc),
+        9 => {
+            load(s, Fixture::ThisPc);
+            refresh_volumes(s);
+        }
         10 => s.notice = "Network browsing is not implemented in this slice".into(),
         i => {
             s.nav = i;
@@ -1151,6 +1168,19 @@ fn navigate(s: &mut App, index: usize) {
                 None => s.notice = "This place is not available here".into(),
             }
         }
+    }
+}
+
+/// Read the attached volumes again, keeping the selected card when it is still
+/// there so a refresh does not drop the selection.
+fn refresh_volumes(s: &mut App) {
+    let selected = s.volumes_selected.and_then(|i| s.volumes.get(i)).map(|v| v.path.clone());
+    s.volumes = volumes::enumerate();
+    s.volumes_at = Instant::now();
+    s.volumes_selected = selected.and_then(|path| s.volumes.iter().position(|v| v.path == path));
+    if s.view == View::ThisPc {
+        s.count = s.volumes.len();
+        s.count_override = Some(s.volumes.len());
     }
 }
 
@@ -1375,13 +1405,7 @@ fn load(s: &mut App, f: Fixture) {
             s.nav = 9;
             s.count = 1;
             s.selection_detail.clear();
-            s.entries = vec![make_entry(
-                "Local Disk (C:)",
-                "",
-                "Local Disk",
-                "",
-                Kind::Drive,
-            )];
+            s.entries.clear();
         }
     }
     let authored_count = s.count;
@@ -1497,6 +1521,9 @@ fn init() -> App {
         scroll_off: Live::new(0.0),
         viewport_rect: Live::new([0.0; 4]),
         marquee_rects: RefCell::new(Vec::new()),
+        volumes: Vec::new(),
+        volumes_selected: None,
+        volumes_at: Instant::now(),
     };
     load_prefs(&mut app);
     refresh_visible(&mut app);
@@ -1568,6 +1595,7 @@ enum Ico {
     Tiles,
     Check,
     Open,
+    Eject,
 }
 
 fn ico(p: Paint, which: Ico, size: f32, ink: Color) -> El {
@@ -1902,6 +1930,9 @@ fn ico(p: Paint, which: Ico, size: f32, ink: Color) -> El {
         )
         .line([12.0, 15.0], [12.0, 4.0], W, LineCap::Round, ink)
         .stroke(vec![[8.0, 8.0], [12.0, 4.0], [16.0, 8.0]], W, ink),
+        Ico::Eject => Shape::new()
+            .fill(vec![[12.0, 4.5], [19.5, 15.0], [4.5, 15.0]], ink)
+            .line([6.0, 19.0], [18.0, 19.0], W, LineCap::Round, ink),
     };
     let _ = p;
     canvas(sh.view_box(24.0, 24.0)).size(size, size)
@@ -3515,6 +3546,44 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                         }),
                     );
                     h += MENU_ROW_H;
+                }
+                CtxScope::Volume => {
+                    if let Some(volume) = s.volumes.get(target).cloned() {
+                        rows.push(
+                            menu_item(p, "Open", Some(Ico::Open), None, false).on_press({
+                                let path = volume.path.clone();
+                                move |s: &mut App| {
+                                    go(s, path.clone());
+                                    s.menu = None;
+                                }
+                            }),
+                        );
+                        h += MENU_ROW_H;
+                        let copy = volume.path.to_string_lossy().into_owned();
+                        rows.push(
+                            menu_item(p, "Copy path", None, None, false).on_press_tx(
+                                move |s: &mut App, tx: &mut Tx| {
+                                    tx.copy(copy.clone());
+                                    s.notice = "Path copied to clipboard".into();
+                                    s.menu = None;
+                                },
+                            ),
+                        );
+                        h += MENU_ROW_H;
+                        if volume.is_ejectable() {
+                            let title = volume.title();
+                            let path = volume.path.clone();
+                            rows.push(
+                                menu_item(p, "Eject", Some(Ico::Eject), None, false).on_press(
+                                    move |s: &mut App| match volumes::eject(&path) {
+                                        Ok(()) => s.notice = format!("{title} ejected"),
+                                        Err(e) => s.notice = e,
+                                    },
+                                ),
+                            );
+                            h += MENU_ROW_H;
+                        }
+                    }
                 }
             }
         }
@@ -5524,43 +5593,7 @@ fn home_content(s: &App, p: Paint) -> El {
 }
 
 fn this_pc_content(s: &App, p: Paint) -> El {
-    let selected = is_selected(s, 0);
-    let drive = row()
-        .w(250.0)
-        .h(64.0)
-        .radius(4.0)
-        .px(8.0)
-        .gap(10.0)
-        .items_center()
-        .fill(if selected { p.row_sel } else { Color::TRANSPARENT })
-        .hover(p.hover)
-        .child(drive_glyph(p, 40.0))
-        .child(
-            col()
-                .grow(1.0)
-                .min_w(0.0)
-                .gap(4.0)
-                .child(text("Local Disk (C:)").font(ROW_TEXT).color(p.text))
-                .child(
-                    el().w_full()
-                        .h(10.0)
-                        .radius(2.0)
-                        .fill(c("#e6e6e6"))
-                        .child(el().w_frac(0.145).h_full().radius(2.0).fill(c("#0070cb"))),
-                )
-                .child(
-                    text("1.55 TB free of 1.81 TB")
-                        .font(CAPTION)
-                        .color(p.tertiary),
-                ),
-        )
-        .on_press(|s: &mut App| select_entry(s, 0))
-        .on_double_press(|s: &mut App| {
-            if let Some(path) = std::env::var_os("SystemDrive").map(|d| PathBuf::from(format!("{}\\", d.to_string_lossy()))) {
-                go(s, path);
-            }
-        });
-    col()
+    let mut list = col()
         .key("thispc")
         .grow(1.0)
         .min_h(0.0)
@@ -5576,12 +5609,90 @@ fn this_pc_content(s: &App, p: Paint) -> El {
                 .items_center()
                 .child(ico(p, Ico::ChevronDown, 10.0, p.secondary))
                 .child(text("Devices and drives").font(TILE_TEXT).color(p.text)),
-        )
-        .child(drive)
+        );
+    if s.volumes.is_empty() {
+        return list.child(
+            col()
+                .w_full()
+                .h(120.0)
+                .center()
+                .child(ico(p, Ico::Info, 28.0, p.disabled))
+                .child(text("No devices found").font(CAPTION).color(p.tertiary)),
+        );
+    }
+    for (vi, volume) in s.volumes.iter().enumerate() {
+        let selected = s.volumes_selected == Some(vi);
+        let title = volume.title();
+        let space = volume.space_label();
+        let used = volume.used_fraction();
+        let ejectable = volume.is_ejectable();
+        let mut card = row()
+            .w(300.0)
+            .h(64.0)
+            .radius(4.0)
+            .px(8.0)
+            .gap(10.0)
+            .items_center()
+            .fill(if selected { p.row_sel } else { Color::TRANSPARENT })
+            .hover(p.hover)
+            .child(drive_glyph(p, 40.0))
+            .child(
+                col()
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .gap(4.0)
+                    .child(text(title.as_str()).font(ROW_TEXT).color(p.text))
+                    .child(
+                        el().w_full()
+                            .h(10.0)
+                            .radius(2.0)
+                            .fill(c("#e6e6e6"))
+                            .child(el().w_frac(used).h_full().radius(2.0).fill(c("#0070cb"))),
+                    )
+                    .child(text(space.as_str()).font(CAPTION).color(p.tertiary)),
+            );
+        if ejectable {
+            card = card.child(
+                el().key(format!("eject-{vi}"))
+                    .size(28.0, 28.0)
+                    .radius(4.0)
+                    .hover(p.hover)
+                    .center()
+                    .help("Eject")
+                    .child(ico(p, Ico::Eject, 14.0, p.secondary))
+                    .on_press({
+                        let path = volume.path.clone();
+                        let title = title.clone();
+                        move |s: &mut App| match volumes::eject(&path) {
+                            Ok(()) => {
+                                s.notice = format!("{title} ejected");
+                                refresh_volumes(s);
+                            }
+                            Err(e) => s.notice = e,
+                        }
+                    }),
+            );
+        }
+        let open = volume.path.clone();
+        card = card
+            .on_press(move |s: &mut App| s.volumes_selected = Some(vi))
+            .on_double_press(move |s: &mut App| go(s, open.clone()))
+            .on_secondary_press(move |s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
+                s.volumes_selected = Some(vi);
+                s.menu = Some(Menu::Context { scope: CtxScope::Volume, target: vi, x: at.x, y: at.y });
+            });
+        list = list.child(card);
+    }
+    list
 }
 
 fn preview_pane(s: &App, p: Paint) -> El {
     let inner = if s.view == View::ThisPc {
+        let title = s
+            .volumes_selected
+            .and_then(|i| s.volumes.get(i))
+            .map(|v| v.title())
+            .unwrap_or_else(|| "This PC".to_string());
         col()
             .grow(1.0)
             .min_h(0.0)
@@ -5601,7 +5712,7 @@ fn preview_pane(s: &App, p: Paint) -> El {
                     .px(24.0)
                     .pt(20.0)
                     .gap(16.0)
-                    .child(text("This PC (1 item)").font(TILE_TEXT).color(p.text))
+                    .child(text(title.as_str()).font(TILE_TEXT).color(p.text))
                     .child(
                         row()
                             .w_full()
@@ -5613,7 +5724,7 @@ fn preview_pane(s: &App, p: Paint) -> El {
                             .items_center()
                             .child(ico(p, Ico::Info, 16.0, p.secondary))
                             .child(
-                                text("Select a single file to get more information and share your cloud content.")
+                                text("Select a device to see its free space, or eject a removable one.")
                                     .font(CAPTION)
                                     .color(p.secondary)
                                     .grow(1.0)
@@ -5956,7 +6067,7 @@ fn main() {
             ("home", |s| load(s, Fixture::Home)),
             ("downloads", |s| load(s, Fixture::Downloads)),
             ("pictures", |s| load(s, Fixture::Screenshots)),
-            ("thispc", |s| load(s, Fixture::ThisPc)),
+            ("thispc", |s| navigate(s, 9)),
             ("list", |s| {
                 load(s, Fixture::Downloads);
                 s.mode = Mode::List;

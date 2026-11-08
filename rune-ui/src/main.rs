@@ -54,6 +54,8 @@ const NAME_W: f32 = 260.0;
 const DATE_W: f32 = 140.0;
 const TYPE_W: f32 = 120.0;
 const SIZE_W: f32 = 80.0;
+/// The column-divider grab zone: a hairline centred in a wider drag target.
+const COL_SEP_W: f32 = 6.0;
 const MENU_W: f32 = 248.0;
 /// The More and context menus carry longer labels ("Stop opening folders with
 /// Lyre", shell verbs) than the command-bar flyouts, so they get extra room.
@@ -416,6 +418,17 @@ enum Dialog {
     Update,
 }
 
+/// A rubber-band selection in the rows' content coordinates. `base` is the
+/// selection kept when the drag adds to it with Ctrl/Cmd held.
+#[derive(Clone)]
+struct Marquee {
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+    base: Vec<usize>,
+}
+
 struct App {
     dark: bool,
     view: View,
@@ -438,6 +451,11 @@ struct App {
     /// A row briefly flashed after keyboard navigation, and when it was lit.
     reveal: Option<usize>,
     reveal_at: Option<std::time::Instant>,
+    /// The rubber-band selection drag, in the rows' own content coordinates.
+    marquee: Option<Marquee>,
+    /// Details column widths (Name, Date, Type, Size) and the nav rail width.
+    col_w: [f32; 4],
+    rail_w: f32,
     nav: usize,
     count: usize,
     selection_detail: String,
@@ -770,6 +788,12 @@ fn load_prefs(s: &mut App) {
     if let Some(v) = prefs.get::<bool>("show_extensions") {
         s.show_extensions = v;
     }
+    if let Some(w) = prefs.get::<[f32; 4]>("col_w") {
+        s.col_w = w;
+    }
+    if let Some(w) = prefs.get::<f32>("rail_w") {
+        s.rail_w = w.clamp(120.0, 400.0);
+    }
 }
 
 /// Write the whole view state and collections; poll calls this once per change.
@@ -797,12 +821,14 @@ fn persist(s: &App) {
     let _ = prefs.set("prompt_default_manager", &s.prompt_default_manager);
     let _ = prefs.set("show_protected", &s.show_protected);
     let _ = prefs.set("show_extensions", &s.show_extensions);
+    let _ = prefs.set("col_w", &s.col_w);
+    let _ = prefs.set("rail_w", &s.rail_w);
 }
 
 /// A cheap fingerprint of everything persisted, so poll saves only on change.
 fn prefs_signature(s: &App) -> String {
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{:?}|{}",
         s.sort,
         s.sort_desc,
         s.preview,
@@ -821,7 +847,9 @@ fn prefs_signature(s: &App) -> String {
         s.update_check_startup,
         s.prompt_default_manager,
         s.show_protected,
-        s.show_extensions
+        s.show_extensions,
+        s.col_w,
+        s.rail_w
     )
 }
 
@@ -1369,6 +1397,9 @@ fn init() -> App {
         anchor: None,
         reveal: None,
         reveal_at: None,
+        marquee: None,
+        col_w: [NAME_W, DATE_W, TYPE_W, SIZE_W],
+        rail_w: RAIL_W,
         nav: 9,
         count,
         selection_detail: String::new(),
@@ -3920,7 +3951,7 @@ fn pinned_item(s: &App, p: Paint, pi: usize, path: &str) -> El {
 fn nav_rail(s: &App, p: Paint) -> El {
     let mut rail = col()
         .key("rail")
-        .w(RAIL_W)
+        .w(s.rail_w)
         .h_full()
         .fill(p.content)
         .px(4.0)
@@ -3949,10 +3980,23 @@ fn nav_rail(s: &App, p: Paint) -> El {
             rail = rail.child(pinned_item(s, p, pi, path));
         }
     }
-    rail.child(el().w_full().h(p.hair).fill(p.soft_line).my(5.0).key("rail-sep-2"))
+    let rail = rail.child(el().w_full().h(p.hair).fill(p.soft_line).my(5.0).key("rail-sep-2"))
         .child(rail_item(s, p, 9, "This PC", true, false))
         .child(rail_item(s, p, 10, "Network", true, false))
-        .child(el().grow(1.0))
+        .child(el().grow(1.0));
+    row().key("rail-wrap")
+        .h_full()
+        .child(rail)
+        .child(
+            el().w(4.0)
+                .h_full()
+                .hover(p.hover)
+                .on_drag(|s: &mut App, d: &mut rune::Drag, _tx: &mut Tx| match d.phase {
+                    Phase::Down => d.data = s.rail_w,
+                    Phase::Move => s.rail_w = (d.data + d.dx).clamp(120.0, 400.0),
+                    _ => {}
+                }),
+        )
 }
 
 fn column_header(p: Paint, cols: &[(&str, f32)], right_last: bool, separators: bool) -> El {
@@ -3973,6 +4017,36 @@ fn column_header(p: Paint, cols: &[(&str, f32)], right_last: bool, separators: b
                     t
                 }),
         );
+    }
+    h.child(el().grow(1.0))
+}
+
+/// The Details column header with drag-resizable dividers. Each divider widens
+/// the column to its left; the widths persist in `col_w`.
+fn details_header(s: &App, p: Paint) -> El {
+    let labels = ["Name", "Date modified", "Type", "Size"];
+    let mut h = row().key("header").w_full().h(HEADER_H).items_center();
+    for (i, label) in labels.iter().enumerate() {
+        if i > 0 {
+            let idx = i - 1;
+            h = h.child(
+                el().w(COL_SEP_W)
+                    .h_full()
+                    .center()
+                    .child(el().w(p.hair).h(16.0).fill(p.line))
+                    .on_drag(move |s: &mut App, d: &mut rune::Drag, _tx: &mut Tx| match d.phase {
+                        Phase::Down => d.data = s.col_w[idx],
+                        Phase::Move => s.col_w[idx] = (d.data + d.dx).clamp(60.0, 600.0),
+                        _ => {}
+                    }),
+            );
+        }
+        let t = text(*label).font(CAPTION).color(p.secondary);
+        h = h.child(col().w(s.col_w[i]).pl(12.0).pr(8.0).child(if i == 3 {
+            t.w_full().align(Align::End)
+        } else {
+            t
+        }));
     }
     h.child(el().grow(1.0))
 }
@@ -4136,6 +4210,66 @@ fn move_focus(s: &mut App, target: usize, mods: rune::Mods, tx: &mut Tx) {
     s.reveal = Some(ei);
     s.reveal_at = Some(std::time::Instant::now());
     tx.scroll_into_view(row_key(s, row));
+}
+
+/// Drive the rubber-band selection from a drag on empty list space. In the
+/// linear views rows are full-width bands, so the band selects by vertical
+/// overlap; a press that lands on a row is left to the row.
+fn marquee_drag(s: &mut App, d: &mut rune::Drag, tx: &mut Tx) {
+    let rh = row_h(s);
+    let content_h = display_len(s) as f32 * rh;
+    match d.phase {
+        Phase::Down => {
+            if d.y < content_h {
+                return;
+            }
+            let additive = tx.mods().cmd || tx.mods().ctrl;
+            let base = if additive { s.selected.clone() } else { Vec::new() };
+            if !additive {
+                clear_selection(s);
+            }
+            s.marquee = Some(Marquee { x0: d.x, y0: d.y, x1: d.x, y1: d.y, base });
+        }
+        Phase::Move => {
+            if let Some(m) = s.marquee.as_mut() {
+                m.x1 = d.x;
+                m.y1 = d.y;
+            }
+            let Some(m) = s.marquee.as_ref() else { return };
+            let lo = m.y0.min(m.y1);
+            let hi = m.y0.max(m.y1);
+            let mut sel = m.base.clone();
+            let first = (lo / rh).floor().max(0.0) as usize;
+            let last = ((hi / rh).floor() as usize).min(display_len(s).saturating_sub(1));
+            for row in first..=last {
+                let ei = ei_at_row(s, row);
+                if !sel.contains(&ei) {
+                    sel.push(ei);
+                }
+            }
+            s.selected = sel;
+            update_selection_detail(s);
+        }
+        Phase::Up => {
+            s.marquee = None;
+        }
+    }
+}
+
+/// The blue rubber-band rectangle. The drag is recorded in content coordinates;
+/// subtract the scroll offset to place it in the list area's own coordinates.
+fn marquee_overlay(s: &App, p: Paint) -> El {
+    let Some(m) = &s.marquee else { return el().key("marquee-none") };
+    let x = m.x0.min(m.x1);
+    let y = m.y0.min(m.y1) - s.scroll_off.get();
+    let w = (m.x0 - m.x1).abs().max(1.0);
+    let h = (m.y0 - m.y1).abs().max(1.0);
+    el().key("marquee")
+        .absolute(x, y)
+        .w(w)
+        .h(h)
+        .fill(p.accent.alpha(0.18))
+        .border(1.0, p.accent.alpha(0.9))
 }
 
 // ---------------------------------------------------------- file operations ----
@@ -4760,7 +4894,7 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
     let line = line
         .child(
             row()
-                .w(NAME_W)
+                .w(s.col_w[0])
                 .pl(12.0)
                 .pr(8.0)
                 .gap(8.0)
@@ -4773,16 +4907,16 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
                         .truncate(),
                 ),
         )
-        .child(el().w(p.hair).h(16.0).fill(p.soft_line))
+        .child(el().w(COL_SEP_W).h(16.0).center().child(el().w(p.hair).h(16.0).fill(p.soft_line)))
         .child(
             col()
-                .w(DATE_W)
+                .w(s.col_w[1])
                 .pl(12.0)
                 .child(text(e.modified.as_str()).font(ROW_TEXT).color(p.secondary)),
         )
-        .child(el().w(p.hair).h(16.0).fill(p.soft_line))
+        .child(el().w(COL_SEP_W).h(16.0).center().child(el().w(p.hair).h(16.0).fill(p.soft_line)))
         .child(
-            col().w(TYPE_W).pl(12.0).pr(8.0).child(
+            col().w(s.col_w[2]).pl(12.0).pr(8.0).child(
                 text(e.type_label.as_str())
                     .font(ROW_TEXT)
                     .color(p.secondary)
@@ -4790,9 +4924,9 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
                     .truncate(),
             ),
         )
-        .child(el().w(p.hair).h(16.0).fill(p.soft_line))
+        .child(el().w(COL_SEP_W).h(16.0).center().child(el().w(p.hair).h(16.0).fill(p.soft_line)))
         .child(
-            col().w(SIZE_W).pl(8.0).pr(12.0).child(
+            col().w(s.col_w[3]).pl(8.0).pr(12.0).child(
                 text(e.size_label())
                     .font(ROW_TEXT)
                     .color(p.secondary)
@@ -4819,7 +4953,7 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
 /// Wrap list content in a scroll viewport plus a drawn scrollbar gutter. The
 /// viewport reports its offset into Live bindings each frame; the window-level
 /// thumb follows without a view re-run, and the gutter reserves its lane.
-fn scrollable(s: &App, content: El) -> El {
+fn scrollable(s: &App, p: Paint, content: El) -> El {
     let track = s.scroll_track.clone();
     let thumb = s.scroll_thumb.clone();
     let vis = s.scroll_vis.clone();
@@ -4869,6 +5003,7 @@ fn scrollable(s: &App, content: El) -> El {
                     tx.scroll_to_instant("viewport", 0.0, off);
                 }),
         )
+        .child(marquee_overlay(s, p))
 }
 
 fn details_rows(s: &App, p: Paint) -> El {
@@ -4892,8 +5027,9 @@ fn details_rows(s: &App, p: Paint) -> El {
                 |s: &App, i| Cow::Borrowed(display_entry(s, i).1.path.as_str()),
                 move |s: &App, i| file_row(s, i, p),
             )
+            .on_drag(|s: &mut App, d: &mut rune::Drag, tx: &mut Tx| marquee_drag(s, d, tx))
     };
-    scrollable(s, list)
+    scrollable(s, p, list)
 }
 
 fn grid_tile(s: &App, i: usize, p: Paint) -> El {
@@ -4956,7 +5092,7 @@ fn grid_rows(s: &App, p: Paint) -> El {
         .px(16.0)
         .gap(8.0)
         .children((0..display_len(s)).map(|i| grid_tile(s, i, p)));
-    scrollable(s, tiles)
+    scrollable(s, p, tiles)
 }
 
 /// List view: a compact small-icon + name flow, denser under Compact view.
@@ -5008,7 +5144,7 @@ fn list_rows(s: &App, p: Paint) -> El {
         .px(12.0)
         .gap(2.0)
         .children((0..display_len(s)).map(|i| list_item(s, i, p)));
-    scrollable(s, items)
+    scrollable(s, p, items)
 }
 
 /// Tiles view: a medium icon with the name and a type/size subtitle.
@@ -5071,7 +5207,7 @@ fn tiles_rows(s: &App, p: Paint) -> El {
         .px(16.0)
         .gap(8.0)
         .children((0..display_len(s)).map(|i| tile_item(s, i, p)));
-    scrollable(s, tiles)
+    scrollable(s, p, tiles)
 }
 
 fn quick_tile(p: Paint, label: &str, mark: Ico, top: &str, bottom: &str, back: &str, nav: usize) -> El {
@@ -5498,17 +5634,7 @@ fn files_list(s: &App, p: Paint) -> El {
             s.menu = Some(Menu::Context { scope: CtxScope::Background, target: 0, x: at.x, y: at.y });
         })
         .child(if s.mode == Mode::Details {
-            column_header(
-                p,
-                &[
-                    ("Name", NAME_W),
-                    ("Date modified", DATE_W),
-                    ("Type", TYPE_W),
-                    ("Size", SIZE_W),
-                ],
-                true,
-                true,
-            )
+            details_header(s, p)
         } else {
             el().w_full().h(p.hair)
         })
@@ -5800,6 +5926,13 @@ fn main() {
                     signature: String::new(),
                 });
                 s.dialog = Some(Dialog::Update);
+            }),
+            ("marquee", |s| {
+                load(s, Fixture::Downloads);
+                s.mode = Mode::Details;
+                s.groups.clear();
+                s.selected = s.visible.iter().take(4).copied().collect();
+                s.marquee = Some(Marquee { x0: 16.0, y0: 6.0, x1: 420.0, y1: 118.0, base: Vec::new() });
             }),
         ],
         poll: Some(poll),

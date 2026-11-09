@@ -1366,6 +1366,24 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
     if s.icons_pending.get() > 0 {
         tx.wake_after(std::time::Duration::from_millis(16));
     }
+    // Shift flips a held drag between move and copy even while the pointer
+    // rests, as the old app's key listeners did.
+    if s.drag.is_some() {
+        let shift = tx.mods().shift;
+        let (paths, target) = {
+            let dr = s.drag.as_ref().unwrap();
+            (dr.paths.clone(), dr.target.clone())
+        };
+        let mode = drop_mode(s, &paths, target.as_ref(), shift);
+        if let Some(dr) = &mut s.drag {
+            if dr.shift != shift || dr.mode != mode {
+                dr.shift = shift;
+                dr.mode = mode;
+                changed = true;
+            }
+        }
+        tx.wake_after(std::time::Duration::from_millis(16));
+    }
     sync_watch(s);
     changed |= drain_watch(s);
     changed |= drain_osdrop(s, tx);
@@ -7303,7 +7321,7 @@ fn status_bar(s: &App, p: Paint) -> El {
             0.0
         };
         let readout = if t.total_bytes > 0 {
-            format!("{}%", (frac * 100.0) as u32)
+            format!("{}% ({} of {})", (frac * 100.0) as u32, t.done.min(t.total), t.total)
         } else {
             format!("{} of {}", t.done.min(t.total), t.total)
         };

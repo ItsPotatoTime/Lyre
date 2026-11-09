@@ -78,7 +78,12 @@ fn item_size(path: &Path) -> u64 {
     }
 }
 
-fn copy_item(src: &Path, dst: &Path, cancel: &AtomicBool) -> Result<(), String> {
+fn copy_item(
+    src: &Path,
+    dst: &Path,
+    cancel: &AtomicBool,
+    report: &mut dyn FnMut(u64),
+) -> Result<(), String> {
     if cancel.load(Ordering::Relaxed) {
         return Err("Cancelled".into());
     }
@@ -89,14 +94,15 @@ fn copy_item(src: &Path, dst: &Path, cancel: &AtomicBool) -> Result<(), String> 
         for entry in entries.flatten() {
             let from = entry.path();
             let to = dst.join(entry.file_name());
-            copy_item(&from, &to, cancel)?;
+            copy_item(&from, &to, cancel, report)?;
         }
         Ok(())
     } else {
         if let Some(parent) = dst.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        fs::copy(src, dst).map_err(|e| format!("{}: {e}", src.display()))?;
+        let copied = fs::copy(src, dst).map_err(|e| format!("{}: {e}", src.display()))?;
+        report(copied);
         Ok(())
     }
 }
@@ -110,12 +116,17 @@ fn remove_item(path: &Path) -> Result<(), String> {
     }
 }
 
-fn move_item(src: &Path, dst: &Path, cancel: &AtomicBool) -> Result<(), String> {
+fn move_item(
+    src: &Path,
+    dst: &Path,
+    cancel: &AtomicBool,
+    report: &mut dyn FnMut(u64),
+) -> Result<(), String> {
     // A rename is instant on the same volume; across volumes fall back to copy.
     if fs::rename(src, dst).is_ok() {
         return Ok(());
     }
-    copy_item(src, dst, cancel)?;
+    copy_item(src, dst, cancel, report)?;
     remove_item(src)
 }
 
@@ -131,7 +142,14 @@ pub fn paste<F: FnMut(Progress) -> bool>(
     let total = sources.len();
     let total_bytes: u64 = sources.iter().map(|p| item_size(p)).sum();
     let mut done_bytes = 0u64;
+    let mut completed = 0u64;
     let mut pasted = 0usize;
+    // Bytes land inside the recursive copy, so a folder of ten thousand files
+    // climbs smoothly instead of jumping from 0 to 100 at the end. Throttled
+    // by time and by a sixteenth of the total so the channel never floods.
+    let mut last_emit = std::time::Instant::now();
+    let mut last_bytes = 0u64;
+    let step = (total_bytes / 16).max(1);
     for (i, src) in sources.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             break;
@@ -151,11 +169,25 @@ pub fn paste<F: FnMut(Progress) -> bool>(
         if src.is_dir() && dst.starts_with(src) {
             return Err("Cannot paste a folder into itself.".into());
         }
-        match mode {
-            Mode::Copy => copy_item(src, &dst, cancel)?,
-            Mode::Cut => move_item(src, &dst, cancel)?,
+        {
+            let mut report = |add: u64| {
+                done_bytes += add;
+                if last_emit.elapsed() >= std::time::Duration::from_millis(60)
+                    || done_bytes - last_bytes >= step
+                {
+                    last_emit = std::time::Instant::now();
+                    last_bytes = done_bytes;
+                    emit(Progress { done: i, total, name: name.clone(), done_bytes, total_bytes });
+                }
+            };
+            match mode {
+                Mode::Copy => copy_item(src, &dst, cancel, &mut report)?,
+                Mode::Cut => move_item(src, &dst, cancel, &mut report)?,
+            }
         }
-        done_bytes += item_size(src);
+        // A rename moves bytes without copying them; credit them at the end.
+        completed += item_size(src);
+        done_bytes = done_bytes.max(completed);
         pasted += 1;
         emit(Progress { done: i + 1, total, name, done_bytes, total_bytes });
     }
@@ -306,9 +338,10 @@ fn trash_one(path: &Path) -> Result<(), String> {
     );
 
     let cancel = AtomicBool::new(false);
-    move_item(path, &target, &cancel).map_err(|e| format!("Could not move to the trash: {e}"))?;
+    move_item(path, &target, &cancel, &mut |_| {})
+        .map_err(|e| format!("Could not move to the trash: {e}"))?;
     if let Err(e) = fs::write(&info_path, body) {
-        let _ = move_item(&target, path, &cancel);
+        let _ = move_item(&target, path, &cancel, &mut |_| {});
         return Err(format!("Could not record the deletion: {e}"));
     }
     Ok(())
@@ -368,6 +401,41 @@ mod tests {
 
     fn noop(_: Progress) -> bool {
         true
+    }
+
+    /// A folder copy must report bytes while it runs, not only at the end:
+    /// the status bar's percentage climbs through the transfer.
+    #[test]
+    fn folder_copy_reports_bytes_while_it_runs() {
+        let base = scratch("progress");
+        let src = base.join("src");
+        fs::create_dir_all(&src).unwrap();
+        for i in 0..32 {
+            fs::write(src.join(format!("f{i:02}.bin")), vec![7u8; 4096]).unwrap();
+        }
+        let dest = base.join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut seen = Vec::new();
+        paste(
+            Mode::Copy,
+            Conflict::Rename,
+            &[src],
+            &dest,
+            &cancel,
+            |p| {
+                seen.push((p.done_bytes, p.total_bytes));
+                true
+            },
+        )
+        .unwrap();
+        let total = 32 * 4096;
+        assert!(
+            seen.iter().any(|&(d, t)| t == total && d > 0 && d < total),
+            "progress must climb inside the folder: {seen:?}"
+        );
+        assert_eq!(seen.last().unwrap().0, total);
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

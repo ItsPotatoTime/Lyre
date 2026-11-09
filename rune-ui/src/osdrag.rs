@@ -198,7 +198,7 @@ pub mod win {
     }
 
     #[repr(C)]
-    struct FileDescriptor {
+    pub struct FileDescriptor {
         flags: u32,
         _clsid: [u8; 16],
         _sizel: [i32; 2],
@@ -347,6 +347,9 @@ pub mod win {
     ) -> i32 {
         unsafe {
             *effect = if accepts(data, (*this).descriptor) { DROPEFFECT_COPY } else { 0 };
+            if std::env::var_os("LYRE_TRACE").is_some() {
+                eprintln!("[drop] DragEnter effect={}", *effect);
+            }
         }
         S_OK
     }
@@ -371,8 +374,14 @@ pub mod win {
         unsafe {
             let paths = collect(data, (*this).descriptor, (*this).contents);
             *effect = if paths.is_empty() { 0 } else { DROPEFFECT_COPY };
+            if std::env::var_os("LYRE_TRACE").is_some() {
+                eprintln!("[drop] Drop pt=({},{}) paths={} first={:?}", pt.x, pt.y, paths.len(), paths.first());
+            }
             if !paths.is_empty() {
                 let staged = stage(&paths);
+                if std::env::var_os("LYRE_TRACE").is_some() {
+                    eprintln!("[drop] staged={} first={:?}", staged.len(), staged.first());
+                }
                 let _ = (*this).tx.send(OsDrop { paths: staged, at: (pt.x as f32, pt.y as f32) });
             }
         }
@@ -418,6 +427,32 @@ pub mod win {
         }
     }
 
+    /// Member names out of a `FILEGROUP_DESCRIPTORW` global. The descriptor
+    /// array starts at offset 8: the DWORD count is followed by padding to
+    /// the FILE_DESCRIPTORW's eight-byte alignment.
+    pub fn descriptor_names(bytes: &[u8]) -> Vec<String> {
+        if bytes.len() < 8 {
+            return Vec::new();
+        }
+        let count = u32::from_ne_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let mut out = Vec::new();
+        let stride = std::mem::size_of::<FileDescriptor>();
+        for i in 0..count.min(super::MAX_STAGED_ITEMS) {
+            let at = 8 + i * stride;
+            if at + stride > bytes.len() {
+                break;
+            }
+            let d: &FileDescriptor = unsafe { &*(bytes.as_ptr().add(at) as *const FileDescriptor) };
+            let units: Vec<u16> = d.name.iter().take_while(|&&u| u != 0).copied().collect();
+            if let Ok(name) = String::from_utf16(&units)
+                && !name.is_empty()
+            {
+                out.push(name);
+            }
+        }
+        out
+    }
+
     /// Every path or virtual member the source offers, extracted in full.
     unsafe fn collect(data: *mut c_void, descriptor: u16, contents: u16) -> Vec<PathBuf> {
         unsafe {
@@ -443,17 +478,14 @@ pub mod win {
                 ReleaseStgMedium(&mut { group });
                 return Vec::new();
             }
-            let count = *(ptr as *const u32) as usize;
-            let descriptors = (ptr as *const u8).add(4) as *const FileDescriptor;
+            let count_bytes = GlobalSize(group.data);
+            let names = descriptor_names(std::slice::from_raw_parts(ptr as *const u8, count_bytes));
             let root = std::env::temp_dir().join(format!(
                 "lyre-virtual-{}",
                 super::NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
             ));
             let mut out = Vec::new();
-            for i in 0..count.min(super::MAX_STAGED_ITEMS) {
-                let d = &*descriptors.add(i);
-                let units: Vec<u16> = d.name.iter().take_while(|&&u| u != 0).copied().collect();
-                let Ok(name) = String::from_utf16(&units) else { continue };
+            for (i, name) in names.iter().enumerate() {
                 let name = name.replace('/', "\\");
                 let dst = root.join(name.trim_start_matches('\\'));
                 let Some(stream_medium) = get_medium(data, contents, i as i32, TYMED_ISTREAM) else { continue };
@@ -516,8 +548,12 @@ pub mod win {
                 contents: format_name("FileContents"),
             });
             let ptr = Box::into_raw(target);
-            RevokeDragDrop(hwnd);
-            if RegisterDragDrop(hwnd, ptr.cast()) != S_OK {
+            let revoked = RevokeDragDrop(hwnd);
+            let registered = RegisterDragDrop(hwnd, ptr.cast());
+            if std::env::var_os("LYRE_TRACE").is_some() {
+                eprintln!("[drop] RevokeDragDrop={revoked:#x} RegisterDragDrop={registered:#x}");
+            }
+            if registered != S_OK {
                 drop(Box::from_raw(ptr));
             }
         }
@@ -679,8 +715,11 @@ pub mod win {
             hdrop.extend_from_slice(&0u16.to_ne_bytes());
         }
         hdrop.extend_from_slice(&0u16.to_ne_bytes());
-        std::thread::spawn(move || unsafe {
-            CoInitializeEx(std::ptr::null_mut(), 0x2);
+        // OLE's modal drag loop must run on the thread that owns the press and
+        // the foreground window: it captures the mouse there and pumps that
+        // thread's messages (so the window keeps painting). A worker thread
+        // cannot take the capture, and the drag dies at the window edge.
+        unsafe {
             let data = Box::into_raw(Box::new(Data {
                 refs: AtomicUsize::new(1),
                 vtable: &DATA_VTABLE.0,
@@ -691,10 +730,17 @@ pub mod win {
                 vtable: &SOURCE_VTABLE,
             }));
             let mut effect = 0u32;
-            DoDragDrop(data.cast(), source.cast(), DROPEFFECT_COPY | DROPEFFECT_MOVE, &mut effect);
+            let started = std::time::Instant::now();
+            let hr = DoDragDrop(data.cast(), source.cast(), DROPEFFECT_COPY | DROPEFFECT_MOVE, &mut effect);
+            if std::env::var_os("LYRE_TRACE").is_some() {
+                eprintln!(
+                    "[drag] DoDragDrop hr={hr:#x} effect={effect} after {} ms",
+                    started.elapsed().as_millis()
+                );
+            }
             d_release(data);
             src_release(source);
-        });
+        }
     }
 
     #[cfg(test)]
@@ -1305,6 +1351,19 @@ mod tests {
         let dir = std::env::current_dir().unwrap();
         let staged = stage(&[dir.clone()]);
         assert_eq!(staged, vec![dir]);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn filegroup_descriptor_names_start_after_the_alignment_padding() {
+        let stride = std::mem::size_of::<win::FileDescriptor>();
+        let mut bytes = vec![0u8; 8 + stride];
+        bytes[0..4].copy_from_slice(&1u32.to_ne_bytes());
+        let name_at = 8 + 72; // DWORD count, padding, then the fixed fields
+        for (i, u) in "sub\\deep.txt".encode_utf16().enumerate() {
+            bytes[name_at + i * 2..name_at + i * 2 + 2].copy_from_slice(&u.to_ne_bytes());
+        }
+        assert_eq!(win::descriptor_names(&bytes), vec!["sub\\deep.txt".to_string()]);
     }
 
     #[cfg(target_os = "windows")]

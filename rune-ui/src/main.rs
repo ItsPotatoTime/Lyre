@@ -472,20 +472,31 @@ fn drain_osdrop(s: &mut App, tx: &mut Tx) -> bool {
         };
         #[cfg(not(target_os = "windows"))]
         let at = m.at;
-        let paths = m.paths;
-        tx.element_at(at.0, at.1, move |s: &mut App, picked, _tx: &mut Tx| {
-            let (_, target) = picked
-                .map(|p| parse_drop_target(s, p.path()))
-                .unwrap_or_default();
-            let target = target.or_else(|| {
-                matches!(s.view, View::Files | View::Gallery).then_some(DropTarget::Background)
-            });
-            let Some(tp) = drop_target_path(s, target.as_ref()) else { return };
-            s.drop_staged.extend(paths.iter().cloned());
-            paste_into(s, paths.clone(), fileops::Mode::Copy, tp);
-        });
+        apply_osdrop(tx, at, m.paths);
     }
     any
+}
+
+/// One staged drop at a window point: hit-test, then copy into the target.
+fn apply_osdrop(tx: &mut Tx, at: (f32, f32), paths: Vec<PathBuf>) {
+    if std::env::var_os("LYRE_TRACE").is_some() {
+        eprintln!("[drop] apply at={at:?} paths={}", paths.len());
+    }
+    tx.element_at(at.0, at.1, move |s: &mut App, picked, _tx: &mut Tx| {
+        let picked_path = picked.as_ref().map(|p| p.path().to_string());
+        let (_, target) = picked
+            .map(|p| parse_drop_target(s, p.path()))
+            .unwrap_or_default();
+        let target = target.or_else(|| {
+            matches!(s.view, View::Files | View::Gallery).then_some(DropTarget::Background)
+        });
+        if std::env::var_os("LYRE_TRACE").is_some() {
+            eprintln!("[drop] pick path={picked_path:?} target={target:?}");
+        }
+        let Some(tp) = drop_target_path(s, target.as_ref()) else { return };
+        s.drop_staged.extend(paths.iter().cloned());
+        paste_into(s, paths.clone(), fileops::Mode::Copy, tp);
+    });
 }
 
 /// A drop the host delivered (Linux, macOS): the element that took it names
@@ -5955,6 +5966,9 @@ fn cut_selection(s: &mut App) {
 
 /// Spawn the worker for a paste, wiring progress into the status bar.
 fn start_paste(s: &mut App, mode: fileops::Mode, conflict: fileops::Conflict, sources: Vec<PathBuf>, target: PathBuf) {
+    if std::env::var_os("LYRE_TRACE").is_some() {
+        eprintln!("[paste] mode={mode:?} sources={sources:?} target={target:?}");
+    }
     use std::sync::atomic::Ordering;
     let total = sources.len();
     let label = if mode == fileops::Mode::Cut { "Moving" } else { "Copying" };

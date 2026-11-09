@@ -234,6 +234,21 @@ pub mod win {
     #[link(name = "user32")]
     unsafe extern "system" {
         fn RegisterClipboardFormatW(name: *const u16) -> u16;
+        fn ReleaseCapture() -> i32;
+        fn ScreenToClient(hwnd: isize, pt: *mut Point) -> i32;
+    }
+
+    /// OLE tracks the pointer itself; the UI thread must let go of the Win32
+    /// capture first, or the drag loop never sees a move and the drag dies.
+    pub fn release_capture() {
+        unsafe { ReleaseCapture() };
+    }
+
+    /// IDropTarget points are screen pixels; the hit test wants window points.
+    pub fn to_window(hwnd: isize, x: f32, y: f32, scale: f32) -> (f32, f32) {
+        let mut pt = Point { x: x as i32, y: y as i32 };
+        unsafe { ScreenToClient(hwnd, &mut pt) };
+        (pt.x as f32 / scale, pt.y as f32 / scale)
     }
 
     fn wide(text: &str) -> Vec<u16> {

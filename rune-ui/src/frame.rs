@@ -20,6 +20,17 @@ pub fn install(handle: &WindowHandle) {
     imp::install(handle);
 }
 
+/// The native window handle, for converting OS drag coordinates.
+#[cfg(target_os = "windows")]
+pub fn hwnd() -> Option<isize> {
+    imp::hwnd()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn hwnd() -> Option<isize> {
+    None
+}
+
 pub fn minimize() {
     imp::minimize();
 }
@@ -122,6 +133,10 @@ mod imp {
             }
             DefSubclassProc(hwnd, msg, wparam, lparam)
         }
+    }
+
+    pub fn hwnd() -> Option<isize> {
+        HWND.get().copied()
     }
 
     pub fn install(handle: &WindowHandle) {

@@ -464,6 +464,13 @@ fn drain_osdrop(s: &mut App, tx: &mut Tx) -> bool {
     }
     let any = !msgs.is_empty();
     for m in msgs {
+        // OLE hands over screen pixels; the hit test wants window points.
+        #[cfg(target_os = "windows")]
+        let at = match frame::hwnd() {
+            Some(hwnd) => osdrag::win::to_window(hwnd, m.at.0, m.at.1, s.scale.get()),
+            None => m.at,
+        };
+        #[cfg(not(target_os = "windows"))]
         let at = m.at;
         let paths = m.paths;
         tx.element_at(at.0, at.1, move |s: &mut App, picked, _tx: &mut Tx| {
@@ -666,6 +673,8 @@ struct App {
     /// The payload of our own macOS drag session, so a drop back onto this
     /// window keeps the move/copy rule instead of always copying.
     os_drag: Option<Vec<String>>,
+    /// The window scale, for turning OS drop pixels into window points.
+    scale: std::cell::Cell<f32>,
     thumb_cache: RefCell<HashMap<String, Image>>,
     /// Cut/copy clipboard, the running transfer, its worker channel and cancel.
     clipboard: Option<(Vec<PathBuf>, fileops::Mode)>,
@@ -1935,6 +1944,7 @@ fn init() -> App {
         osdrop_rx: Some(osdrop_rx),
         drop_staged: Vec::new(),
         os_drag: None,
+        scale: std::cell::Cell::new(1.0),
         thumb_cache: RefCell::new(HashMap::new()),
         clipboard: None,
         transfer: None,
@@ -3024,6 +3034,7 @@ fn place_glyph(index: usize, size: f32) -> El {
 
 fn view(s: &App, cx: &mut Cx<App>) -> El {
     let p = paint(s.dark, cx.env().scale);
+    s.scale.set(cx.env().scale);
     // The thumb is a window-level overlay driven by the Files viewport; when
     // that viewport is not mounted nothing refreshes it, so hide it here.
     if s.view != View::Files {
@@ -5474,6 +5485,9 @@ fn row_drag(s: &mut App, rect_i: usize, ei: usize, d: &mut rune::Drag, tx: &mut 
                     let paths: Vec<PathBuf> = dr.paths.iter().map(PathBuf::from).collect();
                     s.drag = None;
                     s.drag_press = None;
+                    // The UI thread owns the Win32 capture from the press; OLE
+                    // cannot take it from another thread, so let go first.
+                    osdrag::win::release_capture();
                     osdrag::win::start_drag_out(&paths);
                     return;
                 }

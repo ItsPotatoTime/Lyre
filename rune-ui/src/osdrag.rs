@@ -214,7 +214,7 @@ pub mod win {
 
     #[link(name = "ole32")]
     unsafe extern "system" {
-        fn CoInitializeEx(reserved: *mut c_void, concurrency: u32) -> i32;
+        fn OleInitialize(reserved: *mut c_void) -> i32;
         fn RegisterDragDrop(hwnd: isize, target: *mut c_void) -> i32;
         fn RevokeDragDrop(hwnd: isize) -> i32;
         fn DoDragDrop(
@@ -539,7 +539,13 @@ pub mod win {
     /// inside Drop rather than a frame later.
     pub fn register(hwnd: isize, tx: Sender<OsDrop>) {
         unsafe {
-            CoInitializeEx(std::ptr::null_mut(), 0x2);
+            // OLE drag and drop needs OleInitialize, not plain CoInitializeEx:
+            // without it DoDragDrop returns CO_E_NOT_SUPPORTED and a registered
+            // target is never consulted by the drag loop.
+            let ole = OleInitialize(std::ptr::null_mut());
+            if std::env::var_os("LYRE_TRACE").is_some() {
+                eprintln!("[drop] OleInitialize={ole:#x}");
+            }
             let target = Box::new(Target {
                 vtable: &TARGET_VTABLE,
                 refs: AtomicUsize::new(1),

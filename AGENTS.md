@@ -93,3 +93,12 @@ ALWAYS prefer MCP graph tools over grep/glob/file-search for code discovery.
 - Behavior changes require regression tests that fail before the fix and pass after it.
 - PowerShell can mangle quoting. Write Markdown/JSON with a file tool or literal single-quoted here-string before using `--body-file` or `gh api --input`.
 - **Cross-platform validation:** Before every git commit and git push, discover all available operating systems and test environments, including every installed WSL distribution, and run the project's applicable build and test checks in each applicable environment. When WSL is available, use it for Linux validation and do not run Linux builds or tests in Docker. Docker infrastructure distributions such as `docker-desktop` are not separate development environments to validate. Fix failures and rerun affected checks before proceeding. If any required environment cannot be tested, report the blocker and obtain explicit approval to proceed without that validation. Do not treat tests on the host OS or future CI runs as a substitute for testing other required operating systems.
+
+## 6. Lyre Project Rules
+
+- **Two apps in one repository:** `src/` + `src-tauri/` is the old Tauri app and the behaviour reference for the rewrite; `rune-ui/` is the native Rust rewrite (one binary on the Rune framework, no IPC). Build and test it with `cargo` inside `rune-ui/`. `docs/building.md` covers only the old app.
+- **rune-ui validation recipe:** `cargo test` on the Windows host and in every WSL development distribution (currently `Ubuntu-24.04`); in WSL set `CARGO_TARGET_DIR="$HOME/lyre-target-linux"` so Linux objects never mix with the shared `rune-ui/target`. Check rendering headlessly: `cargo run -- --snap out.png --scene <scene> --size 1076x600 --scale 1 --at 0.1` (capture early; a fully at-rest last frame can skip the readback). For a real folder use `LYRE_RUNE_PATH=<folder> --scene real`. Run clippy over changed code.
+- **Never kill or restart the user's open Lyre window.** Validate headlessly or in a separate instance.
+- **macOS cannot be tested in this environment.** Say so explicitly; never claim parity from Windows and Linux runs alone.
+- **Ask before improving:** When you spot an optimization, improvement or scope fork beyond the requested task, present it with its trade-off and wait for my choice before building it. I favour the stable, pragmatic option.
+- **Cross-platform parity:** Features must behave the same on Windows, macOS and Linux unless inherently platform-specific; a no-op fallback is not parity.

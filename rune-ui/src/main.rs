@@ -530,6 +530,10 @@ struct App {
     watch: Option<watch::Handle>,
     watch_path: Option<PathBuf>,
     watch_rx: Option<std::sync::mpsc::Receiver<watch::Refreshed>>,
+    /// Rescans of restored tab listings, which were snapshotted while another
+    /// tab was on screen and missed everything that happened since.
+    rescan_tx: std::sync::mpsc::Sender<watch::Refreshed>,
+    rescan_rx: std::sync::mpsc::Receiver<watch::Refreshed>,
     /// A refresh that arrived while an inline rename owned its row.
     pending_refresh: Option<watch::Refreshed>,
     thumb_cache: RefCell<HashMap<String, Image>>,
@@ -713,6 +717,7 @@ fn switch_tab(s: &mut App, index: usize) {
     restore_tab(s, &tab);
     s.menu = None;
     s.marquee = None;
+    rescan_restored(s);
 }
 
 /// Reset the showing tab's fields to a fresh Home, closing its history. The
@@ -765,6 +770,7 @@ fn close_tab_at(s: &mut App, index: usize) {
     let tab = s.tabs[s.active_tab].clone();
     restore_tab(s, &tab);
     s.menu = None;
+    rescan_restored(s);
 }
 
 pub(crate) fn format_size(n: u64) -> String {
@@ -1683,6 +1689,7 @@ fn init() -> App {
     // get theirs first and a folder of installers never stalls a frame.
     let (icon_tx, icon_jobs) = std::sync::mpsc::channel::<IconJob>();
     let (icon_done, icon_rx) = std::sync::mpsc::channel::<IconDone>();
+    let (rescan_tx, rescan_rx) = std::sync::mpsc::channel::<watch::Refreshed>();
     std::thread::spawn(move || {
         imagery::prepare_thread();
         while let Ok(job) = icon_jobs.recv() {
@@ -1750,6 +1757,8 @@ fn init() -> App {
         watch: None,
         watch_path: None,
         watch_rx: None,
+        rescan_tx,
+        rescan_rx,
         pending_refresh: None,
         thumb_cache: RefCell::new(HashMap::new()),
         clipboard: None,
@@ -2673,8 +2682,30 @@ fn apply_refresh(s: &mut App, msg: watch::Refreshed) {
     update_selection_detail(s);
 }
 
-/// Drain finished rescans. An inline rename owns its row: hold the refresh
-/// until the editor closes rather than pulling it out from under the typing.
+/// A restored tab shows its saved listing instantly, but that snapshot missed
+/// everything that happened while another tab was on screen — a paste from
+/// that tab, another program's writes. Rescan off the UI thread and let the
+/// seamless apply swap the news in without moving the scroll or selection.
+fn rescan_restored(s: &mut App) {
+    if !matches!(s.view, View::Files | View::Gallery) {
+        return;
+    }
+    let path = s.root.clone();
+    let tx = s.rescan_tx.clone();
+    let wake = s.waker.clone();
+    let _ = std::thread::Builder::new().name("lyre-rescan".into()).spawn(move || {
+        let (entries, scan_ms) = scan(&path);
+        if tx.send(watch::Refreshed { path, entries, scan_ms }).is_ok()
+            && let Some(wake) = wake
+        {
+            wake();
+        }
+    });
+}
+
+/// Drain finished rescans. An inline rename owns its row, and a search owns the
+/// list: hold the refresh until the editor closes or the search clears rather
+/// than pulling either out from under the person.
 fn drain_watch(s: &mut App) -> bool {
     let mut msgs = Vec::new();
     if let Some(rx) = &s.watch_rx {
@@ -2682,26 +2713,28 @@ fn drain_watch(s: &mut App) -> bool {
             msgs.push(msg);
         }
     }
+    while let Ok(msg) = s.rescan_rx.try_recv() {
+        msgs.push(msg);
+    }
     let mut changed = false;
-    let renaming = matches!(s.dialog, Some(Dialog::Rename { .. }));
+    let held = matches!(s.dialog, Some(Dialog::Rename { .. })) || s.searching;
     for msg in msgs {
-        if msg.path != s.root || s.searching {
+        if msg.path != s.root {
             continue;
         }
-        if renaming {
+        if held {
             s.pending_refresh = Some(msg);
         } else {
             apply_refresh(s, msg);
             changed = true;
         }
     }
-    if !renaming {
-        if let Some(msg) = s.pending_refresh.take() {
-            if msg.path == s.root && !s.searching {
-                apply_refresh(s, msg);
-                changed = true;
-            }
-        }
+    if !held
+        && let Some(msg) = s.pending_refresh.take()
+        && msg.path == s.root
+    {
+        apply_refresh(s, msg);
+        changed = true;
     }
     changed
 }
@@ -7015,5 +7048,51 @@ mod tests {
         sync_watch(&mut s);
         assert!(s.watch.is_none());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: cut in one tab, paste in another, switch back — the source
+    /// tab must show the file gone without a manual refresh. The snapshot
+    /// still draws first (instant tab switch), then the rescan corrects it.
+    #[test]
+    fn a_move_done_while_a_tab_was_backgrounded_shows_on_switch_back() {
+        let base = std::env::temp_dir().join(format!("lyre-tabs-{}", std::process::id()));
+        let dir_a = base.join("a");
+        let dir_b = base.join("b");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        std::fs::write(dir_a.join("moved.txt"), b"x").unwrap();
+        let mut s = init();
+        s.waker = Some(std::sync::Arc::new(|| {}));
+        s.view = View::Files;
+        s.root = dir_a.clone();
+        s.entries = scan(&dir_a).0;
+        refresh_visible(&mut s);
+        s.tabs = vec![capture_tab(&s)];
+        s.active_tab = 0;
+        s.root = dir_b.clone();
+        s.entries = scan(&dir_b).0;
+        refresh_visible(&mut s);
+        s.tabs.push(capture_tab(&s));
+        s.active_tab = 1;
+        // The paste's move lands while tab A is backgrounded and unwatched.
+        std::fs::rename(dir_a.join("moved.txt"), dir_b.join("moved.txt")).unwrap();
+        switch_tab(&mut s, 0);
+        assert!(
+            s.entries.iter().any(|e| e.name == "moved.txt"),
+            "the saved listing must draw first, instantly"
+        );
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        let mut gone = false;
+        while Instant::now() < deadline {
+            drain_watch(&mut s);
+            if !s.entries.iter().any(|e| e.name == "moved.txt") {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(gone, "switching back must rescan what happened while the tab was away");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

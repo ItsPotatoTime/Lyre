@@ -452,6 +452,28 @@ struct Marquee {
     auto_scroll: i8,
 }
 
+/// Where a drag would land: a folder path, a tab's folder, or the empty
+/// background of the folder on screen.
+#[derive(Clone, Debug, PartialEq)]
+enum DropTarget {
+    Folder(PathBuf),
+    Tab(usize),
+    Background,
+}
+
+/// An internal file drag in flight: the paths, the pointer in window points,
+/// the hit-tested target and the copy/move decision for it.
+#[derive(Clone)]
+struct DragState {
+    paths: Vec<String>,
+    at: (f32, f32),
+    shift: bool,
+    target: Option<DropTarget>,
+    /// The element key under the pointer, for the hover highlight.
+    target_key: String,
+    mode: fileops::Mode,
+}
+
 struct App {
     dark: bool,
     view: View,
@@ -476,6 +498,9 @@ struct App {
     reveal_at: Option<std::time::Instant>,
     /// The rubber-band selection drag, in the rows' own content coordinates.
     marquee: Option<Marquee>,
+    /// The internal file drag, and the window point its press started at.
+    drag: Option<DragState>,
+    drag_press: Option<(f32, f32)>,
     /// Details column widths (Name, Date, Type, Size) and the nav rail width.
     col_w: [f32; 4],
     rail_w: f32,
@@ -778,6 +803,8 @@ fn close_tab_at(s: &mut App, index: usize) {
     restore_tab(s, &tab);
     s.menu = None;
     s.address_edit = None;
+    s.drag = None;
+    s.drag_press = None;
     rescan_restored(s);
 }
 
@@ -1371,6 +1398,8 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
 fn set_location(s: &mut App, path: PathBuf) {
     clear_search(s);
     s.address_edit = None;
+    s.drag = None;
+    s.drag_press = None;
     let (entries, scan_ms) = scan(&path);
     let crumbs: Vec<String> = path
         .components()
@@ -1472,6 +1501,8 @@ fn refresh_volumes(s: &mut App) {
 fn load(s: &mut App, f: Fixture) {
     s.groups.clear();
     s.address_edit = None;
+    s.drag = None;
+    s.drag_press = None;
     s.preview = false;
     s.contextual = false;
     s.mode = Mode::Details;
@@ -1734,6 +1765,8 @@ fn init() -> App {
         reveal: None,
         reveal_at: None,
         marquee: None,
+        drag: None,
+        drag_press: None,
         col_w: [NAME_W, DATE_W, TYPE_W, SIZE_W],
         rail_w: RAIL_W,
         nav: 9,
@@ -2933,7 +2966,7 @@ fn tab_button(s: &App, p: Paint, index: usize, tab: &Tab) -> El {
         .h(TAB_ITEM_H)
         .w(180.0)
         .corners([8.0, 8.0, 0.0, 0.0])
-        .fill(if active { p.tab } else { Color::TRANSPARENT })
+        .fill(if active { p.tab } else if drop_hot(s, &format!("tab-{index}")) { p.hover } else { Color::TRANSPARENT })
         .hover(if active { Color::TRANSPARENT } else { p.hover })
         .pl(12.0)
         .pr(6.0)
@@ -3224,6 +3257,7 @@ fn address_row(s: &App, p: Paint) -> El {
                             .h(22.0)
                             .px(4.0)
                             .radius(3.0)
+                            .fill(if drop_hot(s, &format!("crumb-{i}")) { p.hover } else { Color::TRANSPARENT })
                             .hover(p.hover)
                             .center()
                             .child(text(label.as_str()).font(UI_TEXT).color(p.text).truncate())
@@ -4637,6 +4671,8 @@ fn rail_item(
         .radius(4.0)
         .fill(if active {
             p.rail_sel
+        } else if drop_hot(s, &format!("rail-{index}")) {
+            p.hover
         } else {
             Color::TRANSPARENT
         })
@@ -4683,7 +4719,7 @@ fn pinned_item(s: &App, p: Paint, pi: usize, path: &str) -> El {
         .w_full()
         .h(28.0)
         .radius(4.0)
-        .fill(if active { p.rail_sel } else { Color::TRANSPARENT })
+        .fill(if active { p.rail_sel } else if drop_hot(s, &format!("pinned-{pi}")) { p.hover } else { Color::TRANSPARENT })
         .hover(p.hover)
         .px(8.0)
         .gap(8.0)
@@ -5095,6 +5131,250 @@ fn marquee_drag(s: &mut App, d: &mut rune::Drag, tx: &mut Tx) {
     }
 }
 
+/// The volume a path lives on, longest mounted prefix first, so a drag between
+/// two folders on one disk moves and a drag to another disk copies.
+fn volume_of(s: &App, path: &Path) -> String {
+    let mut best = String::new();
+    for v in &s.volumes {
+        let vp = v.path.to_string_lossy();
+        if path.starts_with(&v.path) && vp.len() > best.len() {
+            best = vp.into_owned();
+        }
+    }
+    if best.is_empty() {
+        best = path
+            .components()
+            .next()
+            .map(|c| c.as_os_str().to_string_lossy().into_owned())
+            .unwrap_or_default();
+    }
+    if cfg!(windows) { best.to_ascii_lowercase() } else { best }
+}
+
+fn same_volume(s: &App, paths: &[String], target: &Path) -> bool {
+    paths
+        .first()
+        .map(|p| volume_of(s, Path::new(p)) == volume_of(s, target))
+        .unwrap_or(true)
+}
+
+fn drop_target_path(s: &App, target: Option<&DropTarget>) -> Option<PathBuf> {
+    match target {
+        Some(DropTarget::Folder(p)) => Some(p.clone()),
+        Some(DropTarget::Tab(i)) => s.tabs.get(*i).map(|t| t.root.clone()),
+        Some(DropTarget::Background) => Some(s.root.clone()),
+        None => None,
+    }
+}
+
+/// The old app's rule, kept: one volume moves, across volumes copies, and
+/// Shift inverts whichever the volumes decided.
+fn drop_mode(s: &App, paths: &[String], target: Option<&DropTarget>, shift: bool) -> fileops::Mode {
+    let base = match drop_target_path(s, target) {
+        Some(tp) if same_volume(s, paths, &tp) => fileops::Mode::Cut,
+        Some(_) => fileops::Mode::Copy,
+        None => fileops::Mode::Cut,
+    };
+    if !shift {
+        return base;
+    }
+    match base {
+        fileops::Mode::Cut => fileops::Mode::Copy,
+        fileops::Mode::Copy => fileops::Mode::Cut,
+    }
+}
+
+/// Read a drop target out of an element key path: the deepest keyed segment
+/// that names a place a drag can land.
+fn parse_drop_target(s: &App, path: &str) -> (String, Option<DropTarget>) {
+    for seg in path.rsplit('/') {
+        let target = if let Some(n) = seg.strip_prefix("row-") {
+            n.parse::<usize>()
+                .ok()
+                .map(|i| display_entry(s, i).1)
+                .filter(|e| e.is_dir)
+                .map(|e| DropTarget::Folder(PathBuf::from(&e.path)))
+        } else if let Some(n) = seg.strip_prefix("crumb-") {
+            n.parse::<usize>()
+                .ok()
+                .and_then(|i| crumb_segments(s).get(i).map(|(_, p)| p.clone()))
+                .filter(|p| !p.as_os_str().is_empty())
+                .map(DropTarget::Folder)
+        } else if let Some(n) = seg.strip_prefix("tab-close-") {
+            n.parse::<usize>()
+                .ok()
+                .filter(|i| *i < s.tabs.len())
+                .map(DropTarget::Tab)
+        } else if let Some(n) = seg.strip_prefix("tab-") {
+            n.parse::<usize>()
+                .ok()
+                .filter(|i| *i < s.tabs.len())
+                .map(DropTarget::Tab)
+        } else if let Some(n) = seg.strip_prefix("rail-") {
+            n.parse::<usize>().ok().and_then(place_path).map(DropTarget::Folder)
+        } else if let Some(n) = seg.strip_prefix("pinned-") {
+            n.parse::<usize>()
+                .ok()
+                .and_then(|i| s.pinned.get(i).cloned())
+                .map(|p| DropTarget::Folder(PathBuf::from(p)))
+        } else if let Some(n) = seg.strip_prefix("list-") {
+            n.parse::<usize>()
+                .ok()
+                .and_then(|i| s.favorites.get(i).cloned())
+                .map(|p| DropTarget::Folder(PathBuf::from(p)))
+        } else if let Some(n) = seg.strip_prefix("drop-place-") {
+            n.parse::<usize>().ok().and_then(place_path).map(DropTarget::Folder)
+        } else if let Some(n) = seg.strip_prefix("drop-fav-") {
+            n.parse::<usize>()
+                .ok()
+                .and_then(|i| s.favorites.get(i).cloned())
+                .map(|p| DropTarget::Folder(PathBuf::from(p)))
+        } else if let Some(n) = seg.strip_prefix("drop-vol-") {
+            n.parse::<usize>()
+                .ok()
+                .and_then(|i| s.volumes.get(i).map(|v| PathBuf::from(&v.path)))
+                .map(DropTarget::Folder)
+        } else {
+            continue;
+        };
+        return (seg.to_string(), target);
+    }
+    (String::new(), None)
+}
+
+/// Whether the element under a drag's pointer is its current target.
+fn drop_hot(s: &App, key: &str) -> bool {
+    s.drag.as_ref().is_some_and(|d| d.target_key == key)
+}
+
+/// The gesture on a row: past the threshold it becomes a file drag carrying
+/// the selection, hit-testing every frame against the places a drop can land.
+fn row_drag(s: &mut App, rect_i: usize, ei: usize, d: &mut rune::Drag, tx: &mut Tx) {
+    match d.phase {
+        Phase::Down => {
+            let rects = s.marquee_rects.borrow();
+            if let Some(r) = rects.get(rect_i) {
+                s.drag_press = Some((r[0] + d.x, r[1] + d.y));
+            }
+        }
+        Phase::Move => {
+            let Some(press) = s.drag_press else { return };
+            if s.drag.is_none() {
+                if d.dx * d.dx + d.dy * d.dy < 16.0 {
+                    return;
+                }
+                let paths = if s.selected.contains(&ei) {
+                    selected_paths(s)
+                        .iter()
+                        .map(|p| p.to_string_lossy().into_owned())
+                        .collect()
+                } else {
+                    vec![s.entries[ei].path.clone()]
+                };
+                if paths.is_empty() {
+                    return;
+                }
+                s.volumes = volumes::enumerate();
+                s.marquee = None;
+                s.drag = Some(DragState {
+                    paths,
+                    at: (press.0 + d.dx, press.1 + d.dy),
+                    shift: tx.mods().shift,
+                    target: None,
+                    target_key: String::new(),
+                    mode: fileops::Mode::Cut,
+                });
+            }
+            let at = (press.0 + d.dx, press.1 + d.dy);
+            let shift = tx.mods().shift;
+            if let Some(dr) = &mut s.drag {
+                dr.at = at;
+                dr.shift = shift;
+            }
+            tx.element_at(at.0, at.1, move |s: &mut App, picked, _tx: &mut Tx| {
+                let (key, mut target) = picked
+                    .map(|p| parse_drop_target(s, p.path()))
+                    .unwrap_or_default();
+                if key.is_empty() && matches!(s.view, View::Files | View::Gallery) {
+                    let r = s.viewport_rect.get();
+                    if at.0 >= r[0] && at.0 <= r[0] + r[2] && at.1 >= r[1] && at.1 <= r[1] + r[3] {
+                        target = Some(DropTarget::Background);
+                    }
+                }
+                let paths = s.drag.as_ref().map(|d| d.paths.clone()).unwrap_or_default();
+                let mode = drop_mode(s, &paths, target.as_ref(), shift);
+                if let Some(dr) = &mut s.drag {
+                    dr.target_key = key;
+                    dr.target = target;
+                    dr.mode = mode;
+                }
+            });
+        }
+        Phase::Up => {
+            s.drag_press = None;
+            if d.cancelled() {
+                s.drag = None;
+                return;
+            }
+            finish_drag(s);
+        }
+    }
+}
+
+/// Let go: copy or move onto the target. A tab target takes the items into its
+/// folder and brings that tab forward; the background of the folder the items
+/// already live in is a no-op, as in Explorer.
+fn finish_drag(s: &mut App) {
+    let Some(dr) = s.drag.take() else { return };
+    let Some(target) = dr.target else { return };
+    let (target_path, tab) = match &target {
+        DropTarget::Folder(p) => (p.clone(), None),
+        DropTarget::Tab(i) => match s.tabs.get(*i) {
+            Some(t) => (t.root.clone(), Some(*i)),
+            None => return,
+        },
+        DropTarget::Background => (s.root.clone(), None),
+    };
+    let sources: Vec<PathBuf> = dr.paths.iter().map(PathBuf::from).collect();
+    if dr.mode == fileops::Mode::Cut
+        && sources.iter().all(|p| p.parent() == Some(target_path.as_path()))
+    {
+        return;
+    }
+    paste_into(s, sources, dr.mode, target_path);
+    if let Some(i) = tab {
+        if i != s.active_tab {
+            switch_tab(s, i);
+        }
+    }
+}
+
+/// The badge that follows the pointer: what the drop would do, and how many.
+fn drag_overlay(s: &App, p: Paint) -> El {
+    let Some(dr) = &s.drag else { return el().key("drag-none") };
+    let cut = dr.mode == fileops::Mode::Cut;
+    let label = format!(
+        "{} {} item{}",
+        if cut { "Move" } else { "Copy" },
+        dr.paths.len(),
+        if dr.paths.len() == 1 { "" } else { "s" }
+    );
+    el().key("drag-badge")
+        .absolute(dr.at.0 + 14.0, dr.at.1 + 16.0)
+        .child(
+            row()
+                .h(24.0)
+                .px(8.0)
+                .gap(6.0)
+                .radius(4.0)
+                .fill(p.field)
+                .border(p.hair, p.field_line)
+                .items_center()
+                .child(ico(p, if cut { Ico::Forward } else { Ico::Copy }, 12.0, p.secondary))
+                .child(text(label.as_str()).font(CAPTION).color(p.text)),
+        )
+}
+
 /// The blue rubber-band rectangle. The drag is recorded in content coordinates;
 /// subtract the scroll offset to place it in the list area's own coordinates.
 fn marquee_overlay(s: &App, p: Paint) -> El {
@@ -5481,7 +5761,12 @@ fn begin_paste(s: &mut App) {
         return;
     }
     let target = s.root.clone();
-    // Cutting into the folder an item already lives in is a no-op, not a conflict.
+    paste_into(s, sources, mode, target);
+}
+
+/// Copy or move sources into a target, asking about conflicts. Cutting into
+/// the folder an item already lives in is a no-op, not a conflict.
+fn paste_into(s: &mut App, sources: Vec<PathBuf>, mode: fileops::Mode, target: PathBuf) {
     let sources: Vec<PathBuf> = if mode == fileops::Mode::Cut {
         sources
             .into_iter()
@@ -5665,6 +5950,11 @@ fn open_recent(s: &mut App, i: usize) {
 /// Global shortcuts. Returns true when the key was handled. Editing keys are
 /// left to a focused field or an open dialog.
 fn handle_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    if ev.key == Key::Escape && s.drag.is_some() {
+        s.drag = None;
+        s.drag_press = None;
+        return true;
+    }
     if s.address_edit.is_some() {
         match ev.key {
             Key::Escape => {
@@ -5776,7 +6066,7 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
         .w(row_width(s))
         .h(row_h(s))
         .items_center()
-        .fill(if selected { p.row_sel } else { Color::TRANSPARENT })
+        .fill(if selected || drop_hot(s, &format!("row-{i}")) { p.row_sel } else { Color::TRANSPARENT })
         .hover(p.hover)
         .opacity(if is_cut(s, &e.path) { 0.4 } else { 1.0 });
     if s.reveal == Some(ei) {
@@ -5832,6 +6122,7 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
         line.on_press_tx(move |s: &mut App, tx: &mut Tx| {
             click_select(s, ei, tx.mods());
         })
+        .on_drag(move |s: &mut App, d: &mut rune::Drag, tx: &mut Tx| row_drag(s, i, ei, d, tx))
         .on_double_press(move |s: &mut App| {
             select_entry(s, ei);
             open_selected(s);
@@ -5901,6 +6192,7 @@ fn scrollable(s: &App, p: Paint, content: El) -> El {
                 }),
         )
         .child(marquee_overlay(s, p))
+        .child(drag_overlay(s, p))
 }
 
 fn details_rows(s: &App, p: Paint) -> El {
@@ -5947,7 +6239,7 @@ fn grid_tile(s: &App, i: usize, p: Paint) -> El {
         .key(format!("tile-{i}"))
         .w(106.0)
         .radius(4.0)
-        .fill(if selected { p.rail_sel } else { Color::TRANSPARENT })
+        .fill(if selected || drop_hot(s, &format!("tile-{i}")) { p.rail_sel } else { Color::TRANSPARENT })
         .hover(p.hover)
         .pt(8.0)
         .pb(8.0)
@@ -5969,6 +6261,7 @@ fn grid_tile(s: &App, i: usize, p: Paint) -> El {
         tile.on_press_tx(move |s: &mut App, tx: &mut Tx| {
             click_select(s, ei, tx.mods());
         })
+        .on_drag(move |s: &mut App, d: &mut rune::Drag, tx: &mut Tx| row_drag(s, i, ei, d, tx))
         .on_double_press(move |s: &mut App| {
             select_entry(s, ei);
             open_selected(s);
@@ -6092,6 +6385,7 @@ fn tile_item(s: &App, i: usize, p: Paint) -> El {
         tile.on_press_tx(move |s: &mut App, tx: &mut Tx| {
             click_select(s, ei, tx.mods());
         })
+        .on_drag(move |s: &mut App, d: &mut rune::Drag, tx: &mut Tx| row_drag(s, i, ei, d, tx))
         .on_double_press(move |s: &mut App| {
             select_entry(s, ei);
             open_selected(s);
@@ -6119,8 +6413,10 @@ fn tiles_rows(s: &App, p: Paint) -> El {
     scrollable(s, p, tiles)
 }
 
-fn quick_tile(p: Paint, label: &str, mark: Ico, top: &str, bottom: &str, back: &str, nav: usize) -> El {
+fn quick_tile(s: &App, p: Paint, label: &str, mark: Ico, top: &str, bottom: &str, back: &str, nav: usize) -> El {
     row()
+        .key(format!("drop-place-{nav}"))
+        .fill(if drop_hot(s, &format!("drop-place-{nav}")) { p.hover } else { Color::TRANSPARENT })
         .w(272.0)
         .h(60.0)
         .radius(4.0)
@@ -6155,7 +6451,7 @@ fn home_content(s: &App, p: Paint) -> El {
     for chunk in tiles.chunks(3) {
         let mut line = row().w_full().justify_center().gap(12.0);
         for (label, mark, top, bottom, back, nav) in chunk {
-            line = line.child(quick_tile(p, label, *mark, top, bottom, back, *nav));
+            line = line.child(quick_tile(s, p, label, *mark, top, bottom, back, *nav));
         }
         grid = grid.child(line);
     }
@@ -6248,6 +6544,7 @@ fn home_content(s: &App, p: Paint) -> El {
                 .child(col().w(160.0));
             row = row
                 .on_press_tx(move |st: &mut App, tx: &mut Tx| click_select(st, ei, tx.mods()))
+                .on_drag(move |st: &mut App, d: &mut rune::Drag, tx: &mut Tx| row_drag(st, ei, ei, d, tx))
                 .on_double_press(move |st: &mut App| {
                     select_entry(st, ei);
                     open_recent(st, ei);
@@ -6372,13 +6669,14 @@ fn this_pc_content(s: &App, p: Paint) -> El {
         let used = volume.used_fraction();
         let ejectable = volume.is_ejectable();
         let mut card = row()
+            .key(format!("drop-vol-{vi}"))
             .w(300.0)
             .h(64.0)
             .radius(4.0)
             .px(8.0)
             .gap(10.0)
             .items_center()
-            .fill(if selected { p.row_sel } else { Color::TRANSPARENT })
+            .fill(if selected || drop_hot(s, &format!("drop-vol-{vi}")) { p.row_sel } else { Color::TRANSPARENT })
             .hover(p.hover)
             .child(drive_glyph(p, 40.0))
             .child(
@@ -6547,6 +6845,7 @@ fn gallery_cell(s: &App, i: usize, p: Paint) -> El {
     marquee_track(
         col()
             .key(format!("gcell-{i}"))
+            .on_drag(move |s: &mut App, d: &mut rune::Drag, tx: &mut Tx| row_drag(s, i, ei, d, tx))
             .w(148.0)
             .radius(4.0)
             .fill(if selected { p.row_sel } else { Color::TRANSPARENT })
@@ -7037,6 +7336,17 @@ fn main() {
                 load(s, Fixture::Downloads);
                 begin_address_edit(s);
             }),
+            ("drag", |s| {
+                load(s, Fixture::Downloads);
+                s.drag = Some(DragState {
+                    paths: vec!["a.txt".into(), "b.txt".into()],
+                    at: (500.0, 300.0),
+                    shift: false,
+                    target: Some(DropTarget::Folder(PathBuf::from(&s.entries[2].path))),
+                    target_key: "row-2".into(),
+                    mode: fileops::Mode::Copy,
+                });
+            }),
             ("crumbmenu", |s| {
                 load(s, Fixture::Downloads);
                 s.tail_folders = fs::read_dir(&s.root)
@@ -7438,5 +7748,97 @@ mod tests {
         assert_eq!(crumb_segments(&s)[0].0, "This PC");
         s.view = View::Gallery;
         assert_eq!(crumb_segments(&s)[0].0, "Gallery");
+    }
+
+    /// One volume moves, across volumes copies, and Shift inverts whichever
+    /// the volumes decided — the old app's rule, kept.
+    #[test]
+    fn drag_effect_follows_volumes_and_shift_inverts() {
+        let mut s = init();
+        s.volumes = vec![
+            volumes::Volume {
+                path: PathBuf::from(if cfg!(windows) { "C:\\" } else { "/" }),
+                label: String::new(),
+                kind: volumes::VolumeKind::Fixed,
+                free: 0,
+                total: 0,
+            },
+            volumes::Volume {
+                path: PathBuf::from(if cfg!(windows) { "D:\\" } else { "/mnt/usb" }),
+                label: String::new(),
+                kind: volumes::VolumeKind::Removable,
+                free: 0,
+                total: 0,
+            },
+        ];
+        let src = vec![if cfg!(windows) { "C:\\docs\\a.txt".to_string() } else { "/docs/a.txt".to_string() }];
+        let same = DropTarget::Folder(PathBuf::from(if cfg!(windows) { "C:\\other" } else { "/other" }));
+        let cross = DropTarget::Folder(PathBuf::from(if cfg!(windows) { "D:\\drop" } else { "/mnt/usb/drop" }));
+        assert_eq!(drop_mode(&s, &src, Some(&same), false), fileops::Mode::Cut);
+        assert_eq!(drop_mode(&s, &src, Some(&cross), false), fileops::Mode::Copy);
+        assert_eq!(drop_mode(&s, &src, Some(&same), true), fileops::Mode::Copy);
+        assert_eq!(drop_mode(&s, &src, Some(&cross), true), fileops::Mode::Cut);
+    }
+
+    /// Every place a drop can land is readable from the element key path the
+    /// hit test returns, including a tab's close button and the favorites list.
+    #[test]
+    fn drop_targets_parse_from_key_paths() {
+        let base = std::env::temp_dir().join(format!("lyre-drag-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("zdir")).unwrap();
+        std::fs::write(base.join("a.txt"), b"x").unwrap();
+        let mut s = init();
+        s.view = View::Files;
+        s.root = base.clone();
+        s.entries = scan(&base).0;
+        refresh_visible(&mut s);
+        s.tabs = vec![capture_tab(&s)];
+        s.pinned = vec![base.to_string_lossy().into_owned()];
+        s.favorites = vec![base.to_string_lossy().into_owned()];
+        let (key, target) = parse_drop_target(&s, "main/rows/row-0/name");
+        assert_eq!(key, "row-0");
+        assert_eq!(target, Some(DropTarget::Folder(base.join("zdir"))));
+        let (_, target) = parse_drop_target(&s, "main/tabs/tab-0/tab-close-0");
+        assert_eq!(target, Some(DropTarget::Tab(0)));
+        let (_, target) = parse_drop_target(&s, "main/rail/pinned-0");
+        assert_eq!(target, Some(DropTarget::Folder(base.clone())));
+        let (_, target) = parse_drop_target(&s, "main/home/list-0");
+        assert_eq!(target, Some(DropTarget::Folder(base.clone())));
+        let (key, target) = parse_drop_target(&s, "main/rows");
+        assert_eq!(key, "");
+        assert_eq!(target, None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Moving onto the folder the items already live in does nothing; a copy
+    /// onto a name that exists asks about the conflict instead of overwriting.
+    #[test]
+    fn drop_noops_in_place_and_asks_about_conflicts() {
+        let base = std::env::temp_dir().join(format!("lyre-drop-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::write(base.join("a.txt"), b"x").unwrap();
+        let mut s = init();
+        s.view = View::Files;
+        s.root = base.clone();
+        s.entries = scan(&base).0;
+        refresh_visible(&mut s);
+        let drag = |target: DropTarget, mode: fileops::Mode| DragState {
+            paths: vec![base.join("a.txt").to_string_lossy().into_owned()],
+            at: (0.0, 0.0),
+            shift: false,
+            target: Some(target),
+            target_key: String::new(),
+            mode,
+        };
+        s.drag = Some(drag(DropTarget::Background, fileops::Mode::Cut));
+        finish_drag(&mut s);
+        assert!(s.transfer.is_none(), "moving within the same folder must do nothing");
+        assert!(s.dialog.is_none());
+        s.drag = Some(drag(DropTarget::Folder(base.clone()), fileops::Mode::Copy));
+        finish_drag(&mut s);
+        assert!(matches!(s.dialog, Some(Dialog::PasteConflict { .. })));
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

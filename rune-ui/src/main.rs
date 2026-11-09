@@ -412,6 +412,21 @@ enum UpdateMsg {
     Done(Result<(), String>),
 }
 
+/// A shell icon request for the icon worker. Extraction reads executables and
+/// shortcuts from disk, so it must never run on the UI thread.
+struct IconJob {
+    key: String,
+    path: String,
+    is_dir: bool,
+    px: u32,
+}
+
+/// The icon worker's answer, drained in `poll`.
+struct IconDone {
+    key: String,
+    picture: Option<(u32, u32, Vec<u8>)>,
+}
+
 /// A modal dialog: delete confirmation, paste conflict, rename, new folder, default manager, update.
 enum Dialog {
     Delete { permanent: bool, paths: Vec<PathBuf> },
@@ -503,6 +518,10 @@ struct App {
     prefs_sig: String,
     /// Real shell icons keyed by type/path, and decoded image previews by path.
     icon_cache: RefCell<HashMap<String, Pixels>>,
+    /// The icon worker's channels and how many extractions are still running.
+    icon_tx: std::sync::mpsc::Sender<IconJob>,
+    icon_rx: std::sync::mpsc::Receiver<IconDone>,
+    icons_pending: std::cell::Cell<usize>,
     thumb_cache: RefCell<HashMap<String, Image>>,
     /// Cut/copy clipboard, the running transfer, its worker channel and cancel.
     clipboard: Option<(Vec<PathBuf>, fileops::Mode)>,
@@ -1259,6 +1278,10 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
     if s.transfer.is_some() {
         tx.wake_after(std::time::Duration::from_millis(60));
     }
+    changed |= drain_icons(s);
+    if s.icons_pending.get() > 0 {
+        tx.wake_after(std::time::Duration::from_millis(16));
+    }
     changed |= drain_search(s);
     if s.search_busy {
         tx.wake_after(std::time::Duration::from_millis(40));
@@ -1644,6 +1667,20 @@ fn init() -> App {
         .collect();
     let tab = crumbs.last().cloned().unwrap_or_else(|| "Lyre".into());
     let count = entries.len();
+    // One worker extracts shell icons in request order, so the rows on screen
+    // get theirs first and a folder of installers never stalls a frame.
+    let (icon_tx, icon_jobs) = std::sync::mpsc::channel::<IconJob>();
+    let (icon_done, icon_rx) = std::sync::mpsc::channel::<IconDone>();
+    std::thread::spawn(move || {
+        imagery::prepare_thread();
+        while let Ok(job) = icon_jobs.recv() {
+            let picture = imagery::icon_rgba(&job.path, job.is_dir, job.px);
+            if icon_done.send(IconDone { key: job.key, picture }).is_err() {
+                break;
+            }
+        }
+        imagery::release_thread();
+    });
     let mut app = App {
         dark: true,
         view: View::Files,
@@ -1694,6 +1731,9 @@ fn init() -> App {
         customize_background: false,
         prefs_sig: String::new(),
         icon_cache: RefCell::new(HashMap::new()),
+        icon_tx,
+        icon_rx,
+        icons_pending: std::cell::Cell::new(0),
         thumb_cache: RefCell::new(HashMap::new()),
         clipboard: None,
         transfer: None,
@@ -2532,7 +2572,9 @@ fn icon_key(e: &Entry) -> String {
 }
 
 /// The entry's real shell icon at `size`, falling back to the drawn glyph when the
-/// platform supplies none (or the path is only a fixture).
+/// platform supplies none (or the path is only a fixture). A cache miss queues
+/// the extraction on the icon worker and draws the glyph meanwhile; `poll`
+/// drains the answer and the rebuilt row swaps the glyph for the real icon.
 fn entry_icon(s: &App, e: &Entry, p: Paint, size: f32) -> El {
     let key = icon_key(e);
     let pixels = {
@@ -2541,10 +2583,14 @@ fn entry_icon(s: &App, e: &Entry, p: Paint, size: f32) -> El {
             px.clone()
         } else {
             let px = Pixels::new();
-            if let Some((w, h, rgba)) = imagery::icon_rgba(&e.path, e.is_dir, (size.ceil() as u32).max(32)) {
-                px.set(w, h, rgba);
-            }
-            cache.insert(key, px.clone());
+            cache.insert(key.clone(), px.clone());
+            s.icons_pending.set(s.icons_pending.get() + 1);
+            let _ = s.icon_tx.send(IconJob {
+                key,
+                path: e.path.clone(),
+                is_dir: e.is_dir,
+                px: (size.ceil() as u32).max(32),
+            });
             px
         }
     };
@@ -2552,6 +2598,21 @@ fn entry_icon(s: &App, e: &Entry, p: Paint, size: f32) -> El {
         return file_glyph(e, p, size);
     }
     el().size(size, size).pixels(&pixels)
+}
+
+/// Land finished extractions in the icon cache; true to rebuild rows with them.
+fn drain_icons(s: &App) -> bool {
+    let mut changed = false;
+    while let Ok(done) = s.icon_rx.try_recv() {
+        s.icons_pending.set(s.icons_pending.get().saturating_sub(1));
+        if let Some((w, h, rgba)) = done.picture
+            && let Some(px) = s.icon_cache.borrow().get(&done.key)
+        {
+            px.set(w, h, rgba);
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// Whether an entry is a raster image worth decoding into a preview.
@@ -6721,4 +6782,57 @@ fn main() {
         let window = window.on_created(|handle| frame::install(&handle));
         [window.boxed()]
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: the first render of a folder must not extract shell icons on
+    /// the calling (UI) thread. A miss queues work and draws the glyph; the
+    /// answer lands in the cache only when drained, as `poll` does.
+    #[test]
+    fn icon_miss_queues_worker_and_lands_through_drain() {
+        let s = init();
+        let path = std::env::current_exe().unwrap().to_string_lossy().into_owned();
+        let e = Entry {
+            name: "app.exe".into(),
+            path,
+            is_dir: false,
+            size: 0,
+            modified: String::new(),
+            modified_at: None,
+            type_label: "Application".into(),
+            kind: classify("app.exe", false),
+            hidden: false,
+            system: false,
+            fixture: false,
+            fixture_size: String::new(),
+        };
+        let key = icon_key(&e);
+        let _ = entry_icon(&s, &e, paint(true, 1.0), 16.0);
+        assert_eq!(s.icons_pending.get(), 1, "the miss must queue exactly one job");
+        assert_eq!(
+            s.icon_cache.borrow().get(&key).unwrap().size(),
+            (0, 0),
+            "nothing may be extracted synchronously on the calling thread"
+        );
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        while s.icons_pending.get() > 0 && Instant::now() < deadline {
+            drain_icons(&s);
+            if s.icons_pending.get() > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+        assert_eq!(s.icons_pending.get(), 0, "the worker answer must drain");
+        #[cfg(target_os = "windows")]
+        assert_ne!(
+            s.icon_cache.borrow().get(&key).unwrap().size(),
+            (0, 0),
+            "an executable's shell icon must arrive through the worker"
+        );
+        // A second render is a pure cache hit: no new job.
+        let _ = entry_icon(&s, &e, paint(true, 1.0), 16.0);
+        assert_eq!(s.icons_pending.get(), 0);
+    }
 }

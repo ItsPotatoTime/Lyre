@@ -19,6 +19,35 @@ pub fn icon_rgba(path: &str, _is_dir: bool, px: u32) -> Option<(u32, u32, Vec<u8
     rune::image::app_icon_rgba(Path::new(path), px.max(1)).ok()
 }
 
+/// Prepare a worker thread for shell icon calls. Windows shell functions need
+/// COM on the calling thread; the UI thread gets it from the window system, a
+/// bare worker does not.
+#[cfg(target_os = "windows")]
+pub fn prepare_thread() {
+    #[link(name = "ole32")]
+    unsafe extern "system" {
+        fn CoInitializeEx(reserved: *mut std::ffi::c_void, concurrency: u32) -> i32;
+    }
+    // COINIT_APARTMENTTHREADED, matching the UI thread's shell apartment.
+    unsafe { CoInitializeEx(std::ptr::null_mut(), 0x2) };
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn prepare_thread() {}
+
+/// Undo `prepare_thread` when the worker retires.
+#[cfg(target_os = "windows")]
+pub fn release_thread() {
+    #[link(name = "ole32")]
+    unsafe extern "system" {
+        fn CoUninitialize();
+    }
+    unsafe { CoUninitialize() };
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn release_thread() {}
+
 /// Whether a file carries its own icon (so the shell must read the file rather
 /// than look the type up by extension).
 #[cfg(target_os = "windows")]

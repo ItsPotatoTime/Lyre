@@ -1093,6 +1093,7 @@ dependencies = [
  "serde",
  "serde_json",
  "ureq",
+ "wayland-client",
 ]
 
 [[package]]

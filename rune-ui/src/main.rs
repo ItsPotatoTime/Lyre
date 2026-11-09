@@ -481,6 +481,69 @@ fn drain_osdrop(s: &mut App, tx: &mut Tx) -> bool {
     any
 }
 
+/// A drop the host delivered (Linux, macOS): the element that took it names
+/// the target. Our own macOS session keeps the volume rule with Shift;
+/// anything from outside copies, as the old app did.
+fn take_drop(s: &mut App, target: Option<DropTarget>, files: &[PathBuf], tx: &mut Tx) {
+    let target = match target {
+        Some(DropTarget::Background) if !matches!(s.view, View::Files | View::Gallery) => None,
+        other => other,
+    };
+    let Some(tp) = drop_target_path(s, target.as_ref()) else { return };
+    let paths: Vec<String> = files.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    let own = s.os_drag.as_ref().is_some_and(|p| *p == paths);
+    let mode = if own {
+        drop_mode(s, &paths, target.as_ref(), tx.mods().shift)
+    } else {
+        fileops::Mode::Copy
+    };
+    let staged = osdrag::stage(files);
+    s.drop_staged.extend(staged.iter().cloned());
+    paste_into(s, staged, mode, tp);
+}
+
+/// What a row drag carries: the selection, or just the pressed row.
+fn drag_paths(s: &App, ei: usize) -> Vec<PathBuf> {
+    if s.selected.contains(&ei) {
+        selected_paths(s)
+    } else {
+        vec![PathBuf::from(&s.entries[ei].path)]
+    }
+}
+
+/// On macOS the OS runs the drag session (rune's drag_out), so the row offers
+/// its files there and hears the session's start and end; elsewhere these
+/// handlers are inert and the pointer drag owns the gesture.
+fn os_drag_source(el: El, ei: usize) -> El {
+    el.drag_out(move |s: &App| {
+        if !cfg!(target_os = "macos") {
+            return None;
+        }
+        let mut item = rune::DragItem::new();
+        for p in drag_paths(s, ei) {
+            item = item.file(p);
+        }
+        Some(item.allow(rune::DragOperation::Move))
+    })
+    .on_drag_start(move |s: &mut App, _tx: &mut Tx| {
+        s.os_drag = Some(
+            drag_paths(s, ei)
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+        );
+    })
+    .on_drag_end(|s: &mut App, _outcome, _tx: &mut Tx| s.os_drag = None)
+    .on_drop_files(move |s: &mut App, files, tx: &mut Tx| {
+        let target = if s.entries.get(ei).is_some_and(|e| e.is_dir) {
+            Some(DropTarget::Folder(PathBuf::from(&s.entries[ei].path)))
+        } else {
+            Some(DropTarget::Background)
+        };
+        take_drop(s, target, files, tx);
+    })
+}
+
 /// Where a drag would land: a folder path, a tab's folder, or the empty
 /// background of the folder on screen.
 #[derive(Clone, Debug, PartialEq)]
@@ -600,6 +663,9 @@ struct App {
     /// running paste still needs alive.
     osdrop_rx: Option<std::sync::mpsc::Receiver<osdrag::OsDrop>>,
     drop_staged: Vec<PathBuf>,
+    /// The payload of our own macOS drag session, so a drop back onto this
+    /// window keeps the move/copy rule instead of always copying.
+    os_drag: Option<Vec<String>>,
     thumb_cache: RefCell<HashMap<String, Image>>,
     /// Cut/copy clipboard, the running transfer, its worker channel and cancel.
     clipboard: Option<(Vec<PathBuf>, fileops::Mode)>,
@@ -1868,6 +1934,7 @@ fn init() -> App {
         tail_folders: Vec::new(),
         osdrop_rx: Some(osdrop_rx),
         drop_staged: Vec::new(),
+        os_drag: None,
         thumb_cache: RefCell::new(HashMap::new()),
         clipboard: None,
         transfer: None,
@@ -3032,6 +3099,9 @@ fn tab_button(s: &App, p: Paint, index: usize, tab: &Tab) -> El {
     let nav = tab.nav;
     let b = row()
         .key(format!("tab-{index}"))
+        .on_drop_files(move |s: &mut App, files, tx: &mut Tx| {
+            take_drop(s, Some(DropTarget::Tab(index)), files, tx);
+        })
         .h(TAB_ITEM_H)
         .w(180.0)
         .corners([8.0, 8.0, 0.0, 0.0])
@@ -3323,6 +3393,14 @@ fn address_row(s: &App, p: Paint) -> El {
                     let path = path.clone();
                     bar = bar.child(
                         el().key(format!("crumb-{i}"))
+                            .on_drop_files(move |s: &mut App, files, tx: &mut Tx| {
+                                let t = crumb_segments(s)
+                                    .get(i)
+                                    .map(|(_, p)| p.clone())
+                                    .filter(|p| !p.as_os_str().is_empty())
+                                    .map(DropTarget::Folder);
+                                take_drop(s, t, files, tx);
+                            })
                             .h(22.0)
                             .px(4.0)
                             .radius(3.0)
@@ -4735,6 +4813,9 @@ fn rail_item(
     let ink = if active { p.text } else { p.secondary };
     let mut item = row()
         .key(format!("rail-{index}"))
+        .on_drop_files(move |s: &mut App, files, tx: &mut Tx| {
+            take_drop(s, place_path(index).map(DropTarget::Folder), files, tx);
+        })
         .w_full()
         .h(28.0)
         .radius(4.0)
@@ -4785,6 +4866,10 @@ fn pinned_item(s: &App, p: Paint, pi: usize, path: &str) -> El {
     let open = path.to_string();
     let mut item = row()
         .key(format!("pinned-{pi}"))
+        .on_drop_files(move |s: &mut App, files, tx: &mut Tx| {
+            let t = s.pinned.get(pi).cloned().map(|p| DropTarget::Folder(PathBuf::from(p)));
+            take_drop(s, t, files, tx);
+        })
         .w_full()
         .h(28.0)
         .radius(4.0)
@@ -5359,6 +5444,10 @@ fn row_drag(s: &mut App, rect_i: usize, ei: usize, d: &mut rune::Drag, tx: &mut 
                 if paths.is_empty() {
                     return;
                 }
+                // macOS runs the session through the OS (os_drag_source).
+                if cfg!(target_os = "macos") {
+                    return;
+                }
                 s.volumes = volumes::enumerate();
                 s.marquee = None;
                 s.drag = Some(DragState {
@@ -5386,6 +5475,17 @@ fn row_drag(s: &mut App, rect_i: usize, ei: usize, d: &mut rune::Drag, tx: &mut 
                     s.drag = None;
                     s.drag_press = None;
                     osdrag::win::start_drag_out(&paths);
+                    return;
+                }
+            }
+            #[cfg(target_os = "linux")]
+            if let Some(dr) = &s.drag {
+                let w = s.rect_window.get();
+                if at.0 < w[0] || at.0 > w[0] + w[2] || at.1 < w[1] || at.1 > w[1] + w[3] {
+                    let paths: Vec<PathBuf> = dr.paths.iter().map(PathBuf::from).collect();
+                    s.drag = None;
+                    s.drag_press = None;
+                    osdrag::linux::start_drag_out(&paths);
                     return;
                 }
             }
@@ -6250,7 +6350,7 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
             ),
         )
         .child(el().w(COL_SEP_W).h(16.0).center().child(el().w(p.hair).h(16.0).fill(p.soft_line)));
-    marquee_track(
+    os_drag_source(marquee_track(
         line.on_press_tx(move |s: &mut App, tx: &mut Tx| {
             click_select(s, ei, tx.mods());
         })
@@ -6266,7 +6366,7 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
             s.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
         }),
         i,
-    )
+    ), ei)
 }
 
 /// Wrap list content in a scroll viewport plus a drawn scrollbar gutter. The
@@ -6388,7 +6488,7 @@ fn grid_tile(s: &App, i: usize, p: Paint) -> El {
     if selected {
         tile = tile.border(p.hair, p.focus_line);
     }
-    marquee_track(
+    os_drag_source(marquee_track(
         tile.on_press_tx(move |s: &mut App, tx: &mut Tx| {
             click_select(s, ei, tx.mods());
         })
@@ -6404,7 +6504,7 @@ fn grid_tile(s: &App, i: usize, p: Paint) -> El {
             s.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
         }),
         i,
-    )
+    ), ei)
 }
 
 fn grid_rows(s: &App, p: Paint) -> El {
@@ -6426,6 +6526,10 @@ fn list_item(s: &App, i: usize, p: Paint) -> El {
     let selected = is_selected(s, ei);
     let mut item = row()
         .key(format!("list-{i}"))
+        .on_drop_files(move |s: &mut App, files, tx: &mut Tx| {
+            let t = s.favorites.get(i).cloned().map(|p| DropTarget::Folder(PathBuf::from(p)));
+            take_drop(s, t, files, tx);
+        })
         .w(230.0)
         .h(if s.compact { 22.0 } else { 26.0 })
         .radius(4.0)
@@ -6445,7 +6549,7 @@ fn list_item(s: &App, i: usize, p: Paint) -> El {
     if selected {
         item = item.border(p.hair, p.focus_line);
     }
-    marquee_track(
+    os_drag_source(marquee_track(
         item.on_press_tx(move |s: &mut App, tx: &mut Tx| {
             click_select(s, ei, tx.mods());
         })
@@ -6460,7 +6564,7 @@ fn list_item(s: &App, i: usize, p: Paint) -> El {
             s.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
         }),
         i,
-    )
+    ), ei)
 }
 
 fn list_rows(s: &App, p: Paint) -> El {
@@ -6512,7 +6616,7 @@ fn tile_item(s: &App, i: usize, p: Paint) -> El {
     if selected {
         tile = tile.border(p.hair, p.focus_line);
     }
-    marquee_track(
+    os_drag_source(marquee_track(
         tile.on_press_tx(move |s: &mut App, tx: &mut Tx| {
             click_select(s, ei, tx.mods());
         })
@@ -6528,7 +6632,7 @@ fn tile_item(s: &App, i: usize, p: Paint) -> El {
             s.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
         }),
         i,
-    )
+    ), ei)
 }
 
 fn tiles_rows(s: &App, p: Paint) -> El {
@@ -6547,6 +6651,9 @@ fn tiles_rows(s: &App, p: Paint) -> El {
 fn quick_tile(s: &App, p: Paint, label: &str, mark: Ico, top: &str, bottom: &str, back: &str, nav: usize) -> El {
     row()
         .key(format!("drop-place-{nav}"))
+        .on_drop_files(move |s: &mut App, files, tx: &mut Tx| {
+            take_drop(s, place_path(nav).map(DropTarget::Folder), files, tx);
+        })
         .fill(if drop_hot(s, &format!("drop-place-{nav}")) { p.hover } else { Color::TRANSPARENT })
         .w(272.0)
         .h(60.0)
@@ -6686,7 +6793,7 @@ fn home_content(s: &App, p: Paint) -> El {
                     }
                     st.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
                 });
-            table = table.child(marquee_track(row, ei));
+            table = table.child(os_drag_source(marquee_track(row, ei), ei));
         }
     } else if s.favorites.is_empty() {
         table = table.child(
@@ -6801,6 +6908,10 @@ fn this_pc_content(s: &App, p: Paint) -> El {
         let ejectable = volume.is_ejectable();
         let mut card = row()
             .key(format!("drop-vol-{vi}"))
+            .on_drop_files(move |s: &mut App, files, tx: &mut Tx| {
+                let t = s.volumes.get(vi).map(|v| DropTarget::Folder(v.path.clone()));
+                take_drop(s, t, files, tx);
+            })
             .w(300.0)
             .h(64.0)
             .radius(4.0)
@@ -6973,7 +7084,7 @@ fn go_gallery(s: &mut App) {
 fn gallery_cell(s: &App, i: usize, p: Paint) -> El {
     let (ei, e) = display_entry(s, i);
     let selected = is_selected(s, ei);
-    marquee_track(
+    os_drag_source(marquee_track(
         col()
             .key(format!("gcell-{i}"))
             .on_drag(move |s: &mut App, d: &mut rune::Drag, tx: &mut Tx| row_drag(s, i, ei, d, tx))
@@ -7006,7 +7117,7 @@ fn gallery_cell(s: &App, i: usize, p: Paint) -> El {
                 s.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
             }),
         i,
-    )
+    ), ei)
 }
 
 /// The Gallery: the Pictures library as a date-grouped photo grid.

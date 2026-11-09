@@ -246,6 +246,9 @@ mod imp {
             if let RawWindowHandle::Xlib(x) = raw.as_raw() {
                 let _ = XWINDOW.set(x.window as u64);
             }
+            if let RawWindowHandle::Wayland(_) = raw.as_raw() {
+                crate::osdrag::linux::set_wayland();
+            }
         });
     }
 

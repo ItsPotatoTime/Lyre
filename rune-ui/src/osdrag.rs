@@ -697,6 +697,576 @@ pub mod win {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Linux: an XDND source over X11, and a wl_data_source on Wayland. The Wayland
+// tracker thread binds its own seat and pointer (every pointer object of a
+// seat hears its events) so the press serial start_drag demands is known; all
+// protocol calls stay on that one thread and queue.
+// ---------------------------------------------------------------------------
+#[cfg(target_os = "linux")]
+pub mod linux {
+    use std::ffi::{c_char, c_int, c_void, CString};
+    use std::os::raw::{c_ulong, c_uint};
+    use std::path::PathBuf;
+    use std::sync::mpsc::{channel, Sender};
+    use std::sync::OnceLock;
+
+    static REQUEST: OnceLock<Sender<Vec<PathBuf>>> = OnceLock::new();
+
+    /// Start the Wayland tracker once the window proves it is on Wayland.
+    pub fn set_wayland() {
+        if REQUEST.get().is_none() {
+            let (tx, rx) = channel::<Vec<PathBuf>>();
+            if REQUEST.set(tx).is_ok() {
+                std::thread::spawn(move || wayland_tracker(rx));
+            }
+        }
+    }
+
+    /// The gesture left the window: hand it to whichever session the window
+    /// belongs to.
+    pub fn start_drag_out(paths: &[PathBuf]) {
+        if REQUEST.get().is_some() {
+            if let Some(tx) = REQUEST.get() {
+                let _ = tx.send(paths.to_vec());
+            }
+            return;
+        }
+        let paths = paths.to_vec();
+        std::thread::spawn(move || xdnd_drag(&paths));
+    }
+
+    fn uri_list(paths: &[PathBuf]) -> String {
+        let mut out = String::new();
+        for path in paths {
+            out.push_str("file://");
+            for byte in path.to_string_lossy().bytes() {
+                match byte {
+                    b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/' | b':' => {
+                        out.push(byte as char)
+                    }
+                    _ => out.push_str(&format!("%{byte:02X}")),
+                }
+            }
+            out.push_str("\r\n");
+        }
+        out
+    }
+
+    // -- X11 / XDND ----------------------------------------------------------
+
+    type Display = *mut c_void;
+    type Window = c_ulong;
+    type Atom = c_ulong;
+    type Bool = c_int;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct XClientMessage {
+        type_: c_int,
+        serial: c_ulong,
+        send_event: Bool,
+        display: Display,
+        window: Window,
+        message_type: Atom,
+        format: c_int,
+        data: [c_ulong; 5],
+    }
+
+    #[repr(C)]
+    union XEvent {
+        type_: c_int,
+        client: XClientMessage,
+        selection: XSelectionEvent,
+        request: XSelectionRequest,
+        pad: [c_ulong; 24],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct XSelectionEvent {
+        type_: c_int,
+        serial: c_ulong,
+        send_event: Bool,
+        display: Display,
+        requestor: Window,
+        selection: Atom,
+        target: Atom,
+        property: Atom,
+        time: c_ulong,
+    }
+
+    #[link(name = "X11")]
+    unsafe extern "C" {
+        fn XOpenDisplay(name: *const c_char) -> Display;
+        fn XCloseDisplay(d: Display) -> c_int;
+        fn XDefaultRootWindow(d: Display) -> Window;
+        fn XInternAtom(d: Display, name: *const c_char, only_if_exists: Bool) -> Atom;
+        fn XSetSelectionOwner(d: Display, selection: Atom, owner: Window, time: c_ulong);
+        fn XCreateSimpleWindow(
+            d: Display,
+            parent: Window,
+            x: c_int,
+            y: c_int,
+            w: c_uint,
+            h: c_uint,
+            border: c_uint,
+            border_pixel: c_ulong,
+            background: c_ulong,
+        ) -> Window;
+        fn XDestroyWindow(d: Display, w: Window);
+        fn XQueryPointer(
+            d: Display,
+            w: Window,
+            root: *mut Window,
+            child: *mut Window,
+            rx: *mut c_int,
+            ry: *mut c_int,
+            wx: *mut c_int,
+            wy: *mut c_int,
+            mask: *mut c_uint,
+        ) -> Bool;
+        fn XGetWindowProperty(
+            d: Display,
+            w: Window,
+            property: Atom,
+            offset: c_long,
+            length: c_long,
+            delete: Bool,
+            req_type: Atom,
+            actual_type: *mut Atom,
+            actual_format: *mut c_int,
+            nitems: *mut c_ulong,
+            bytes_after: *mut c_ulong,
+            prop: *mut *mut c_void,
+        ) -> c_int;
+        fn XFree(data: *mut c_void) -> c_int;
+        fn XSendEvent(d: Display, w: Window, propagate: Bool, mask: c_long, event: *mut XEvent) -> c_int;
+        fn XNextEvent(d: Display, event: *mut XEvent) -> c_int;
+        fn XPending(d: Display) -> c_int;
+        fn XFlush(d: Display) -> c_int;
+        fn XChangeProperty(
+            d: Display,
+            w: Window,
+            property: Atom,
+            type_: Atom,
+            format: c_int,
+            mode: c_int,
+            data: *const c_void,
+            nelements: c_int,
+        ) -> c_int;
+    }
+    use std::os::raw::c_long;
+
+    const CURRENT_TIME: c_ulong = 0;
+    const SELECTION_REQUEST: c_int = 22;
+    const CLIENT_MESSAGE: c_int = 33;
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct XSelectionRequest {
+        type_: c_int,
+        serial: c_ulong,
+        send_event: Bool,
+        display: Display,
+        owner: Window,
+        requestor: Window,
+        selection: Atom,
+        target: Atom,
+        property: Atom,
+        time: c_ulong,
+    }
+
+    fn atom(d: Display, name: &str) -> Atom {
+        let c = CString::new(name).unwrap();
+        unsafe { XInternAtom(d, c.as_ptr(), 0) }
+    }
+
+    /// XDND version 5 source: own the selection, announce to the window under
+    /// the pointer, answer its data requests, finish on release.
+    fn xdnd_drag(paths: &[PathBuf]) {
+        unsafe {
+            let d = XOpenDisplay(std::ptr::null());
+            if d.is_null() {
+                return;
+            }
+            let root = XDefaultRootWindow(d);
+            let win = XCreateSimpleWindow(d, root, -100, -100, 1, 1, 0, 0, 0);
+            let aware = atom(d, "XdndAware");
+            let selection = atom(d, "XdndSelection");
+            let enter = atom(d, "XdndEnter");
+            let position = atom(d, "XdndPosition");
+            let leave = atom(d, "XdndLeave");
+            let drop = atom(d, "XdndDrop");
+            let finished = atom(d, "XdndFinished");
+            let status = atom(d, "XdndStatus");
+            let action_copy = atom(d, "XdndActionCopy");
+            let action_move = atom(d, "XdndActionMove");
+            let action_ask = atom(d, "XdndActionAsk");
+            let uri = atom(d, "text/uri-list");
+            let targets = atom(d, "TARGETS");
+            XSetSelectionOwner(d, selection, win, CURRENT_TIME);
+            let list = uri_list(paths);
+            let mut target_win: Window = 0;
+            let mut accepted = false;
+            let mut entered = false;
+            let mut last_pos = std::time::Instant::now();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            loop {
+                if std::time::Instant::now() > deadline {
+                    break;
+                }
+                while XPending(d) > 0 {
+                    let mut ev: XEvent = std::mem::zeroed();
+                    XNextEvent(d, &mut ev);
+                    match ev.type_ {
+                        SELECTION_REQUEST => {
+                            let req = &ev.request;
+                            let prop = if req.property != 0 { req.property } else { req.target };
+                            if req.target == targets {
+                                let list_atoms = [targets, uri];
+                                XChangeProperty(
+                                    d,
+                                    req.requestor,
+                                    prop,
+                                    4, // XA_ATOM
+                                    32,
+                                    0,
+                                    list_atoms.as_ptr().cast(),
+                                    2,
+                                );
+                            } else if req.target == uri {
+                                XChangeProperty(
+                                    d,
+                                    req.requestor,
+                                    prop,
+                                    uri,
+                                    8,
+                                    0,
+                                    list.as_ptr().cast(),
+                                    list.len() as c_int,
+                                );
+                            }
+                            let mut reply: XEvent = std::mem::zeroed();
+                            reply.selection.type_ = 31; // SelectionNotify
+                            reply.selection.display = d;
+                            reply.selection.requestor = req.requestor;
+                            reply.selection.selection = req.selection;
+                            reply.selection.target = req.target;
+                            reply.selection.property = prop;
+                            reply.selection.time = req.time;
+                            XSendEvent(d, req.requestor, 0, 0, &mut reply);
+                        }
+                        CLIENT_MESSAGE => {
+                            let msg = &ev.client;
+                            if msg.message_type == status {
+                                accepted = msg.data[1] & 1 != 0;
+                            } else if msg.message_type == finished {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                let mut root_ret = 0;
+                let mut child = 0;
+                let mut rx = 0;
+                let mut ry = 0;
+                let mut wx = 0;
+                let mut wy = 0;
+                let mut mask = 0u32;
+                XQueryPointer(d, root, &mut root_ret, &mut child, &mut rx, &mut ry, &mut wx, &mut wy, &mut mask);
+                if mask & 0x100 == 0 {
+                    // Button released: drop on the accepted target, if any.
+                    if entered && target_win != 0 {
+                        let mut ev: XEvent = std::mem::zeroed();
+                        ev.client.type_ = CLIENT_MESSAGE;
+                        ev.client.display = d;
+                        ev.client.window = target_win;
+                        ev.client.message_type = drop;
+                        ev.client.format = 32;
+                        ev.client.data[0] = win as c_ulong;
+                        ev.client.data[2] = CURRENT_TIME;
+                        XSendEvent(d, target_win, 0, 0, &mut ev);
+                        XFlush(d);
+                        // Give the target a moment to finish; its Finished
+                        // message ends the loop above.
+                        let until = std::time::Instant::now() + std::time::Duration::from_millis(500);
+                        while std::time::Instant::now() < until && XPending(d) == 0 {
+                            std::thread::sleep(std::time::Duration::from_millis(10));
+                        }
+                    }
+                    break;
+                }
+                let over = if child != 0 { child } else { root };
+                if over != target_win {
+                    if entered && target_win != 0 {
+                        let mut ev: XEvent = std::mem::zeroed();
+                        ev.client.type_ = CLIENT_MESSAGE;
+                        ev.client.display = d;
+                        ev.client.window = target_win;
+                        ev.client.message_type = leave;
+                        ev.client.format = 32;
+                        ev.client.data[0] = win as c_ulong;
+                        XSendEvent(d, target_win, 0, 0, &mut ev);
+                    }
+                    target_win = over;
+                    accepted = false;
+                    entered = false;
+                    let mut ty = 0;
+                    let mut fmt = 0;
+                    let mut n = 0;
+                    let mut after = 0;
+                    let mut prop: *mut c_void = std::ptr::null_mut();
+                    if XGetWindowProperty(d, over, aware, 0, 1, 0, 0, &mut ty, &mut fmt, &mut n, &mut after, &mut prop) == 0
+                        && !prop.is_null()
+                    {
+                        let version = *(prop as *const c_ulong);
+                        XFree(prop);
+                        if version >= 3 {
+                            entered = true;
+                            let mut ev: XEvent = std::mem::zeroed();
+                            ev.client.type_ = CLIENT_MESSAGE;
+                            ev.client.display = d;
+                            ev.client.window = over;
+                            ev.client.message_type = enter;
+                            ev.client.format = 32;
+                            ev.client.data[0] = win as c_ulong;
+                            ev.client.data[1] = (5u64 << 24) as c_ulong | 1; // version 5, more types flag
+                            ev.client.data[2] = uri;
+                            XSendEvent(d, over, 0, 0, &mut ev);
+                        }
+                    }
+                }
+                if entered && last_pos.elapsed() >= std::time::Duration::from_millis(50) {
+                    last_pos = std::time::Instant::now();
+                    let mut ev: XEvent = std::mem::zeroed();
+                    ev.client.type_ = CLIENT_MESSAGE;
+                    ev.client.display = d;
+                    ev.client.window = target_win;
+                    ev.client.message_type = position;
+                    ev.client.format = 32;
+                    ev.client.data[0] = win as c_ulong;
+                    ev.client.data[2] = ((rx as c_ulong) << 16) | (ry as c_ulong & 0xffff);
+                    ev.client.data[3] = CURRENT_TIME;
+                    ev.client.data[4] = if accepted { action_copy } else { action_ask };
+                    let _ = action_move;
+                    XSendEvent(d, target_win, 0, 0, &mut ev);
+                }
+                XFlush(d);
+                std::thread::sleep(std::time::Duration::from_millis(16));
+            }
+            if entered && target_win != 0 {
+                let mut ev: XEvent = std::mem::zeroed();
+                ev.client.type_ = CLIENT_MESSAGE;
+                ev.client.display = d;
+                ev.client.window = target_win;
+                ev.client.message_type = leave;
+                ev.client.format = 32;
+                ev.client.data[0] = win as c_ulong;
+                XSendEvent(d, target_win, 0, 0, &mut ev);
+            }
+            XSetSelectionOwner(d, selection, 0, CURRENT_TIME);
+            XDestroyWindow(d, win);
+            XCloseDisplay(d);
+        }
+    }
+
+    // -- Wayland -------------------------------------------------------------
+    //
+    // One tracker thread owns one event queue: it binds its own seat and
+    // pointer (every pointer object of a seat hears its events) so the press
+    // serial start_drag demands is known, and runs any drag the window hands
+    // over as a wl_data_source offering text/uri-list.
+
+    use wayland_client::protocol::{
+        wl_data_device::WlDataDevice,
+        wl_data_device_manager::{DndAction, WlDataDeviceManager},
+        wl_data_source::WlDataSource,
+        wl_pointer::{self, WlPointer},
+        wl_registry::{self, WlRegistry},
+        wl_seat::{self, WlSeat},
+    };
+    use wayland_client::{Connection, Dispatch, QueueHandle};
+
+    struct Tracker {
+        serial: u32,
+        seat: Option<WlSeat>,
+        manager: Option<WlDataDeviceManager>,
+        device: Option<WlDataDevice>,
+        origin: Option<wayland_client::protocol::wl_surface::WlSurface>,
+        done: bool,
+        payload: String,
+    }
+
+    impl Dispatch<WlRegistry, ()> for Tracker {
+        fn event(
+            state: &mut Self,
+            registry: &WlRegistry,
+            event: wl_registry::Event,
+            _: &(),
+            _: &Connection,
+            qh: &QueueHandle<Self>,
+        ) {
+            if let wl_registry::Event::Global { name, interface, version } = event {
+                match interface.as_str() {
+                    "wl_seat" if state.seat.is_none() => {
+                        state.seat = Some(registry.bind::<WlSeat, _, _>(name, version.min(5), qh, ()));
+                    }
+                    "wl_data_device_manager" if state.manager.is_none() => {
+                        state.manager =
+                            Some(registry.bind::<WlDataDeviceManager, _, _>(name, version.min(3), qh, ()));
+                    }
+                    "wl_compositor" if state.origin.is_none() => {
+                        let comp = registry.bind::<wayland_client::protocol::wl_compositor::WlCompositor, _, _>(
+                            name,
+                            version.min(4),
+                            qh,
+                            (),
+                        );
+                        state.origin = Some(comp.create_surface(qh, ()));
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    impl Dispatch<WlSeat, ()> for Tracker {
+        fn event(_: &mut Self, _: &WlSeat, _: wl_seat::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    }
+
+    impl Dispatch<WlDataDeviceManager, ()> for Tracker {
+        fn event(_: &mut Self, _: &WlDataDeviceManager, _: wayland_client::protocol::wl_data_device_manager::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    }
+
+    impl Dispatch<wayland_client::protocol::wl_compositor::WlCompositor, ()> for Tracker {
+        fn event(_: &mut Self, _: &wayland_client::protocol::wl_compositor::WlCompositor, _: wayland_client::protocol::wl_compositor::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    }
+
+    impl Dispatch<wayland_client::protocol::wl_surface::WlSurface, ()> for Tracker {
+        fn event(_: &mut Self, _: &wayland_client::protocol::wl_surface::WlSurface, _: wayland_client::protocol::wl_surface::Event, _: &(), _: &Connection, _: &QueueHandle<Self>) {}
+    }
+
+    impl Dispatch<WlPointer, ()> for Tracker {
+        fn event(
+            state: &mut Self,
+            _: &WlPointer,
+            event: wl_pointer::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            if let wl_pointer::Event::Button { serial, state: btn, .. } = event {
+                if btn == wayland_client::WEnum::Value(wl_pointer::ButtonState::Pressed) {
+                    state.serial = serial;
+                }
+            }
+        }
+    }
+
+    impl Dispatch<WlDataDevice, ()> for Tracker {
+        fn event(
+            _: &mut Self,
+            _: &WlDataDevice,
+            _: wayland_client::protocol::wl_data_device::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+        }
+    }
+
+    impl Dispatch<WlDataSource, ()> for Tracker {
+        fn event(
+            state: &mut Self,
+            _: &WlDataSource,
+            event: wayland_client::protocol::wl_data_source::Event,
+            _: &(),
+            _: &Connection,
+            _: &QueueHandle<Self>,
+        ) {
+            use wayland_client::protocol::wl_data_source::Event;
+            match event {
+                Event::Send { mime_type, fd } => {
+                    // We own the write end; taking it as a File closes it on
+                    // drop, which is what the compositor expects.
+                    let mut file = std::fs::File::from(fd);
+                    if mime_type == "text/uri-list" {
+                        use std::io::Write;
+                        let _ = file.write_all(state.payload.as_bytes());
+                    }
+                }
+                Event::Cancelled | Event::DndFinished => state.done = true,
+                _ => {}
+            }
+        }
+    }
+
+    /// Dispatch what arrived, then sleep: an idle tracker costs a sleeping
+    /// thread, and a handoff is picked up within the timeout.
+    fn pump(
+        queue: &mut wayland_client::EventQueue<Tracker>,
+        conn: &Connection,
+        state: &mut Tracker,
+        timeout_ms: u64,
+    ) {
+        let _ = queue.dispatch_pending(state);
+        let _ = conn.flush();
+        std::thread::sleep(std::time::Duration::from_millis(timeout_ms));
+        let _ = queue.dispatch_pending(state);
+    }
+
+    fn wayland_tracker(rx: std::sync::mpsc::Receiver<Vec<PathBuf>>) {
+        let Ok(conn) = Connection::connect_to_env() else { return };
+        let mut queue = conn.new_event_queue();
+        let qh = queue.handle();
+        let mut state = Tracker {
+            serial: 0,
+            seat: None,
+            manager: None,
+            device: None,
+            origin: None,
+            done: false,
+            payload: String::new(),
+        };
+        let _registry = conn.display().get_registry(&qh, ());
+        if queue.roundtrip(&mut state).is_err() {
+            return;
+        }
+        let (Some(seat), Some(manager)) = (state.seat.clone(), state.manager.clone()) else {
+            return;
+        };
+        let _pointer = seat.get_pointer(&qh, ());
+        state.device = Some(manager.get_data_device(&seat, &qh, ()));
+        if queue.roundtrip(&mut state).is_err() {
+            return;
+        }
+        loop {
+            pump(&mut queue, &conn, &mut state, 100);
+            let Ok(paths) = rx.try_recv() else { continue };
+            if state.serial == 0 {
+                continue;
+            }
+            state.payload = uri_list(&paths);
+            state.done = false;
+            let source = manager.create_data_source(&qh, ());
+            source.offer("text/uri-list".to_string());
+            source.set_actions(DndAction::Copy | DndAction::Move);
+            if let (Some(device), Some(origin)) = (&state.device, &state.origin) {
+                device.start_drag(Some(&source), origin, None, state.serial);
+            }
+            let _ = conn.flush();
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(120);
+            while !state.done && std::time::Instant::now() < until {
+                pump(&mut queue, &conn, &mut state, 20);
+            }
+            source.destroy();
+            let _ = conn.flush();
+            state.payload.clear();
+        }
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

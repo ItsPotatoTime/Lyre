@@ -31,6 +31,7 @@ mod defaultmanager;
 mod fileops;
 mod frame;
 mod imagery;
+mod osdrag;
 mod search;
 mod shell;
 mod updates;
@@ -452,6 +453,34 @@ struct Marquee {
     auto_scroll: i8,
 }
 
+/// Drops the OS staged inside its own Drop handler: hit-test the landing point
+/// and copy them in, keeping the staging alive until the paste finishes.
+fn drain_osdrop(s: &mut App, tx: &mut Tx) -> bool {
+    let mut msgs = Vec::new();
+    if let Some(rx) = &s.osdrop_rx {
+        while let Ok(m) = rx.try_recv() {
+            msgs.push(m);
+        }
+    }
+    let any = !msgs.is_empty();
+    for m in msgs {
+        let at = m.at;
+        let paths = m.paths;
+        tx.element_at(at.0, at.1, move |s: &mut App, picked, _tx: &mut Tx| {
+            let (_, target) = picked
+                .map(|p| parse_drop_target(s, p.path()))
+                .unwrap_or_default();
+            let target = target.or_else(|| {
+                matches!(s.view, View::Files | View::Gallery).then_some(DropTarget::Background)
+            });
+            let Some(tp) = drop_target_path(s, target.as_ref()) else { return };
+            s.drop_staged.extend(paths.iter().cloned());
+            paste_into(s, paths.clone(), fileops::Mode::Copy, tp);
+        });
+    }
+    any
+}
+
 /// Where a drag would land: a folder path, a tab's folder, or the empty
 /// background of the folder on screen.
 #[derive(Clone, Debug, PartialEq)]
@@ -567,6 +596,10 @@ struct App {
     rect_crumb_tail: Live<[f32; 4]>,
     /// Subfolders listed by the breadcrumb tail dropdown, read when it opens.
     tail_folders: Vec<(String, String)>,
+    /// Drops the OS thread staged and handed over, and the staging roots the
+    /// running paste still needs alive.
+    osdrop_rx: Option<std::sync::mpsc::Receiver<osdrag::OsDrop>>,
+    drop_staged: Vec<PathBuf>,
     thumb_cache: RefCell<HashMap<String, Image>>,
     /// Cut/copy clipboard, the running transfer, its worker channel and cancel.
     clipboard: Option<(Vec<PathBuf>, fileops::Mode)>,
@@ -1335,6 +1368,7 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
     }
     sync_watch(s);
     changed |= drain_watch(s);
+    changed |= drain_osdrop(s, tx);
     // Clicking away from the address editor cancels it, as Explorer does.
     if s.address_edit.as_ref().is_some_and(|e| !e.focused) {
         s.address_edit = None;
@@ -1736,6 +1770,9 @@ fn init() -> App {
     let (icon_tx, icon_jobs) = std::sync::mpsc::channel::<IconJob>();
     let (icon_done, icon_rx) = std::sync::mpsc::channel::<IconDone>();
     let (rescan_tx, rescan_rx) = std::sync::mpsc::channel::<watch::Refreshed>();
+    let (osdrop_tx, osdrop_rx) = std::sync::mpsc::channel::<osdrag::OsDrop>();
+    osdrag::set_sender(osdrop_tx);
+    osdrag::sweep_stale();
     std::thread::spawn(move || {
         imagery::prepare_thread();
         while let Ok(job) = icon_jobs.recv() {
@@ -1811,6 +1848,8 @@ fn init() -> App {
         address_edit: None,
         rect_crumb_tail: Live::new([0.0; 4]),
         tail_folders: Vec::new(),
+        osdrop_rx: Some(osdrop_rx),
+        drop_staged: Vec::new(),
         thumb_cache: RefCell::new(HashMap::new()),
         clipboard: None,
         transfer: None,
@@ -2912,6 +2951,17 @@ fn view(s: &App, cx: &mut Cx<App>) -> El {
         .fill(p.title)
         .drawn_rect_into(&s.rect_window)
         .on_press(|s: &mut App| s.menu = None)
+        .on_drop_files(|s: &mut App, files, _tx: &mut Tx| {
+            // Platforms whose host delivers drops itself (Linux, macOS) land
+            // here; Windows uses its own IDropTarget with the landing point.
+            if !matches!(s.view, View::Files | View::Gallery) {
+                return;
+            }
+            let staged = osdrag::stage(files);
+            s.drop_staged.extend(staged.iter().cloned());
+            let target = s.root.clone();
+            paste_into(s, staged, fileops::Mode::Copy, target);
+        })
         .child(tab_strip(s, p))
         .child(address_row(s, p))
         .child(command_bar(s, p))
@@ -5291,6 +5341,19 @@ fn row_drag(s: &mut App, rect_i: usize, ei: usize, d: &mut rune::Drag, tx: &mut 
                 dr.at = at;
                 dr.shift = shift;
             }
+            // Leaving the window hands the same gesture to the OS, so it can
+            // finish in a browser or another app without a second drag.
+            #[cfg(target_os = "windows")]
+            if let Some(dr) = &s.drag {
+                let w = s.rect_window.get();
+                if at.0 < w[0] || at.0 > w[0] + w[2] || at.1 < w[1] || at.1 > w[1] + w[3] {
+                    let paths: Vec<PathBuf> = dr.paths.iter().map(PathBuf::from).collect();
+                    s.drag = None;
+                    s.drag_press = None;
+                    osdrag::win::start_drag_out(&paths);
+                    return;
+                }
+            }
             tx.element_at(at.0, at.1, move |s: &mut App, picked, _tx: &mut Tx| {
                 let (key, mut target) = picked
                     .map(|p| parse_drop_target(s, p.path()))
@@ -5901,6 +5964,7 @@ fn drain_op(s: &mut App) -> bool {
         s.op_rx = None;
         s.op_cancel = None;
         s.transfer = None;
+        osdrag::release(&std::mem::take(&mut s.drop_staged));
         clear_selection(s);
         if s.view == View::Files {
             let root = s.root.clone();

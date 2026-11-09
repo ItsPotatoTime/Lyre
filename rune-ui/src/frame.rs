@@ -129,6 +129,9 @@ mod imp {
             if let RawWindowHandle::Win32(win) = raw.as_raw() {
                 let hwnd = win.hwnd.get();
                 let _ = HWND.set(hwnd);
+                if let Some(tx) = crate::osdrag::sender() {
+                    crate::osdrag::win::register(hwnd, tx);
+                }
                 const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
                 const DWMWCP_ROUND: u32 = 2;
                 let preference = DWMWCP_ROUND;

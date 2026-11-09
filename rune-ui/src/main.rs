@@ -360,6 +360,7 @@ enum DropMenu {
     View,
     Filter,
     More,
+    Subfolders,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -536,6 +537,11 @@ struct App {
     rescan_rx: std::sync::mpsc::Receiver<watch::Refreshed>,
     /// A refresh that arrived while an inline rename owned its row.
     pending_refresh: Option<watch::Refreshed>,
+    /// The address bar turned into a path editor; None shows breadcrumbs.
+    address_edit: Option<TextEdit>,
+    rect_crumb_tail: Live<[f32; 4]>,
+    /// Subfolders listed by the breadcrumb tail dropdown, read when it opens.
+    tail_folders: Vec<(String, String)>,
     thumb_cache: RefCell<HashMap<String, Image>>,
     /// Cut/copy clipboard, the running transfer, its worker channel and cancel.
     clipboard: Option<(Vec<PathBuf>, fileops::Mode)>,
@@ -717,6 +723,7 @@ fn switch_tab(s: &mut App, index: usize) {
     restore_tab(s, &tab);
     s.menu = None;
     s.marquee = None;
+    s.address_edit = None;
     rescan_restored(s);
 }
 
@@ -770,6 +777,7 @@ fn close_tab_at(s: &mut App, index: usize) {
     let tab = s.tabs[s.active_tab].clone();
     restore_tab(s, &tab);
     s.menu = None;
+    s.address_edit = None;
     rescan_restored(s);
 }
 
@@ -1300,6 +1308,11 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
     }
     sync_watch(s);
     changed |= drain_watch(s);
+    // Clicking away from the address editor cancels it, as Explorer does.
+    if s.address_edit.as_ref().is_some_and(|e| !e.focused) {
+        s.address_edit = None;
+        changed = true;
+    }
     changed |= drain_search(s);
     if s.search_busy {
         tx.wake_after(std::time::Duration::from_millis(40));
@@ -1357,6 +1370,7 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
 
 fn set_location(s: &mut App, path: PathBuf) {
     clear_search(s);
+    s.address_edit = None;
     let (entries, scan_ms) = scan(&path);
     let crumbs: Vec<String> = path
         .components()
@@ -1457,6 +1471,7 @@ fn refresh_volumes(s: &mut App) {
 
 fn load(s: &mut App, f: Fixture) {
     s.groups.clear();
+    s.address_edit = None;
     s.preview = false;
     s.contextual = false;
     s.mode = Mode::Details;
@@ -1760,6 +1775,9 @@ fn init() -> App {
         rescan_tx,
         rescan_rx,
         pending_refresh: None,
+        address_edit: None,
+        rect_crumb_tail: Live::new([0.0; 4]),
+        tail_folders: Vec::new(),
         thumb_cache: RefCell::new(HashMap::new()),
         clipboard: None,
         transfer: None,
@@ -3019,31 +3037,236 @@ fn nav_button(p: Paint, which: Ico, key: &str, action: usize, enabled: bool, tip
         })
 }
 
-fn address_row(s: &App, p: Paint) -> El {
-    let mut crumb = row()
-        .key("breadcrumb")
-        .grow(1.0)
-        .min_w(120.0)
-        .h(FIELD_H)
-        .radius(4.0)
-        .fill(p.field)
-        .border(p.hair, p.field_line)
-        .px(10.0)
-        .gap(6.0)
-        .items_center()
-        .child(if s.view == View::Home {
-            place_glyph(0, 15.0)
-        } else {
-            ico(p, Ico::ThisPc, 15.0, p.secondary)
-        });
-    for (i, part) in s.crumbs.iter().enumerate() {
-        crumb = crumb
-            .child(ico(p, Ico::ChevronRight, 10.0, p.tertiary))
-            .child(text(part.as_str()).font(UI_TEXT).color(p.text).truncate());
-        if i + 1 == s.crumbs.len() {
-            crumb = crumb.child(ico(p, Ico::ChevronRight, 10.0, p.tertiary));
+/// The breadcrumb segments of the place on screen, each with the path it
+/// opens. Virtual places offer their single label; a real root offers every
+/// component, drive prefix included, with the prefix path it stands for.
+fn crumb_segments(s: &App) -> Vec<(String, PathBuf)> {
+    match s.view {
+        View::Home => return vec![("Home".into(), PathBuf::new())],
+        View::ThisPc => return vec![("This PC".into(), PathBuf::new())],
+        View::Gallery => return vec![("Gallery".into(), s.root.clone())],
+        View::Files => {}
+    }
+    use std::path::Component;
+    let mut prefix = PathBuf::new();
+    let mut out = Vec::new();
+    for part in s.root.components() {
+        match part {
+            Component::Prefix(p) => {
+                prefix.push(p.as_os_str());
+                prefix.push("\\");
+                out.push((p.as_os_str().to_string_lossy().into_owned(), prefix.clone()));
+            }
+            Component::RootDir => {
+                prefix.push(std::path::MAIN_SEPARATOR.to_string());
+                // On Windows the root belongs to the drive prefix ("C:\"),
+                // not to a crumb of its own.
+                if !cfg!(windows) {
+                    out.push(("/".into(), prefix.clone()));
+                }
+            }
+            Component::Normal(n) => {
+                prefix.push(n);
+                out.push((n.to_string_lossy().into_owned(), prefix.clone()));
+            }
+            _ => {}
         }
     }
+    out
+}
+
+/// A breadcrumb press: virtual places reload themselves, a real segment opens
+/// the prefix path it names.
+fn open_crumb(s: &mut App, path: PathBuf) {
+    match s.view {
+        View::Home => load(s, Fixture::Home),
+        View::ThisPc => navigate(s, 9),
+        View::Gallery => go_gallery(s),
+        View::Files => go(s, path),
+    }
+}
+
+/// Turn the bar into a path editor with the current path selected, as Ctrl+L
+/// and a click on the empty field do in Explorer.
+fn begin_address_edit(s: &mut App) {
+    if s.address_edit.is_some() {
+        return;
+    }
+    let draft = match s.view {
+        View::Files | View::Gallery => s.root.to_string_lossy().into_owned(),
+        _ => String::new(),
+    };
+    let mut edit = TextEdit::new(draft);
+    edit.anchor = 0;
+    edit.focus = edit.text.chars().count();
+    edit.focused = true;
+    s.search_edit.focused = false;
+    s.menu = None;
+    s.address_edit = Some(edit);
+}
+
+/// Enter in the address editor: open what was typed. Relative paths resolve
+/// against the folder on screen; the virtual places answer to their names; a
+/// path that is not a folder keeps the editor open with a notice.
+fn commit_address(s: &mut App) {
+    let Some(edit) = s.address_edit.take() else { return };
+    let draft = edit.text.trim().trim_matches('"').to_string();
+    if draft.is_empty() {
+        return;
+    }
+    match draft.to_ascii_lowercase().as_str() {
+        "home" => return load(s, Fixture::Home),
+        "this pc" | "thispc" => return navigate(s, 9),
+        "gallery" => return go_gallery(s),
+        _ => {}
+    }
+    let path = if let Some(rest) = draft.strip_prefix('~') {
+        match home_dir() {
+            Some(home) => home.join(rest.trim_start_matches(['/', '\\'])),
+            None => PathBuf::from(&draft),
+        }
+    } else {
+        let typed = PathBuf::from(&draft);
+        if typed.is_absolute() { typed } else { s.root.join(typed) }
+    };
+    if path == s.root && s.view == View::Files {
+        return;
+    }
+    if path.is_dir() {
+        go(s, path);
+    } else {
+        s.notice = format!("{} is not available here", draft);
+        let mut edit = TextEdit::new(draft);
+        edit.anchor = 0;
+        edit.focus = edit.text.chars().count();
+        edit.focused = true;
+        s.address_edit = Some(edit);
+    }
+}
+
+fn address_row(s: &App, p: Paint) -> El {
+    let crumb = if let Some(edit) = &s.address_edit {
+        row()
+            .key("breadcrumb")
+            .grow(1.0)
+            .min_w(120.0)
+            .h(FIELD_H)
+            .radius(4.0)
+            .fill(p.field)
+            .border(p.hair, p.field_line)
+            .px(10.0)
+            .gap(6.0)
+            .items_center()
+            .child(ico(p, Ico::ThisPc, 15.0, p.secondary))
+            .child(
+                text_input(edit, UI_TEXT)
+                    .key("address-edit")
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .single_line()
+                    .color(p.text)
+                    .placeholder("Enter a path", p.tertiary)
+                    .on_edit(|s: &mut App| s.address_edit.as_mut().expect("address editing"))
+                    .on_submit(|s: &mut App, _tx: &mut Tx| commit_address(s)),
+            )
+    } else {
+        let segments = crumb_segments(s);
+        // Deep paths keep their head and tail and fold the middle, as Explorer
+        // does; the fold opens the editor with the whole path.
+        let folded: Vec<Option<&(String, PathBuf)>> = if segments.len() > 5 {
+            let mut v = vec![Some(&segments[0]), None];
+            v.extend(segments[segments.len() - 3..].iter().map(Some));
+            v
+        } else {
+            segments.iter().map(Some).collect()
+        };
+        let mut bar = row()
+            .key("breadcrumb")
+            .grow(1.0)
+            .min_w(120.0)
+            .h(FIELD_H)
+            .radius(4.0)
+            .fill(p.field)
+            .border(p.hair, p.field_line)
+            .px(10.0)
+            .gap(6.0)
+            .items_center()
+            .child(if s.view == View::Home {
+                place_glyph(0, 15.0)
+            } else {
+                ico(p, Ico::ThisPc, 15.0, p.secondary)
+            });
+        for (i, segment) in folded.iter().enumerate() {
+            bar = bar.child(ico(p, Ico::ChevronRight, 10.0, p.tertiary));
+            match segment {
+                None => {
+                    bar = bar.child(
+                        el().key("crumb-fold")
+                            .h(22.0)
+                            .px(4.0)
+                            .radius(3.0)
+                            .hover(p.hover)
+                            .center()
+                            .child(text("…").font(UI_TEXT).color(p.secondary))
+                            .help("Edit address")
+                            .on_press(|s: &mut App| begin_address_edit(s)),
+                    );
+                }
+                Some((label, path)) => {
+                    let tip = if path.as_os_str().is_empty() {
+                        label.clone()
+                    } else {
+                        path.to_string_lossy().into_owned()
+                    };
+                    let path = path.clone();
+                    bar = bar.child(
+                        el().key(format!("crumb-{i}"))
+                            .h(22.0)
+                            .px(4.0)
+                            .radius(3.0)
+                            .hover(p.hover)
+                            .center()
+                            .child(text(label.as_str()).font(UI_TEXT).color(p.text).truncate())
+                            .help(tip)
+                            .on_press(move |s: &mut App| open_crumb(s, path.clone())),
+                    );
+                }
+            }
+        }
+        bar = bar.child(ico(p, Ico::ChevronRight, 10.0, p.tertiary));
+        if matches!(s.view, View::Files | View::Gallery) {
+            bar = bar.child(
+                el().key("crumb-tail")
+                    .size(22.0, 22.0)
+                    .radius(3.0)
+                    .hover(p.hover)
+                    .center()
+                    .drawn_rect_into(&s.rect_crumb_tail)
+                    .child(ico(p, Ico::ChevronDown, 10.0, p.tertiary))
+                    .help("Open a subfolder")
+                    .on_press(|s: &mut App| {
+                        s.tail_folders = fs::read_dir(&s.root)
+                            .into_iter()
+                            .flatten()
+                            .flatten()
+                            .filter(|e| e.path().is_dir())
+                            .take(30)
+                            .map(|e| {
+                                (
+                                    e.file_name().to_string_lossy().into_owned(),
+                                    e.path().to_string_lossy().into_owned(),
+                                )
+                            })
+                            .collect();
+                        let r = s.rect_crumb_tail.get();
+                        open_drop(s, DropMenu::Subfolders, r);
+                    }),
+            );
+        }
+        // The blank space right of the crumbs opens the editor, as a click on
+        // the empty field does in Explorer.
+        bar.child(el().grow(1.0).h_full().on_press(|s: &mut App| begin_address_edit(s)))
+    };
     row()
         .key("address")
         .w_full()
@@ -3360,6 +3583,23 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                     );
                     rows.push(menu_item(p, "Shortcut", Some(Ico::New), None, true));
                     h += MENU_ROW_H * 2.0;
+                }
+                DropMenu::Subfolders => {
+                    if s.tail_folders.is_empty() {
+                        rows.push(menu_item(p, "No subfolders", None, None, true));
+                        h += MENU_ROW_H;
+                    }
+                    for (name, path) in s.tail_folders.clone() {
+                        rows.push(
+                            menu_item(p, &name, None, None, false).on_press(
+                                move |s: &mut App| {
+                                    s.menu = None;
+                                    go(s, PathBuf::from(&path));
+                                },
+                            ),
+                        );
+                        h += MENU_ROW_H;
+                    }
                 }
                 DropMenu::Sort => {
                     for (k, label) in [(0u8, "Name"), (1, "Date modified"), (2, "Type"), (3, "Size")] {
@@ -5425,6 +5665,25 @@ fn open_recent(s: &mut App, i: usize) {
 /// Global shortcuts. Returns true when the key was handled. Editing keys are
 /// left to a focused field or an open dialog.
 fn handle_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
+    if s.address_edit.is_some() {
+        match ev.key {
+            Key::Escape => {
+                s.address_edit = None;
+                return true;
+            }
+            Key::Enter => {
+                commit_address(s);
+                return true;
+            }
+            _ => return false,
+        }
+    }
+    if ev.is_command('l')
+        || (ev.mods.alt && matches!(&ev.key, Key::Text(t) if t.eq_ignore_ascii_case("d")))
+    {
+        begin_address_edit(s);
+        return true;
+    }
     if ev.key == Key::Escape {
         if s.dialog.is_some() {
             s.dialog = None;
@@ -6249,6 +6508,7 @@ fn refresh_gallery(s: &mut App) {
 /// no-op, as with the other places.
 fn go_gallery(s: &mut App) {
     s.menu = None;
+    s.address_edit = None;
     if s.view == View::Gallery {
         return;
     }
@@ -6773,6 +7033,27 @@ fn main() {
                 load(s, Fixture::Downloads);
                 s.menu = Some(Menu::Drop { kind: DropMenu::Sort, x: 336.0, y: 132.0 });
             }),
+            ("address", |s| {
+                load(s, Fixture::Downloads);
+                begin_address_edit(s);
+            }),
+            ("crumbmenu", |s| {
+                load(s, Fixture::Downloads);
+                s.tail_folders = fs::read_dir(&s.root)
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+                    .filter(|e| e.path().is_dir())
+                    .take(6)
+                    .map(|e| {
+                        (
+                            e.file_name().to_string_lossy().into_owned(),
+                            e.path().to_string_lossy().into_owned(),
+                        )
+                    })
+                    .collect();
+                s.menu = Some(Menu::Drop { kind: DropMenu::Subfolders, x: 700.0, y: 100.0 });
+            }),
             ("favorites", |s| {
                 load(s, Fixture::Home);
                 s.home_tab = 1;
@@ -7094,5 +7375,68 @@ mod tests {
         }
         assert!(gone, "switching back must rescan what happened while the tab was away");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The address editor resolves relative paths against the folder on screen,
+    /// opens absolute paths, answers to the virtual places' names, and keeps
+    /// the editor open with a notice when the typed path is not a folder.
+    #[test]
+    fn address_commit_covers_relative_absolute_virtual_and_missing() {
+        let base = std::env::temp_dir().join(format!("lyre-address-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        let mut s = init();
+        s.view = View::Files;
+        s.root = base.clone();
+        s.entries = scan(&base).0;
+        refresh_visible(&mut s);
+        s.address_edit = Some(TextEdit::new("sub"));
+        commit_address(&mut s);
+        assert_eq!(s.root, base.join("sub"));
+        assert!(s.address_edit.is_none());
+        s.address_edit = Some(TextEdit::new(base.to_string_lossy().into_owned()));
+        commit_address(&mut s);
+        assert_eq!(s.root, base);
+        s.address_edit = Some(TextEdit::new("missing"));
+        commit_address(&mut s);
+        assert!(s.address_edit.is_some(), "a bad path keeps the editor for correction");
+        assert!(!s.notice.is_empty());
+        s.address_edit = Some(TextEdit::new("Home"));
+        commit_address(&mut s);
+        assert!(matches!(s.view, View::Home));
+        s.address_edit = Some(TextEdit::new("This PC"));
+        commit_address(&mut s);
+        assert!(matches!(s.view, View::ThisPc));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Every breadcrumb names the prefix path it opens, on both path flavours,
+    /// and the virtual places offer their single label instead.
+    #[test]
+    fn crumbs_carry_the_prefix_path_they_open() {
+        let mut s = init();
+        s.view = View::Files;
+        s.root = if cfg!(windows) {
+            PathBuf::from("C:\\a\\b\\c")
+        } else {
+            PathBuf::from("/a/b/c")
+        };
+        let segs = crumb_segments(&s);
+        let names: Vec<&str> = segs.iter().map(|(n, _)| n.as_str()).collect();
+        if cfg!(windows) {
+            assert_eq!(names, vec!["C:", "a", "b", "c"]);
+            assert_eq!(segs[0].1, PathBuf::from("C:\\"));
+            assert_eq!(segs[2].1, PathBuf::from("C:\\a\\b"));
+        } else {
+            assert_eq!(names, vec!["/", "a", "b", "c"]);
+            assert_eq!(segs[0].1, PathBuf::from("/"));
+            assert_eq!(segs[2].1, PathBuf::from("/a/b"));
+        }
+        s.view = View::Home;
+        assert_eq!(crumb_segments(&s)[0].0, "Home");
+        s.view = View::ThisPc;
+        assert_eq!(crumb_segments(&s)[0].0, "This PC");
+        s.view = View::Gallery;
+        assert_eq!(crumb_segments(&s)[0].0, "Gallery");
     }
 }

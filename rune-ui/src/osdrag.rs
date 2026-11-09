@@ -282,11 +282,12 @@ pub mod win {
         out
     }
 
+    #[repr(C)]
     struct Target {
-        refs: AtomicUsize,
-        // COM reads the vtable through the object pointer, not through Rust.
+        // COM reads the vtable pointer at offset zero; the refcount follows.
         #[allow(dead_code)]
         vtable: &'static TargetVtable,
+        refs: AtomicUsize,
         tx: Sender<OsDrop>,
         descriptor: u16,
         contents: u16,
@@ -493,8 +494,8 @@ pub mod win {
         unsafe {
             CoInitializeEx(std::ptr::null_mut(), 0x2);
             let target = Box::new(Target {
-                refs: AtomicUsize::new(1),
                 vtable: &TARGET_VTABLE,
+                refs: AtomicUsize::new(1),
                 tx,
                 descriptor: format_name("FileDescriptorW"),
                 contents: format_name("FileContents"),
@@ -512,10 +513,11 @@ pub mod win {
     // Two COM objects: the data (CF_HDROP) and the drag source (continue and
     // feedback), as DoDragDrop expects one of each.
 
+    #[repr(C)]
     struct Data {
-        refs: AtomicUsize,
         #[allow(dead_code)]
         vtable: &'static DataObjVtable,
+        refs: AtomicUsize,
         hdrop: Vec<u8>,
     }
 
@@ -590,10 +592,11 @@ pub mod win {
         _rest: [std::ptr::null(); 6],
     });
 
+    #[repr(C)]
     struct DragSource {
-        refs: AtomicUsize,
         #[allow(dead_code)]
         vtable: &'static DropSourceVtable,
+        refs: AtomicUsize,
     }
 
     #[repr(C)]
@@ -677,6 +680,20 @@ pub mod win {
             d_release(data);
             src_release(source);
         });
+    }
+
+    #[cfg(test)]
+    mod com_tests {
+        use super::*;
+
+        /// OLE calls through the pointer at offset zero; a refcount there is an
+        /// access violation the moment RegisterDragDrop addrefs the target.
+        #[test]
+        fn com_objects_start_with_their_vtable() {
+            assert_eq!(std::mem::offset_of!(Target, vtable), 0);
+            assert_eq!(std::mem::offset_of!(Data, vtable), 0);
+            assert_eq!(std::mem::offset_of!(DragSource, vtable), 0);
+        }
     }
 }
 

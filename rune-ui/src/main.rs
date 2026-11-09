@@ -35,6 +35,7 @@ mod search;
 mod shell;
 mod updates;
 mod volumes;
+mod watch;
 
 // Metrics and colours sampled from the four reference captures. The chrome is
 // three distinct bands, not one surface: a near-black tab strip, a Mica-tinted
@@ -272,7 +273,7 @@ fn app_color(name: &str) -> &'static str {
 }
 
 #[derive(Clone)]
-struct Entry {
+pub(crate) struct Entry {
     name: String,
     path: String,
     is_dir: bool,
@@ -522,6 +523,15 @@ struct App {
     icon_tx: std::sync::mpsc::Sender<IconJob>,
     icon_rx: std::sync::mpsc::Receiver<IconDone>,
     icons_pending: std::cell::Cell<usize>,
+    /// Wakes the window from a worker thread; installed once the app handle
+    /// exists, so a watch never needs a polling timer to be noticed.
+    waker: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    /// The live folder watch: one blocked kernel wait, replaced on navigation.
+    watch: Option<watch::Handle>,
+    watch_path: Option<PathBuf>,
+    watch_rx: Option<std::sync::mpsc::Receiver<watch::Refreshed>>,
+    /// A refresh that arrived while an inline rename owned its row.
+    pending_refresh: Option<watch::Refreshed>,
     thumb_cache: RefCell<HashMap<String, Image>>,
     /// Cut/copy clipboard, the running transfer, its worker channel and cancel.
     clipboard: Option<(Vec<PathBuf>, fileops::Mode)>,
@@ -795,7 +805,7 @@ fn format_time(secs: u64) -> String {
     format!("{m}/{d}/{y}  {h12}:{:02} {ampm}", (within % 3600) / 60)
 }
 
-fn scan(path: &Path) -> (Vec<Entry>, f64) {
+pub(crate) fn scan(path: &Path) -> (Vec<Entry>, f64) {
     let start = Instant::now();
     let mut entries = Vec::new();
     if let Ok(reader) = fs::read_dir(path) {
@@ -1282,6 +1292,8 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
     if s.icons_pending.get() > 0 {
         tx.wake_after(std::time::Duration::from_millis(16));
     }
+    sync_watch(s);
+    changed |= drain_watch(s);
     changed |= drain_search(s);
     if s.search_busy {
         tx.wake_after(std::time::Duration::from_millis(40));
@@ -1734,6 +1746,11 @@ fn init() -> App {
         icon_tx,
         icon_rx,
         icons_pending: std::cell::Cell::new(0),
+        waker: None,
+        watch: None,
+        watch_path: None,
+        watch_rx: None,
+        pending_refresh: None,
         thumb_cache: RefCell::new(HashMap::new()),
         clipboard: None,
         transfer: None,
@@ -2610,6 +2627,80 @@ fn drain_icons(s: &App) -> bool {
         {
             px.set(w, h, rgba);
             changed = true;
+        }
+    }
+    changed
+}
+
+/// Watch exactly the folder on screen. One watch per window: navigating,
+/// switching tabs or entering search replaces it; Home and This PC have none.
+fn sync_watch(s: &mut App) {
+    let wanted = if s.searching {
+        None
+    } else {
+        match s.view {
+            View::Files | View::Gallery => Some(s.root.clone()),
+            _ => None,
+        }
+    };
+    if wanted == s.watch_path {
+        return;
+    }
+    s.watch = None;
+    s.watch_rx = None;
+    s.watch_path = wanted.clone();
+    s.pending_refresh = None;
+    let (Some(path), Some(wake)) = (wanted, s.waker.clone()) else { return };
+    let (handle, rx) = watch::spawn(path, wake);
+    s.watch = Some(handle);
+    s.watch_rx = Some(rx);
+}
+
+/// Swap a watched folder's new listing in without disturbing the person:
+/// selection, focus and anchor follow their paths, and the scroll stays put.
+fn apply_refresh(s: &mut App, msg: watch::Refreshed) {
+    let path_of = |i: usize| s.entries.get(i).map(|e| e.path.clone());
+    let selected: Vec<String> = s.selected.iter().filter_map(|&i| path_of(i)).collect();
+    let focused = s.focused.and_then(path_of);
+    let anchor = s.anchor.and_then(path_of);
+    s.entries = msg.entries;
+    s.scan_ms = msg.scan_ms;
+    refresh_visible(s);
+    let index_of = |p: &String| s.entries.iter().position(|e| &e.path == p);
+    s.selected = selected.iter().filter_map(index_of).collect();
+    s.focused = focused.as_ref().and_then(index_of);
+    s.anchor = anchor.as_ref().and_then(index_of);
+    update_selection_detail(s);
+}
+
+/// Drain finished rescans. An inline rename owns its row: hold the refresh
+/// until the editor closes rather than pulling it out from under the typing.
+fn drain_watch(s: &mut App) -> bool {
+    let mut msgs = Vec::new();
+    if let Some(rx) = &s.watch_rx {
+        while let Ok(msg) = rx.try_recv() {
+            msgs.push(msg);
+        }
+    }
+    let mut changed = false;
+    let renaming = matches!(s.dialog, Some(Dialog::Rename { .. }));
+    for msg in msgs {
+        if msg.path != s.root || s.searching {
+            continue;
+        }
+        if renaming {
+            s.pending_refresh = Some(msg);
+        } else {
+            apply_refresh(s, msg);
+            changed = true;
+        }
+    }
+    if !renaming {
+        if let Some(msg) = s.pending_refresh.take() {
+            if msg.path == s.root && !s.searching {
+                apply_refresh(s, msg);
+                changed = true;
+            }
         }
     }
     changed
@@ -6779,6 +6870,13 @@ fn main() {
             }
             .macos(rune::MacWindowOptions::default().corner_radius(8.0)),
         );
+        // The folder watch rescan lands on a worker thread; this handle is how
+        // it wakes the event loop without any polling timer on the UI side.
+        let app_handle = window.app.handle();
+        let wake = app_handle.clone();
+        app_handle.update(move |s: &mut App, _tx: &mut Tx| {
+            s.waker = Some(std::sync::Arc::new(move || wake.wake()));
+        });
         let window = window.on_created(|handle| frame::install(&handle));
         [window.boxed()]
     });
@@ -6834,5 +6932,88 @@ mod tests {
         // A second render is a pure cache hit: no new job.
         let _ = entry_icon(&s, &e, paint(true, 1.0), 16.0);
         assert_eq!(s.icons_pending.get(), 0);
+    }
+
+    /// A live refresh must not disturb the person: selection, focus and anchor
+    /// follow their paths through a reordered listing, and the scroll stays.
+    #[test]
+    fn refresh_keeps_selection_focus_and_scroll_on_their_paths() {
+        let mut s = init();
+        let entry = |name: &str| Entry {
+            name: name.into(),
+            path: format!("/fake/{name}"),
+            is_dir: false,
+            size: 1,
+            modified: String::new(),
+            modified_at: None,
+            type_label: "File".into(),
+            kind: classify(name, false),
+            hidden: false,
+            system: false,
+            fixture: false,
+            fixture_size: String::new(),
+        };
+        s.entries = vec![entry("a"), entry("b"), entry("c")];
+        refresh_visible(&mut s);
+        s.selected = vec![1];
+        s.focused = Some(1);
+        s.anchor = Some(1);
+        s.scroll_off.set(120.0);
+        update_selection_detail(&mut s);
+        let root = s.root.clone();
+        apply_refresh(&mut s, watch::Refreshed {
+            path: root.clone(),
+            entries: vec![entry("new"), entry("c"), entry("b"), entry("a")],
+            scan_ms: 0.1,
+        });
+        let names = |idx: &Vec<usize>| idx.iter().map(|&i| s.entries[i].name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&s.selected), vec!["b"]);
+        assert_eq!(s.focused.map(|i| s.entries[i].name.as_str()), Some("b"));
+        assert_eq!(s.anchor.map(|i| s.entries[i].name.as_str()), Some("b"));
+        assert_eq!(s.scroll_off.get(), 120.0);
+        // A selected file that disappears leaves no dangling index behind.
+        apply_refresh(&mut s, watch::Refreshed {
+            path: root,
+            entries: vec![entry("new"), entry("c"), entry("a")],
+            scan_ms: 0.1,
+        });
+        assert!(s.selected.is_empty());
+        assert_eq!(s.focused, None);
+    }
+
+    /// The whole live-refresh path: arming on the open folder, an external
+    /// write, and the rescan landing in the showing entries without a poll
+    /// timer — the watcher thread does the waiting and the scanning.
+    #[test]
+    fn an_external_write_lands_in_the_open_folder() {
+        let dir = std::env::temp_dir().join(format!("lyre-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = init();
+        s.waker = Some(std::sync::Arc::new(|| {}));
+        s.view = View::Files;
+        s.root = dir.clone();
+        s.entries = scan(&dir).0;
+        refresh_visible(&mut s);
+        sync_watch(&mut s);
+        assert!(s.watch.is_some(), "the open folder must be watched");
+        std::fs::write(dir.join("appeared.txt"), b"x").unwrap();
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        let mut landed = false;
+        while Instant::now() < deadline {
+            if drain_watch(&mut s) {
+                landed = s.entries.iter().any(|e| e.name == "appeared.txt");
+                if landed {
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(landed, "the external write must appear without any manual refresh");
+        // Leaving the folder retires the watch.
+        s.view = View::Home;
+        sync_watch(&mut s);
+        assert!(s.watch.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

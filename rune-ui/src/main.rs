@@ -4573,6 +4573,21 @@ fn marquee_track(el: El, i: usize) -> El {
     })
 }
 
+/// The context-menu target under a window point: the item whose recorded rect
+/// contains it, or the background. The scrim uses this to move an open menu to
+/// whatever a right-click lands on.
+fn context_target_at(s: &App, x: f32, y: f32) -> (CtxScope, usize) {
+    let len = if s.view == View::ThisPc { s.volumes.len() } else { display_len(s) };
+    let rects = s.marquee_rects.borrow();
+    for (i, r) in rects.iter().take(len).enumerate() {
+        if x >= r[0] && x <= r[2] && y >= r[1] && y <= r[3] {
+            let scope = if s.view == View::ThisPc { CtxScope::Volume } else { CtxScope::Item };
+            return (scope, i);
+        }
+    }
+    (CtxScope::Background, 0)
+}
+
 /// Select every visible row whose drawn rect the band crosses, at a given
 /// scroll offset (the live one, or the offset a poll is about to scroll to).
 fn apply_marquee_at(s: &mut App, off: f32) {
@@ -5799,7 +5814,7 @@ fn home_content(s: &App, p: Paint) -> El {
                     }
                     st.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
                 });
-            table = table.child(row);
+            table = table.child(marquee_track(row, ei));
         }
     } else if s.favorites.is_empty() {
         table = table.child(
@@ -5967,7 +5982,7 @@ fn this_pc_content(s: &App, p: Paint) -> El {
                 s.volumes_selected = Some(vi);
                 s.menu = Some(Menu::Context { scope: CtxScope::Volume, target: vi, x: at.x, y: at.y });
             });
-        list = list.child(card);
+        list = list.child(marquee_track(card, vi));
     }
     list
 }
@@ -6123,7 +6138,6 @@ fn gallery_cell(s: &App, i: usize, p: Paint) -> El {
 fn gallery_content(s: &App, p: Paint) -> El {
     let mut out = col()
         .key("gallery")
-        .grow(1.0)
         .min_h(0.0)
         .w_full()
         .fill(p.content)
@@ -6396,7 +6410,13 @@ fn content(s: &App, p: Paint) -> El {
                 .w_full()
                 .h_full()
                 .fill(Color::TRANSPARENT)
-                .on_press(|s: &mut App| s.menu = None),
+                .on_press(|s: &mut App| s.menu = None)
+                .on_secondary_press(|s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
+                    // A right-click on another item moves the open menu to it,
+                    // as a fresh right-click would.
+                    let (scope, target) = context_target_at(s, at.x, at.y);
+                    s.menu = Some(Menu::Context { scope, target, x: at.x, y: at.y });
+                }),
         );
     }
     body

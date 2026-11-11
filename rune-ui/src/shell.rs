@@ -8,6 +8,19 @@
 //! window down, and there is no way to ask a DLL what it would draw without
 //! loading it. Everything links to system libraries by name, so no extra crate.
 
+/// How a menu item is started.
+#[derive(Clone)]
+pub enum Run {
+    /// A top-level registry verb, handed to the shell by name.
+    Shell,
+    /// A command line read from the registry. Cascading submenu items are only
+    /// reachable this way: the shell resolves their names through the menu it
+    /// draws, not through `ShellExecuteEx`.
+    Command(String),
+    /// One item a third-party handler drew, invoked through that handler again.
+    Handler { clsid: String, command: u32 },
+}
+
 /// One registered command verb, as the context menu and customize list show it.
 #[derive(Clone)]
 #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
@@ -21,11 +34,29 @@ pub struct Verb {
     pub verb: String,
     /// A folder-background command, run against the folder rather than an item.
     pub background: bool,
+    /// Items this one opens on hover: a cascading registry submenu, or the items
+    /// a loaded handler drew.
+    pub children: Vec<Verb>,
+    /// Only shown by Explorer with Shift held.
+    pub extended: bool,
+    pub run: Run,
+}
+
+impl Verb {
+    /// Every item in this tree, parents before children.
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub fn flatten(&self) -> Vec<&Verb> {
+        let mut out = vec![self];
+        for child in &self.children {
+            out.extend(child.flatten());
+        }
+        out
+    }
 }
 
 #[cfg(target_os = "windows")]
 mod win {
-    use super::Verb;
+    use super::{Run, Verb};
     use std::collections::HashSet;
     use std::ffi::c_void;
     use std::path::Path;
@@ -357,6 +388,50 @@ mod win {
         roots
     }
 
+    /// The items a cascading verb declares. Windows spells this two ways: a
+    /// `SubCommands` list of names under the verb's own `shell` key, or an
+    /// `ExtendedSubCommandsKey` naming another class's key to read them from.
+    fn cascade_children(key: &str, origin: &str, parent: &str, background: bool) -> Vec<Verb> {
+        let mut bases: Vec<(String, String)> = Vec::new();
+        if let Some(list) = value(key, Some("SubCommands")) {
+            for name in list.split(';').map(str::trim).filter(|name| !name.is_empty()) {
+                bases.push((format!(r"{key}\shell\{name}"), name.to_string()));
+            }
+        }
+        if let Some(target) = value(key, Some("ExtendedSubCommandsKey")) {
+            let base = format!(r"{}\shell", target.trim_start_matches('\\'));
+            for name in subkeys(&base) {
+                bases.push((format!(r"{base}\{name}"), name));
+            }
+        }
+
+        let mut found = Vec::new();
+        for (child, name) in bases {
+            if !key_exists(&child) {
+                continue;
+            }
+            let Some(text) = label(&child, &name) else {
+                continue;
+            };
+            // A child is only runnable through its own command line: the shell
+            // resolves nested names while drawing a menu, not by name.
+            let Some(command) = value(&format!(r"{child}\command"), None) else {
+                continue;
+            };
+            found.push(Verb {
+                id: format!("verb|{origin}|{parent}/{name}"),
+                label: text,
+                source: source_of(&child),
+                verb: name,
+                background,
+                children: Vec::new(),
+                extended: key_exists(&format!(r"{child}\Extended")),
+                run: Run::Command(command),
+            });
+        }
+        found
+    }
+
     /// The runnable command verbs registered for a target, from the registry alone.
     pub fn verbs(path: Option<&str>, is_dir: bool, background: bool) -> Vec<Verb> {
         let origin = if background {
@@ -370,25 +445,24 @@ mod win {
         let mut found = Vec::new();
         let mut seen = HashSet::new();
         for class in classes(origin, target) {
-            for name in subkeys(&format!("{class}\\shell")) {
-                let key = format!("{class}\\shell\\{name}");
-                // LegacyDisable retires an item; Extended hides it behind Shift.
-                if key_exists(&format!("{key}\\LegacyDisable"))
-                    || key_exists(&format!("{key}\\Extended"))
-                {
+            for name in subkeys(&format!(r"{class}\shell")) {
+                let key = format!(r"{class}\shell\{name}");
+                // LegacyDisable retires an item outright.
+                if key_exists(&format!(r"{key}\LegacyDisable")) {
+                    continue;
+                }
+                let id = format!("verb|{origin}|{name}");
+                if !seen.insert(id.clone()) {
                     continue;
                 }
                 let Some(text) = label(&key, &name) else {
                     continue;
                 };
-                // Neither a command nor a delegate means the item does nothing.
-                if !key_exists(&format!("{key}\\command"))
-                    && !key_exists(&format!("{key}\\DelegateExecute"))
-                {
-                    continue;
-                }
-                let id = format!("verb|{origin}|{name}");
-                if !seen.insert(id.clone()) {
+                let children = cascade_children(&key, origin, &name, background);
+                // No command, no delegate and no submenu means it does nothing.
+                let runnable = key_exists(&format!(r"{key}\command"))
+                    || key_exists(&format!(r"{key}\DelegateExecute"));
+                if !runnable && children.is_empty() {
                     continue;
                 }
                 found.push(Verb {
@@ -397,10 +471,77 @@ mod win {
                     source: source_of(&key),
                     verb: name,
                     background,
+                    children,
+                    // Extended items are real, just hidden behind Shift.
+                    extended: key_exists(&format!(r"{key}\Extended")),
+                    run: Run::Shell,
                 });
             }
         }
         found
+    }
+
+    /// The third-party extensions registered for a target, each one a parent
+    /// whose children are the items it drew.
+    ///
+    /// A handler is only queried when the person allowed it: querying one loads
+    /// its DLL into this process, which is third-party code.
+    pub fn handlers(
+        path: Option<&str>,
+        is_dir: bool,
+        background: bool,
+        load: &[String],
+    ) -> Vec<Verb> {
+        let classes = handler_classes(path, is_dir, background);
+        let mut found = Vec::new();
+        for handler in crate::handlers::registrations(&classes) {
+            let allowed = load
+                .iter()
+                .any(|clsid| clsid.eq_ignore_ascii_case(&handler.clsid));
+            let mut children = Vec::new();
+            if allowed
+                && let Some(target) = path
+                && let Ok(items) = crate::handlers::items(&handler.clsid, target)
+            {
+                children = items;
+                for child in &mut children {
+                    child.source = handler.label.clone();
+                    child.background = background;
+                }
+            }
+            let server = handler
+                .dll
+                .as_deref()
+                .and_then(|dll| Path::new(dll).file_name())
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            found.push(Verb {
+                id: handler.id(),
+                label: handler.label.clone(),
+                source: server,
+                // A handler has no verb name; the CLSID is what identifies it,
+                // and it is what the customize list switches on.
+                verb: handler.clsid.clone(),
+                background,
+                children,
+                extended: false,
+                // Its own row loads the extension; it has no command of its own.
+                run: Run::Command(String::new()),
+            });
+        }
+        found
+    }
+
+    /// The classes whose shell extensions a target reads, most specific first.
+    pub fn handler_classes(path: Option<&str>, is_dir: bool, background: bool) -> Vec<String> {
+        let origin = if background {
+            "background"
+        } else if is_dir {
+            "folder"
+        } else {
+            "file"
+        };
+        classes(origin, path.map(Path::new))
     }
 
     fn execute(verb: &str, file: &str, parameters: Option<&str>) -> Result<(), String> {
@@ -502,11 +643,42 @@ mod win {
     }
 
     pub fn run(verb: &Verb, path: &str) -> Result<(), String> {
-        if verb.background {
-            run_background(&verb.verb, path)
-        } else {
-            execute(&verb.verb, path, None)
+        match &verb.run {
+            Run::Shell => {
+                if verb.background {
+                    run_background(&verb.verb, path)
+                } else {
+                    execute(&verb.verb, path, None)
+                }
+            }
+            Run::Command(template) => run_template(template, path),
+            Run::Handler { clsid, command } => crate::handlers::invoke(clsid, path, *command),
         }
+    }
+
+    /// A command line read from the registry, run as a template. Cascading
+    /// submenu items can only be started this way: the shell resolves their
+    /// names while drawing a menu, so `ShellExecuteEx` cannot be handed one.
+    fn run_template(template: &str, path: &str) -> Result<(), String> {
+        if template.trim().is_empty() {
+            return Err("That item has no command to run.".into());
+        }
+        let quoted = format!("\"{path}\"");
+        let mut line = template.to_string();
+        for token in ["%V", "%L", "%1"] {
+            // The token may be quoted already, and the quotes belong to the path.
+            let surround = format!("\"{token}\"");
+            if line.contains(&surround) {
+                line = line.replace(&surround, &quoted);
+            } else {
+                line = line.replace(token, &quoted);
+            }
+        }
+        // The rest describe a multi-selection, which one item does not have.
+        for token in ["%*", "%2", "%3", "%4", "%5", "%6", "%7", "%8", "%9"] {
+            line = line.replace(token, "");
+        }
+        execute("open", "cmd.exe", Some(&format!("/c {line}")))
     }
 
     pub fn open_default(path: &str) -> Result<(), String> {
@@ -520,7 +692,7 @@ mod win {
 
 #[cfg(target_os = "windows")]
 pub use win::{
-    open_as, open_default, open_with_picker, reg_has_value, reg_key_exists, reg_string,
+    handlers, open_as, open_default, open_with_picker, reg_has_value, reg_key_exists, reg_string,
     reg_subkeys, reg_user_string, run, verbs,
 };
 
@@ -529,6 +701,18 @@ mod other {
     use super::Verb;
 
     pub fn verbs(_path: Option<&str>, _is_dir: bool, _background: bool) -> Vec<Verb> {
+        Vec::new()
+    }
+    /// No third-party menu extensions exist away from Windows.
+    pub fn handlers(
+        _path: Option<&str>,
+        _is_dir: bool,
+        _background: bool,
+        _load: &[String],
+    ) -> Vec<Verb> {
+        Vec::new()
+    }
+    pub fn handler_classes(_path: Option<&str>, _is_dir: bool, _background: bool) -> Vec<String> {
         Vec::new()
     }
     pub fn run(_verb: &Verb, _path: &str) -> Result<(), String> {
@@ -543,4 +727,4 @@ mod other {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub use other::{open_default, open_with_picker, run, verbs};
+pub use other::{handlers, open_default, open_with_picker, run, verbs};

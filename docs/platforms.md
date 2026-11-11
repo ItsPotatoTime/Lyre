@@ -131,19 +131,35 @@ The "Other programs" section of a right-click menu is a platform feature, not a
 portable one. Each desktop keeps its own registry for these items, and Lyre can
 only read the Windows one today.
 
-**Windows** reads two kinds of registration. A *verb* is a key under
-`HKCR\<class>\shell` holding a command to run; a *handler* is a COM object under
-`HKCR\<class>\shellex\ContextMenuHandlers` that is asked, through
-`IContextMenu::QueryContextMenu`, what it would draw. Both are read off the
-thread that draws the window, and the answer is cached per file type for five
-minutes. A handler is third-party code loaded into this process, exactly as it is
-into Explorer: a broken one can take the window down. There is no way to ask a
-DLL what it would draw without loading it.
+**Windows** reads three kinds of registration.
+
+A *verb* is a key under `HKCR\<class>\shell` holding a command to run. A verb
+that declares `SubCommands`, or an `ExtendedSubCommandsKey`, opens a submenu;
+those children are enumerated too, and they run through their own command line,
+because the shell resolves a nested name while drawing a menu rather than by
+name. A verb marked `Extended` is listed rather than dropped: it is real, and
+Explorer only shows it with Shift held. `LegacyDisable` still retires one.
+
+A *handler* is a COM object under `HKCR\<class>\shellex\ContextMenuHandlers`.
+Its items exist nowhere in the registry: 7-Zip's "Add to archive" and
+FineReader's commands are built by their DLL when asked, through
+`IContextMenu::QueryContextMenu`, which is what Explorer does. Reading them means
+loading that DLL into this process, where a broken extension can take the window
+down, so it never happens on its own. The customize list shows every handler by
+name with the server it comes from, and loads one only when its switch is turned
+on; its items then appear individually, and can be switched and run like any
+other item. An item is remembered by what it says rather than by the ordinal it
+was given, because a handler numbers its items per file.
+
+A *sparse-package* command is a Windows 11 `IExplorerCommand` handler. Those are
+not read at all: they are activated through COM and their menu is drawn by the
+package, so neither their items nor their wording is reachable from the registry.
 
 None of these items are shown on first install. Every one starts off and is
-switched on individually in "Customize this menu", because installing a program
-should not change what a right-click does. Lyre's own items are the ones that
-start on. Rows that repeat something Lyre already offers under the same name —
+switched on individually in "Customize this menu", which groups them by the
+program that provides them and opens a group on hover, because installing a
+program should not change what a right-click does. Lyre's own items are the ones
+that start on. Rows that repeat something Lyre already offers under the same name —
 Windows' "Add to Favorites" against Lyre's "Add to favorites", for example — are
 left out of the list rather than shown twice.
 

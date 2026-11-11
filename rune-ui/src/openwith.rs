@@ -693,7 +693,7 @@ mod win {
     /// resource, which is the string the shell puts in its own menus. Most
     /// applications name themselves only here, so without it the list would read
     /// "firefox" where the desktop says "Firefox".
-    fn description(program: &str) -> Option<String> {
+    pub(crate) fn description(program: &str) -> Option<String> {
         let file = wide(program);
         let mut ignored = 0u32;
         let size = unsafe { GetFileVersionInfoSizeW(file.as_ptr(), &mut ignored) };
@@ -895,6 +895,9 @@ mod other {
 
 /// Which applications can open this file, and which one does today. This touches
 /// the filesystem and, on Linux, runs `xdg-mime`, so call it off the UI thread.
+#[cfg(target_os = "windows")]
+pub(crate) use win::description as executable_description;
+
 #[cfg(all(unix, not(target_os = "macos")))]
 pub fn open_with(path: &str) -> OpenWith {
     freedesktop::open_with(path)

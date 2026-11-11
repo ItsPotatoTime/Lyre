@@ -771,6 +771,12 @@ pub mod win {
         }
     }
 
+    /// The same data object for one path, for code that hands a file to a shell
+    /// extension rather than to a drag session.
+    pub(crate) fn data_object_for(path: &std::path::Path) -> Option<IDataObject> {
+        unsafe { file_data_object(&[path.to_path_buf()]) }
+    }
+
     /// A 32-bit top-down DIB of the preview, with premultiplied alpha: the
     /// shell's drag image is drawn with `AlphaBlend`, which expects it.
     unsafe fn hbitmap(preview: &DragPreview) -> Option<HBITMAP> {

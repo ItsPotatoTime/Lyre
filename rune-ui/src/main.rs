@@ -30,6 +30,7 @@ use rune::{
 mod defaultmanager;
 mod fileops;
 mod frame;
+mod handlers;
 mod imagery;
 mod openwith;
 mod osdrag;
@@ -698,6 +699,10 @@ struct App {
     /// Built-in rail places (3..=8) the person unpinned from the sidebar.
     hidden_places: Vec<usize>,
     customize_open: bool,
+    /// Owner groups the person has opened in the customize list.
+    customize_expanded: Vec<String>,
+    /// Third-party extensions the person allowed Lyre to load, by CLSID.
+    handler_loaded: Vec<String>,
     /// The target the customize dialog lists shell verbs for.
     customize_path: Option<String>,
     customize_is_dir: bool,
@@ -2020,6 +2025,8 @@ fn init() -> App {
         menu_shown: Vec::new(),
         hidden_places: Vec::new(),
         customize_open: false,
+        customize_expanded: Vec::new(),
+        handler_loaded: Vec::new(),
         customize_path: None,
         customize_is_dir: false,
         customize_background: false,
@@ -4559,49 +4566,313 @@ fn menu_overlay(s: &App, p: Paint) -> El {
         .children(rows)
 }
 
-/// One checkbox row of the customize dialog; `default_on` decides which list a
-/// toggle writes to (Lyre items start on, other apps' verbs start off).
-fn customize_row(
-    p: Paint,
-    label: &str,
-    source: Option<&str>,
-    shown: bool,
+/// One row of the customize list.
+struct CustomLine {
     id: String,
+    label: String,
+    caption: String,
+    shown: bool,
+    /// The state this item has before the person ever touched it.
     default_on: bool,
-) -> El {
-    let check = if shown {
+    /// When set, the row switches loading this extension instead of showing an
+    /// item, and `id` is the CLSID.
+    load: Option<String>,
+}
+
+/// One owner's items: Lyre itself, a program that registered verbs, or a
+/// third-party extension.
+struct CustomGroup {
+    owner: String,
+    caption: String,
+    lines: Vec<CustomLine>,
+}
+
+fn push_custom(group: &mut Vec<CustomGroup>, owner: &str, caption: &str, line: CustomLine) {
+    if let Some(existing) = group.iter_mut().find(|g| g.owner == owner) {
+        existing.lines.push(line);
+        return;
+    }
+    group.push(CustomGroup {
+        owner: owner.to_string(),
+        caption: caption.to_string(),
+        lines: vec![line],
+    });
+}
+
+/// Everything that can appear in a right-click menu for the dialog's target,
+/// grouped by who provides it.
+fn customize_groups(s: &App) -> Vec<CustomGroup> {
+    let mut groups: Vec<CustomGroup> = Vec::new();
+
+    // Lyre's own items always come first, in the order they appear in a menu.
+    let mine: Vec<CustomLine> = CUSTOM_ITEMS
+        .iter()
+        .map(|(id, label)| CustomLine {
+            id: id.to_string(),
+            label: label.to_string(),
+            caption: String::new(),
+            shown: item_shown(s, id, true),
+            default_on: true,
+            load: None,
+        })
+        .collect();
+    groups.push(CustomGroup {
+        owner: "Lyre".into(),
+        caption: String::new(),
+        lines: mine,
+    });
+
+    let path = s.customize_path.as_deref();
+    let is_dir = s.customize_is_dir;
+    let background = s.customize_background;
+
+    // Registry verbs, credited to the program that registered them.
+    for verb in shell::verbs(path, is_dir, background) {
+        for item in verb.flatten() {
+            push_custom(
+                &mut groups,
+                &item.source,
+                "",
+                CustomLine {
+                    id: item.id.clone(),
+                    label: item.label.clone(),
+                    caption: if item.extended { "Shift".into() } else { String::new() },
+                    shown: item_shown(s, &item.id, false),
+                    default_on: false,
+                    load: None,
+                },
+            );
+        }
+    }
+
+    // Third-party extensions. Their items only exist once the person lets Lyre
+    // load the DLL, so the group carries that switch above them.
+    for handler in shell::handlers(path, is_dir, background, &s.handler_loaded) {
+        let clsid = handler.verb.clone();
+        let loaded = !clsid.is_empty()
+            && s.handler_loaded
+                .iter()
+                .any(|allowed| allowed.eq_ignore_ascii_case(&clsid));
+        let caption = if loaded {
+            handler.source.clone()
+        } else {
+            format!("{} (not loaded)", handler.source)
+        };
+        push_custom(
+            &mut groups,
+            &handler.label,
+            &caption,
+            CustomLine {
+                id: clsid.clone(),
+                label: if loaded {
+                    "Read by this extension".into()
+                } else {
+                    "Load this extension's items".into()
+                },
+                caption: String::new(),
+                shown: loaded,
+                default_on: false,
+                load: Some(clsid.clone()),
+            },
+        );
+        for item in &handler.children {
+            push_custom(
+                &mut groups,
+                &handler.label,
+                &caption,
+                CustomLine {
+                    id: item.id.clone(),
+                    label: item.label.clone(),
+                    caption: String::new(),
+                    shown: item_shown(s, &item.id, false),
+                    default_on: false,
+                    load: None,
+                },
+            );
+        }
+    }
+
+    groups
+}
+
+/// A tri-state owner switch: on when every item it owns is shown, off when none
+/// is, and mixed otherwise.
+fn group_state(lines: &[CustomLine]) -> Option<bool> {
+    let mut any_on = false;
+    let mut any_off = false;
+    for line in lines.iter().filter(|line| line.load.is_none()) {
+        if line.shown { any_on = true } else { any_off = true }
+    }
+    match (any_on, any_off) {
+        (true, false) => Some(true),
+        (false, true) => Some(false),
+        _ => None,
+    }
+}
+
+/// The tick box for an owner: filled when all of its items are on, a minus when
+/// only some are, empty when none is.
+fn tri_switch(p: Paint, state: Option<bool>) -> El {
+    let box_el = el()
+        .w(18.0)
+        .h(18.0)
+        .radius(4.0)
+        .border(p.hair, p.menu_line)
+        .center();
+    match state {
+        Some(true) => box_el
+            .fill(p.accent_fill)
+            .child(ico(p, Ico::Check, 12.0, Color::WHITE)),
+        None => box_el.child(el().w(8.0).h(2.0).radius(1.0).fill(p.accent_fill)),
+        Some(false) => box_el,
+    }
+}
+
+/// Switch one extension on or off. Loading is what makes its items readable, so
+/// this is deliberately a separate choice from showing an item.
+fn toggle_handler(s: &mut App, clsid: &str) {
+    if let Some(at) = s
+        .handler_loaded
+        .iter()
+        .position(|allowed| allowed.eq_ignore_ascii_case(clsid))
+    {
+        s.handler_loaded.remove(at);
+    } else {
+        s.handler_loaded.push(clsid.to_string());
+    }
+}
+
+/// One item row inside an owner group.
+fn custom_line(p: Paint, line: &CustomLine) -> El {
+    let id = line.id.clone();
+    let default_on = line.default_on;
+    let load = line.load.clone();
+    let check = if line.shown {
         ico(p, Ico::Check, 12.0, Color::WHITE)
     } else {
         el().size(12.0, 12.0)
     };
-    let mut text_row = row()
+    let mut label_row = row()
         .grow(1.0)
         .min_w(0.0)
         .gap(6.0)
         .items_center()
-        .child(text(label).font(UI_TEXT).color(p.text).grow(1.0).min_w(0.0).truncate());
-    if let Some(src) = source {
-        text_row = text_row.child(text(src).font(CAPTION).color(p.tertiary));
+        .child(
+            text(line.label.as_str())
+                .font(UI_TEXT)
+                .color(if load.is_some() && !line.shown { p.secondary } else { p.text })
+                .grow(1.0)
+                .min_w(0.0)
+                .truncate(),
+        );
+    if !line.caption.is_empty() {
+        label_row = label_row.child(text(line.caption.as_str()).font(CAPTION).color(p.tertiary));
     }
     row()
         .w_full()
-        .h(32.0)
-        .px(8.0)
+        .h(30.0)
+        .px(22.0)
         .gap(10.0)
         .radius(4.0)
         .fill(Color::TRANSPARENT)
         .hover(p.hover)
         .items_center()
         .child(
-            el().size(18.0, 18.0)
+            el().size(17.0, 17.0)
                 .radius(4.0)
                 .border(p.hair, p.menu_line)
-                .fill(if shown { p.accent_fill } else { Color::TRANSPARENT })
+                .fill(if line.shown { p.accent_fill } else { Color::TRANSPARENT })
                 .center()
                 .child(check),
         )
-        .child(text_row)
-        .on_press(move |s: &mut App| toggle_menu_item(s, &id, default_on))
+        .child(label_row)
+        .on_press(move |s: &mut App| match &load {
+            Some(clsid) => toggle_handler(s, clsid),
+            None => toggle_menu_item(s, &id, default_on),
+        })
+}
+
+/// One owner's block: a header that opens on hover, its tri-state switch, and
+/// its items once open.
+fn customize_group(s: &App, p: Paint, group: &CustomGroup) -> El {
+    let open = s.customize_expanded.iter().any(|name| name == &group.owner);
+    let state = group_state(&group.lines);
+    let total = group.lines.iter().filter(|line| line.load.is_none()).count();
+    let on = group
+        .lines
+        .iter()
+        .filter(|line| line.load.is_none() && line.shown)
+        .count();
+
+    let mut header = row()
+        .w_full()
+        .h(28.0)
+        .px(6.0)
+        .gap(8.0)
+        .radius(4.0)
+        .hover(p.hover)
+        .items_center()
+        .child(
+            text(if open { "▾" } else { "▸" })
+                .font(CAPTION)
+                .color(p.tertiary),
+        )
+        .child(
+            text(group.owner.as_str())
+                .font(GROUP_TEXT)
+                .color(p.text)
+                .grow(1.0)
+                .min_w(0.0)
+                .truncate(),
+        );
+    if !group.caption.is_empty() {
+        header = header.child(text(group.caption.as_str()).font(CAPTION).color(p.tertiary));
+    }
+    if total > 0 {
+        header = header.child(
+            text(format!("{on}/{total}"))
+                .font(CAPTION)
+                .color(p.tertiary),
+        );
+        // Flipping the owner sets every one of its items the same way.
+        let targets: Vec<(String, bool)> = group
+            .lines
+            .iter()
+            .filter(|line| line.load.is_none())
+            .map(|line| (line.id.clone(), line.default_on))
+            .collect();
+        let wanted = state != Some(true);
+        header = header.child(tri_switch(p, state).on_press(move |s: &mut App| {
+            for (id, default_on) in &targets {
+                if item_shown(s, id, *default_on) != wanted {
+                    toggle_menu_item(s, id, *default_on);
+                }
+            }
+        }));
+    }
+
+    let mut block = col()
+        .key(format!("customize-group:{}", group.owner))
+        .w_full()
+        .gap(2.0)
+        .child(header);
+    if open {
+        for line in &group.lines {
+            block = block.child(custom_line(p, line));
+        }
+    }
+    // Hovering anywhere in the block, header or items, keeps it open; leaving
+    // closes it, which is how the shell's own cascades behave.
+    let hovered = group.owner.clone();
+    block.on_hover_change(move |s: &mut App, inside, _tx: &mut Tx| {
+        if inside {
+            if !s.customize_expanded.iter().any(|name| name == &hovered) {
+                s.customize_expanded.push(hovered.clone());
+            }
+        } else {
+            s.customize_expanded.retain(|name| name != &hovered);
+        }
+    })
 }
 
 /// A modal dialog toggling which context-menu items appear; choices persist.
@@ -4609,24 +4880,12 @@ fn customize_dialog(s: &App, p: Paint) -> El {
     if !s.customize_open {
         return el().key("customize-none");
     }
-    let mut list = col().key("customize-list").w_full().gap(2.0);
-    for (id, label) in CUSTOM_ITEMS {
-        list = list.child(customize_row(p, label, None, item_shown(s, id, true), id.to_string(), true));
+    let groups = customize_groups(s);
+    let mut list = col().key("customize-list").w_full().gap(10.0);
+    for group in &groups {
+        list = list.child(customize_group(s, p, group));
     }
-    let verbs = shell::verbs(s.customize_path.as_deref(), s.customize_is_dir, s.customize_background);
-    if !verbs.is_empty() {
-        list = list.child(menu_heading(p, "Other apps"));
-        for v in verbs {
-            list = list.child(customize_row(
-                p,
-                &v.label,
-                Some(&v.source),
-                item_shown(s, &v.id, false),
-                v.id.clone(),
-                false,
-            ));
-        }
-    }
+
     el().key("customize-overlay")
         .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
         .fill(Color::BLACK.alpha(0.45))
@@ -4635,7 +4894,7 @@ fn customize_dialog(s: &App, p: Paint) -> El {
         .child(
             col()
                 .key("customize-panel")
-                .w(380.0)
+                .w(560.0)
                 .px(16.0)
                 .py(16.0)
                 .gap(12.0)
@@ -4644,12 +4903,16 @@ fn customize_dialog(s: &App, p: Paint) -> El {
                 .radius(8.0)
                 .shadow(6.0, 24.0, Color::BLACK.alpha(0.5))
                 .child(text("Customize context menu").font(TILE_TEXT).color(p.text))
-                .child(text("Choose which items appear in right-click menus.").font(CAPTION).color(p.tertiary))
+                .child(
+                    text("Hover an owner to open it. Items marked Shift need Shift held.")
+                        .font(CAPTION)
+                        .color(p.tertiary),
+                )
                 .child(
                     col()
                         .key("customize-scroll")
                         .w_full()
-                        .h(380.0)
+                        .h(430.0)
                         .scroll(ScrollSpec { stick_bottom: false })
                         .child(list),
                 )
@@ -7982,6 +8245,7 @@ fn main() {
                 s.customize_path = Some(s.root.to_string_lossy().into_owned());
                 s.customize_is_dir = true;
                 s.customize_background = true;
+                s.customize_expanded.push("Lyre".into());
             }),
             ("context", |s| {
                 load(s, Fixture::Downloads);
@@ -8134,6 +8398,77 @@ fn main() {
         let window = window.on_created(|handle| frame::install(&handle));
         [window.boxed()]
     });
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod customize_tests {
+    use super::*;
+
+    /// The dialog has to list what actually exists, including the extensions
+    /// that draw their own items, which the old flat list never showed at all.
+    #[test]
+    fn groups_cover_lyre_verbs_and_extensions() {
+        let dir = std::env::temp_dir().join(format!("lyre-customize-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("probe.txt");
+        std::fs::write(&file, b"x").unwrap();
+
+        let mut s = init();
+        s.customize_open = true;
+        s.customize_path = Some(file.to_string_lossy().into_owned());
+        s.customize_is_dir = false;
+        s.customize_background = false;
+
+        let groups = customize_groups(&s);
+        let lyre = groups
+            .iter()
+            .find(|group| group.owner == "Lyre")
+            .expect("Lyre's own items are always a group");
+        assert_eq!(lyre.lines.len(), CUSTOM_ITEMS.len());
+
+        let Some(index) = groups
+            .iter()
+            .position(|group| group.owner.to_lowercase().contains("7-zip"))
+        else {
+            // A machine without 7-Zip can still check the rest.
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        };
+
+        // Before it is allowed to load, the extension offers only that choice.
+        assert_eq!(
+            groups[index].lines.len(),
+            1,
+            "an unloaded extension lists only its switch"
+        );
+        let clsid = groups[index].lines[0]
+            .load
+            .clone()
+            .expect("the row switches loading");
+
+        // Once allowed, its real items are there.
+        s.handler_loaded.push(clsid);
+        let groups = customize_groups(&s);
+        let ext = groups
+            .iter()
+            .find(|group| group.owner.to_lowercase().contains("7-zip"))
+            .unwrap();
+        assert!(
+            ext.lines.len() > 5,
+            "7-Zip should list its items, got {}",
+            ext.lines.len()
+        );
+        assert!(
+            ext.lines
+                .iter()
+                .any(|line| line.load.is_none() && line.label.to_lowercase().contains("archive")),
+            "the archive items should be named: {:?}",
+            ext.lines.iter().map(|line| &line.label).collect::<Vec<_>>()
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
 
 #[cfg(test)]

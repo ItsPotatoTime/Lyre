@@ -20,13 +20,26 @@ release notes rather than a second copy of them.
   is asked what it would draw, which is the same call the shell makes; and choosing
   one runs it through the program that registered it. A new program is picked up
   when its registration is there, with no list to maintain. Windows 11
-  `IExplorerCommand` handlers and cascading `SubCommands` verbs are not runnable
-  yet and are named as such rather than left out quietly.
+  `IExplorerCommand` handlers are still not read: they are activated through COM
+  and draw their own menu, so nothing about them is reachable from the registry.
 - **Customize this menu**, at the bottom of every right-click menu and in the More
   menu. It lists everything that can appear in that menu, Lyre's own items and the
   ones other programs added, with a tick per item and a count of how many are
   shown. Turning something off is remembered. It also lists every registration
   that exists but could not be read, with the reason.
+- **Customize this menu now shows everything, grouped by the program it comes
+  from.** The dialog lists Lyre's items, every registry verb, and the third-party
+  extensions that draw their own menus, with each owner as a group that opens on
+  hover and a switch that turns the whole owner on or off at once. Cascading
+  registry submenus are enumerated and runnable, and Shift-only items are listed
+  instead of dropped.
+- **7-Zip and its like can be listed at last.** Their items are built by a DLL at
+  runtime and exist nowhere in the registry, so the customize list shows each
+  extension by name and loads one only when its switch is turned on. On this
+  machine that turns 7-Zip's 19 hidden commands, "Add to <file>.zip" among them,
+  into individually switchable and runnable rows. Loading a third-party DLL is
+  the one thing here that can take the window down, which is why it is never
+  automatic.
 - **Open with, on every platform.** "Open with…" now opens a dialog listing the
   applications that declare they can open that file's type, with the current
   default marked and preselected. Choosing one opens the file there, and "Always

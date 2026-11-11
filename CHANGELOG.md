@@ -8,6 +8,12 @@ release notes rather than a second copy of them.
 
 ### Added
 
+- **Follow the desktop's appearance.** The appearance menu is now Follow system,
+  Light and Dark. Following reads the desktop's own setting: the registry on
+  Windows, re-read every couple of seconds so a change while Lyre is running is
+  picked up, and `defaults` or `gsettings` on macOS and freedesktop otherwise,
+  which settle it when the window starts and when the choice is made. A save from
+  before the option existed keeps the appearance it recorded.
 - **Folders refresh themselves.** Files another program saves, edits, renames or
   deletes appear without pressing F5. Windows uses `ReadDirectoryChangesW`; Linux,
   macOS and volumes that refuse a notification compare a fingerprint of names,

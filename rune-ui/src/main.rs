@@ -37,6 +37,7 @@ mod openwith;
 mod osdrag;
 mod search;
 mod shell;
+mod theme;
 mod updates;
 mod volumes;
 mod watch;
@@ -657,6 +658,11 @@ struct DragState {
 
 struct App {
     dark: bool,
+    /// What was chosen: follow the desktop, or force one. `dark` is that choice
+    /// resolved, and is what everything draws from.
+    theme: theme::Theme,
+    /// When the desktop was last asked, for following it while running.
+    theme_at: Instant,
     view: View,
     mode: Mode,
     preview: bool,
@@ -1259,6 +1265,7 @@ fn load_prefs(s: &mut App) {
 /// touching the settings a person actually uses.
 fn load_prefs_from(s: &mut App, id: &str) {
     let prefs = rune::prefs::Prefs::open(id);
+    let mut stored_dark = None;
     if let Some((sort, sort_desc, preview, mode, compact, filter, group, nav, hidden, dark)) =
         prefs.get::<(u8, bool, bool, u8, bool, u8, bool, bool, bool, bool)>("settings")
     {
@@ -1272,6 +1279,24 @@ fn load_prefs_from(s: &mut App, id: &str) {
         s.nav_open = nav;
         s.show_hidden = hidden;
         s.dark = dark;
+        stored_dark = Some(dark);
+    }
+    // The appearance preference. A save from before it existed carries only the
+    // old boolean, which is taken as the choice it was.
+    match prefs.get::<u8>("theme") {
+        Some(stored) => {
+            s.theme = theme::Theme::from_u8(stored);
+            s.dark = s.theme.is_dark();
+        }
+        None => {
+            if let Some(dark) = stored_dark {
+                s.theme = if dark { theme::Theme::Dark } else { theme::Theme::Light };
+                s.dark = dark;
+            } else {
+                s.theme = theme::Theme::System;
+                s.dark = s.theme.is_dark();
+            }
+        }
     }
     if let Some(f) = prefs.get::<Vec<String>>("favorites") {
         s.favorites = f;
@@ -1337,6 +1362,7 @@ fn persist_to(s: &App, id: &str) {
         s.dark,
     );
     let _ = prefs.set("settings", &settings);
+    let _ = prefs.set("theme", &s.theme.to_u8());
     let _ = prefs.set("favorites", &s.favorites);
     let _ = prefs.set("recent", &s.recent);
     let _ = prefs.set("pinned", &s.pinned);
@@ -1355,7 +1381,7 @@ fn persist_to(s: &App, id: &str) {
 /// A cheap fingerprint of everything persisted, so poll saves only on change.
 fn prefs_signature(s: &App) -> String {
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{:?}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{:?}|{}|{}",
         s.sort,
         s.sort_desc,
         s.preview,
@@ -1378,7 +1404,8 @@ fn prefs_signature(s: &App) -> String {
         s.show_protected,
         s.show_extensions,
         s.col_w,
-        s.rail_w
+        s.rail_w,
+        s.theme.to_u8()
     )
 }
 
@@ -1459,6 +1486,14 @@ fn toggle_pin(s: &mut App, path: &str) {
 /// Whether a context-menu item survives the person's customize choices. Lyre's
 /// own items start on; another program's verbs start off and are turned on one
 /// at a time, so installing software never silently changes a right-click.
+/// Change the appearance choice, resolving it now so the next frame draws the
+/// right one.
+fn set_theme(s: &mut App, theme: theme::Theme) {
+    s.theme = theme;
+    s.dark = theme.is_dark();
+    s.theme_at = Instant::now();
+}
+
 fn item_shown(s: &App, id: &str, default_on: bool) -> bool {
     if s.menu_hidden.iter().any(|x| x == id) {
         false
@@ -1652,6 +1687,20 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
         // Keep frames coming so the count climbing is visible and the answer is
         // picked up promptly.
         tx.wake_after(std::time::Duration::from_millis(30));
+    }
+    // Following the desktop means noticing when it changes while running. Asking
+    // costs a registry read on Windows and a child process elsewhere, so only
+    // Windows re-asks; the others settle it at launch and when it is chosen.
+    #[cfg(target_os = "windows")]
+    if s.theme == theme::Theme::System
+        && s.theme_at.elapsed() >= std::time::Duration::from_secs(2)
+    {
+        s.theme_at = Instant::now();
+        let dark = s.theme.is_dark();
+        if dark != s.dark {
+            s.dark = dark;
+            changed = true;
+        }
     }
     changed |= drain_openwith(s);
     if s.openwith_rx.is_some() {
@@ -2150,6 +2199,8 @@ fn init() -> App {
     });
     let mut app = App {
         dark: true,
+        theme: theme::Theme::System,
+        theme_at: Instant::now(),
         view: View::Files,
         mode: Mode::Details,
         preview: false,
@@ -4391,27 +4442,29 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                     h += MENU_ROW_H;
                     rows.push(menu_sep(p));
                     h += 9.0;
-                    rows.push(menu_heading(p, "Theme"));
+                    rows.push(menu_heading(p, "Appearance"));
                     h += 24.0;
-                    let dark = s.dark;
-                    rows.push(
-                        menu_item(p, "Light", (!dark).then_some(Ico::Check), None, false).on_press(
-                            move |s: &mut App| {
-                                s.dark = false;
+                    let theme = s.theme;
+                    for (choice, label) in [
+                        (theme::Theme::System, "Follow system"),
+                        (theme::Theme::Light, "Light"),
+                        (theme::Theme::Dark, "Dark"),
+                    ] {
+                        rows.push(
+                            menu_item(
+                                p,
+                                label,
+                                (theme == choice).then_some(Ico::Check),
+                                None,
+                                false,
+                            )
+                            .on_press(move |s: &mut App| {
+                                set_theme(s, choice);
                                 s.menu = None;
-                            },
-                        ),
-                    );
-                    h += MENU_ROW_H;
-                    rows.push(
-                        menu_item(p, "Dark", dark.then_some(Ico::Check), None, false).on_press(
-                            move |s: &mut App| {
-                                s.dark = true;
-                                s.menu = None;
-                            },
-                        ),
-                    );
-                    h += MENU_ROW_H;
+                            }),
+                        );
+                        h += MENU_ROW_H;
+                    }
                 }
             }
         }

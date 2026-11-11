@@ -66,6 +66,7 @@ mod win {
     const KEY_READ: u32 = 0x0002_0019;
     const REG_SZ: u32 = 1;
     const REG_EXPAND_SZ: u32 = 2;
+    const REG_DWORD: u32 = 4;
     const SW_SHOWNORMAL: i32 = 1;
 
     #[link(name = "advapi32")]
@@ -597,6 +598,35 @@ mod win {
         key_exists(key)
     }
 
+    /// A DWORD under `HKEY_CURRENT_USER`, which is where the per-user
+    /// appearance choice lives.
+    pub fn reg_dword(key: &str, name: Option<&str>) -> Option<u32> {
+        let path = wide(key);
+        let mut handle: usize = 0;
+        if unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, path.as_ptr(), 0, KEY_READ, &mut handle) } != 0 {
+            return None;
+        }
+        let name_wide = name.map(wide);
+        let name_ptr = name_wide
+            .as_ref()
+            .map_or(std::ptr::null(), |units| units.as_ptr());
+        let mut kind = 0u32;
+        let mut value = 0u32;
+        let mut len = std::mem::size_of::<u32>() as u32;
+        let read = unsafe {
+            RegQueryValueExW(
+                handle,
+                name_ptr,
+                std::ptr::null_mut(),
+                &mut kind,
+                &mut value as *mut u32 as *mut u8,
+                &mut len,
+            )
+        };
+        unsafe { RegCloseKey(handle) };
+        (read == 0 && kind == REG_DWORD).then_some(value)
+    }
+
     /// Whether `key` defines a value at all. `SupportedTypes` records a type by
     /// the value's *name* and leaves its data empty, so reading it back yields
     /// nothing; only its presence answers.
@@ -702,8 +732,8 @@ mod win {
 
 #[cfg(target_os = "windows")]
 pub use win::{
-    handlers, open_as, open_default, open_with_picker, reg_has_value, reg_key_exists, reg_string,
-    reg_subkeys, reg_user_string, run, verbs,
+    handlers, open_as, open_default, open_with_picker, reg_dword, reg_has_value, reg_key_exists,
+    reg_string, reg_subkeys, reg_user_string, run, verbs,
 };
 
 #[cfg(not(target_os = "windows"))]

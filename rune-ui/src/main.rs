@@ -763,6 +763,9 @@ struct App {
     /// for: building them instantiates a third-party DLL, which is far too much
     /// to repeat on every frame the menu is drawn.
     menu_handler_rows: RefCell<Option<(String, Vec<shell::Verb>)>>,
+    /// Per-type facts for the previewed item, memoised by path: reading a file
+    /// for its metadata must not happen on every frame the pane is drawn.
+    preview_facts: RefCell<Option<(String, Vec<metadata::Fact>)>>,
     /// The open modal dialog (delete confirm, paste conflict, rename, new folder).
     dialog: Option<Dialog>,
     /// The "Open with" worker's answer: listing applications touches the disk
@@ -2084,6 +2087,7 @@ fn init() -> App {
         op_rx: None,
         op_cancel: None,
         menu_handler_rows: RefCell::new(None),
+        preview_facts: RefCell::new(None),
         dialog: None,
         openwith_rx: None,
         searching: false,
@@ -7960,6 +7964,21 @@ fn gallery_content(s: &App, p: Paint) -> El {
     scrollable(s, p, out.on_drag(|s: &mut App, d: &mut rune::Drag, tx: &mut Tx| marquee_drag(s, d, tx)))
 }
 
+/// Per-type facts for one item, memoised by path. Reading a file for its
+/// dimensions or its word count is cheap once and far too much per frame.
+fn preview_facts(s: &App, entry: &Entry) -> Vec<metadata::Fact> {
+    let key = entry.path.clone();
+    if let Some((cached, facts)) = s.preview_facts.borrow().as_ref()
+        && *cached == key
+    {
+        return facts.clone();
+    }
+    let facts =
+        metadata::describe(Path::new(&entry.path), entry.is_dir, &entry.type_label).extra;
+    *s.preview_facts.borrow_mut() = Some((key, facts.clone()));
+    facts
+}
+
 fn preview_pane(s: &App, p: Paint) -> El {
     let inner = if s.view == View::ThisPc {
         let title = s
@@ -8054,21 +8073,26 @@ fn preview_pane(s: &App, p: Paint) -> El {
             .pt(18.0)
             .gap(10.0)
             .child(text("Details").font(TILE_TEXT).color(p.text));
-        let rows: [(&str, String); 4] = [
-            ("Type", e.map(|x| x.type_label.clone()).unwrap_or_default()),
-            ("Size", e.map(|x| x.size_label()).unwrap_or_default()),
-            ("File location", location),
-            ("Date modified", e.map(|x| x.modified.clone()).unwrap_or_default()),
+        let mut rows: Vec<(String, String)> = vec![
+            ("Type".to_string(), e.map(|x| x.type_label.clone()).unwrap_or_default()),
+            ("Size".to_string(), e.map(|x| x.size_label()).unwrap_or_default()),
+            ("File location".to_string(), location),
+            ("Date modified".to_string(), e.map(|x| x.modified.clone()).unwrap_or_default()),
         ];
-        for (k, v) in rows {
+        // The same per-type facts the Properties dialog shows, so the pane says
+        // what a file is without opening anything.
+        if let Some(entry) = e {
+            rows.extend(preview_facts(s, entry));
+        }
+        for (k, v) in &rows {
             details = details.child(
                 row()
                     .w_full()
                     .gap(8.0)
                     .items_center()
-                    .child(col().w(96.0).child(text(k).font(CAPTION).color(p.tertiary)))
+                    .child(col().w(96.0).child(text(k.as_str()).font(CAPTION).color(p.tertiary)))
                     .child(
-                        text(v)
+                        text(v.as_str())
                             .font(CAPTION)
                             .color(p.secondary)
                             .grow(1.0)

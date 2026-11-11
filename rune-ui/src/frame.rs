@@ -32,6 +32,21 @@ pub fn hwnd() -> Option<isize> {
     None
 }
 
+/// The window's client size in physical pixels, when the platform can be asked.
+///
+/// Rune exposes no size accessor and no resize event, so the native window is
+/// asked directly. Only Windows implements it; elsewhere this returns `None` and
+/// the window simply opens at its default size.
+#[cfg(target_os = "windows")]
+pub fn content_size() -> Option<(u32, u32)> {
+    imp::content_size()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn content_size() -> Option<(u32, u32)> {
+    None
+}
+
 pub fn minimize() {
     imp::minimize();
 }
@@ -77,6 +92,7 @@ mod imp {
         fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
         fn IsZoomed(hwnd: isize) -> i32;
         fn GetWindowRect(hwnd: isize, rect: *mut Rect) -> i32;
+        fn GetClientRect(hwnd: isize, rect: *mut Rect) -> i32;
         fn DefSubclassProc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
         fn RedrawWindow(hwnd: isize, rect: *const core::ffi::c_void, region: *mut core::ffi::c_void, flags: u32) -> i32;
         fn LoadImageW(
@@ -161,6 +177,19 @@ mod imp {
 
     pub fn hwnd() -> Option<isize> {
         HWND.get().copied()
+    }
+
+    /// The client area, which is what the layout sees and what a saved size has
+    /// to describe.
+    pub fn content_size() -> Option<(u32, u32)> {
+        let &hwnd = HWND.get()?;
+        let mut rect = Rect { left: 0, top: 0, right: 0, bottom: 0 };
+        if unsafe { GetClientRect(hwnd, &mut rect) } == 0 {
+            return None;
+        }
+        let width = (rect.right - rect.left).max(0) as u32;
+        let height = (rect.bottom - rect.top).max(0) as u32;
+        (width > 0 && height > 0).then_some((width, height))
     }
 
     pub fn install(handle: &WindowHandle) {

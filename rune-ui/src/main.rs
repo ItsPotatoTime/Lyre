@@ -778,6 +778,12 @@ struct App {
     #[cfg(target_os = "windows")]
     pending_os_drag: Option<(Vec<PathBuf>, Option<osdrag::DragPreview>)>,
     /// The window scale, for turning OS drop pixels into window points.
+    /// The window size in physical pixels that was last written to settings.
+    /// `window_pending` is a size being dragged, which replaces it only once it
+    /// has stopped changing.
+    window_settled: (u32, u32),
+    window_pending: Option<(u32, u32)>,
+    window_changed_at: Instant,
     scale: std::cell::Cell<f32>,
     trace_tick: u64,
     thumb_cache: RefCell<HashMap<String, Image>>,
@@ -1346,6 +1352,10 @@ fn load_prefs_from(s: &mut App, id: &str) {
     if let Some(w) = prefs.get::<f32>("rail_w") {
         s.rail_w = w.clamp(120.0, 400.0);
     }
+    // The size the window was last left at, restored below when it opens.
+    if let Some(size) = prefs.get::<(u32, u32)>("window_size") {
+        s.window_settled = size;
+    }
 }
 
 /// Write the whole view state and collections; poll calls this once per change.
@@ -1370,6 +1380,7 @@ fn persist_to(s: &App, id: &str) {
     );
     let _ = prefs.set("settings", &settings);
     let _ = prefs.set("theme", &s.theme.to_u8());
+    let _ = prefs.set("window_size", &s.window_settled);
     let _ = prefs.set("favorites", &s.favorites);
     let _ = prefs.set("recent", &s.recent);
     let _ = prefs.set("pinned", &s.pinned);
@@ -1388,7 +1399,7 @@ fn persist_to(s: &App, id: &str) {
 /// A cheap fingerprint of everything persisted, so poll saves only on change.
 fn prefs_signature(s: &App) -> String {
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{:?}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{:?}|{}|{}|{:?}",
         s.sort,
         s.sort_desc,
         s.preview,
@@ -1412,7 +1423,8 @@ fn prefs_signature(s: &App) -> String {
         s.show_extensions,
         s.col_w,
         s.rail_w,
-        s.theme.to_u8()
+        s.theme.to_u8(),
+        s.window_settled
     )
 }
 
@@ -1625,6 +1637,24 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
         && let Some(hwnd) = frame::hwnd()
     {
         osdrag::win::request_start(hwnd, paths, preview);
+    }
+    // Remember the window's size, but only once a resize has stopped. Rune has no
+    // resize event, so it is sampled here; writing the settings on every frame of
+    // a drag would be wasteful, and nothing else would wake the window after the
+    // last frame of it, hence the delayed wake.
+    if let Some(size) = frame::content_size()
+        && size != s.window_settled
+    {
+        if s.window_pending != Some(size) {
+            s.window_pending = Some(size);
+            s.window_changed_at = Instant::now();
+            tx.wake_after(std::time::Duration::from_millis(500));
+        } else if s.window_changed_at.elapsed() >= std::time::Duration::from_millis(400) {
+            s.window_settled = size;
+            s.window_pending = None;
+        }
+    } else {
+        s.window_pending = None;
     }
     let sig = prefs_signature(s);
     if sig != s.prefs_sig {
@@ -2299,6 +2329,9 @@ fn init() -> App {
         os_drag: None,
         #[cfg(target_os = "windows")]
         pending_os_drag: None,
+        window_settled: (0, 0),
+        window_pending: None,
+        window_changed_at: Instant::now(),
         scale: std::cell::Cell::new(1.0),
         trace_tick: 0,
         thumb_cache: RefCell::new(HashMap::new()),
@@ -8704,6 +8737,19 @@ fn load_fonts() -> &'static [&'static [u8]] {
     Box::leak(out.into_boxed_slice())
 }
 
+/// Fit a remembered window size to the screen it will open on: never past the
+/// screen, and never below the window's minimum, except where the screen itself
+/// is smaller than that minimum, in which case the screen wins.
+fn fit_to_screen(saved: (u32, u32), screen: (u32, u32), scale: f32) -> Option<(u32, u32)> {
+    if screen.0 == 0 || screen.1 == 0 {
+        return None;
+    }
+    let scale = scale.max(0.5);
+    let min_w = ((760.0 * scale).round() as u32).min(screen.0);
+    let min_h = ((480.0 * scale).round() as u32).min(screen.1);
+    Some((saved.0.clamp(min_w, screen.0), saved.1.clamp(min_h, screen.1)))
+}
+
 fn main() {
     // A launch the shell meant for Explorer itself (a /select reveal, a shell
     // namespace) is handed back rather than opened as a folder.
@@ -8922,7 +8968,15 @@ fn main() {
     // One window, no system frame. The tab strip is the titlebar now, so the
     // drawn minimize/maximize/close controls and window_drag own that job;
     // leaving decorations on would stack a second, native bar above it.
-    run_windows(|_displays| {
+    run_windows(|displays| {
+        // Open at the size the window was last left at, clamped to the screen it
+        // will actually open on so a size remembered from a larger display still
+        // fits, and never below the window's own minimum.
+        let saved = rune::prefs::Prefs::open(PREFS_ID).get::<(u32, u32)>("window_size");
+        let physical = saved.and_then(|(width, height)| {
+            let display = displays.iter().find(|d| d.primary).or(displays.first())?;
+            fit_to_screen((width, height), display.size, display.scale as f32)
+        });
         // macOS rounds a transparent borderless window through Rune's own corner
         // radius; Windows rounds through DWM in frame::install; Linux leaves the
         // corners to the compositor.
@@ -8931,6 +8985,7 @@ fn main() {
                 borderless: true,
                 resizable: true,
                 min_size: Some((760.0, 480.0)),
+                physical_size: physical,
                 transparent: cfg!(target_os = "macos"),
                 ..Default::default()
             }
@@ -9132,6 +9187,41 @@ mod start_tests {
         }
         assert!(matches!(s.view, View::Home), "a plain launch opens on Home");
         assert_eq!(s.tab, "Home");
+    }
+}
+
+#[cfg(test)]
+mod window_tests {
+    use super::*;
+
+    #[test]
+    fn a_remembered_size_is_kept_when_it_fits() {
+        assert_eq!(fit_to_screen((1200, 800), (1920, 1080), 1.0), Some((1200, 800)));
+    }
+
+    #[test]
+    fn a_size_bigger_than_the_screen_is_pulled_back_inside_it() {
+        // Remembered from a larger display.
+        assert_eq!(fit_to_screen((2560, 1440), (1920, 1080), 1.0), Some((1920, 1080)));
+    }
+
+    #[test]
+    fn a_size_below_the_minimum_is_raised_to_it() {
+        // 760x480 is the window's floor at this scale.
+        assert_eq!(fit_to_screen((300, 200), (1920, 1080), 1.0), Some((760, 480)));
+        // At 2x the floor is twice as many physical pixels.
+        assert_eq!(fit_to_screen((300, 200), (3840, 2160), 2.0), Some((1520, 960)));
+    }
+
+    #[test]
+    fn a_screen_smaller_than_the_minimum_does_not_panic_or_overflow_it() {
+        // The minimum has to give way to the screen rather than clamp() panic.
+        assert_eq!(fit_to_screen((1200, 800), (640, 400), 1.0), Some((640, 400)));
+    }
+
+    #[test]
+    fn a_screen_with_no_size_keeps_the_default() {
+        assert_eq!(fit_to_screen((1200, 800), (0, 0), 1.0), None);
     }
 }
 

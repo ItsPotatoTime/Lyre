@@ -5862,8 +5862,9 @@ fn toggle_rail(s: &mut App, place: usize) {
 }
 
 /// One row beneath an expanded rail place. A place with nothing to list says so
-/// rather than leaving the chevron looking broken.
-fn rail_leaf(p: Paint, label: &str, path: Option<&str>) -> El {
+/// rather than leaving the chevron looking broken. `volume` is the index into
+/// `s.volumes` when the row is a drive, so it can offer that drive's own menu.
+fn rail_leaf(p: Paint, label: &str, path: Option<&str>, volume: Option<usize>) -> El {
     let leaf = row()
         .w_full()
         .h(24.0)
@@ -5880,12 +5881,20 @@ fn rail_leaf(p: Paint, label: &str, path: Option<&str>) -> El {
                 .min_w(0.0)
                 .truncate(),
         );
-    match path {
+    let leaf = match path {
         Some(path) => {
             let target = path.to_string();
             leaf.hover(p.hover)
                 .on_press(move |s: &mut App| go(s, PathBuf::from(target.clone())))
         }
+        None => leaf,
+    };
+    // The same menu This PC's cards offer, so a drive can be ejected from here
+    // too rather than only from the view on the right.
+    match volume {
+        Some(index) => leaf.on_secondary_press(move |s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
+            s.menu = Some(Menu::Context { scope: CtxScope::Volume, target: index, x: at.x, y: at.y });
+        }),
         None => leaf,
     }
 }
@@ -5964,21 +5973,19 @@ fn nav_rail(s: &App, p: Paint) -> El {
         .child(rail_item(s, p, 9, "This PC", true, false));
     if s.rail_open.contains(&9) {
         if s.volumes.is_empty() {
-            rail = rail.child(rail_leaf(p, "No drives found", None));
+            rail = rail.child(rail_leaf(p, "No drives found", None, None));
         }
-        for volume in &s.volumes {
-            let letter = volume.letter();
-            let title = match volume.label.trim() {
-                "" => letter,
-                label => format!("{label} ({letter})"),
-            };
+        // The title is the volume's own: a label when it has one, otherwise the
+        // kind of device, so an unnamed system drive reads "Local Disk (C:)".
+        for (index, volume) in s.volumes.iter().enumerate() {
+            let title = volume.title();
             let path = volume.path.to_string_lossy().into_owned();
-            rail = rail.child(rail_leaf(p, &title, Some(&path)));
+            rail = rail.child(rail_leaf(p, &title, Some(&path), Some(index)));
         }
     }
     rail = rail.child(rail_item(s, p, 10, "Network", true, false));
     if s.rail_open.contains(&10) {
-        rail = rail.child(rail_leaf(p, "Network browsing is not implemented", None));
+        rail = rail.child(rail_leaf(p, "Network browsing is not implemented", None, None));
     }
     let rail = rail.child(el().grow(1.0));
     row().key("rail-wrap")
@@ -9150,6 +9157,23 @@ mod rail_tests {
         assert_eq!(s.rail_open, vec![9, 10]);
         toggle_rail(&mut s, 9);
         assert_eq!(s.rail_open, vec![10]);
+    }
+    /// The rail used to fall back to the bare letter, so an unnamed system drive
+    /// read "C:". The volume names itself by kind instead.
+    #[test]
+    fn an_unnamed_drive_is_named_by_what_it_is() {
+        let drive = |kind, name: &str| volumes::Volume {
+            path: PathBuf::from(name),
+            label: String::new(),
+            kind,
+            free: 0,
+            total: 0,
+        };
+        assert_eq!(drive(volumes::VolumeKind::Fixed, r"C:\").title(), "Local Disk (C:)");
+        assert_eq!(
+            drive(volumes::VolumeKind::Removable, r"E:\").title(),
+            "Removable Disk (E:)"
+        );
     }
 }
 

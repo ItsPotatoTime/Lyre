@@ -31,6 +31,7 @@ mod defaultmanager;
 mod fileops;
 mod frame;
 mod imagery;
+mod openwith;
 mod osdrag;
 mod search;
 mod shell;
@@ -430,7 +431,8 @@ struct IconDone {
     picture: Option<(u32, u32, Vec<u8>)>,
 }
 
-/// A modal dialog: delete confirmation, paste conflict, rename, new folder, default manager, update.
+/// A modal dialog: delete confirmation, paste conflict, rename, new folder,
+/// default manager, update, or which application opens a file.
 enum Dialog {
     Delete { permanent: bool, paths: Vec<PathBuf> },
     PasteConflict { mode: fileops::Mode, sources: Vec<PathBuf>, target: PathBuf },
@@ -438,6 +440,15 @@ enum Dialog {
     NewFolder { parent: PathBuf, edit: TextEdit },
     DefaultManager,
     Update,
+    /// `data` is None while the platform is still being asked; `selected` holds
+    /// the app id the Open button would launch.
+    OpenWith {
+        path: String,
+        name: String,
+        data: Option<openwith::OpenWith>,
+        selected: Option<String>,
+        remember: bool,
+    },
 }
 
 /// A rubber-band selection in the rows' content coordinates. `base` is the
@@ -742,6 +753,9 @@ struct App {
     op_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// The open modal dialog (delete confirm, paste conflict, rename, new folder).
     dialog: Option<Dialog>,
+    /// The "Open with" worker's answer: listing applications touches the disk
+    /// and, on Linux, runs `xdg-mime`, so it never runs on the UI thread.
+    openwith_rx: Option<std::sync::mpsc::Receiver<openwith::OpenWith>>,
     /// Live search: results stream from a worker into these, replacing the list.
     searching: bool,
     search_hits: Vec<search::Hit>,
@@ -1552,6 +1566,10 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
     if s.update_busy {
         tx.wake_after(std::time::Duration::from_millis(60));
     }
+    changed |= drain_openwith(s);
+    if s.openwith_rx.is_some() {
+        tx.wake_after(std::time::Duration::from_millis(16));
+    }
     // The keyboard-navigation flash fades after a moment; keep frames coming
     // until it clears so the redraw lands.
     if let Some(at) = s.reveal_at {
@@ -2034,6 +2052,7 @@ fn init() -> App {
         op_rx: None,
         op_cancel: None,
         dialog: None,
+        openwith_rx: None,
         searching: false,
         search_hits: Vec::new(),
         search_matched: 0,
@@ -4179,11 +4198,10 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                         }
                     } else if menu_visible(s, "open-with") {
                         let open = path.clone();
+                        let label = entry.map(|e| e.name.clone()).unwrap_or_default();
                         rows.push(
                             menu_item(p, "Open with…", None, None, false).on_press(move |s: &mut App| {
-                                if let Err(e) = shell::open_with_picker(&open) {
-                                    s.notice = e;
-                                }
+                                start_open_with(s, open.clone(), label.clone());
                                 s.menu = None;
                             }),
                         );
@@ -4666,6 +4684,37 @@ fn dialog_button(p: Paint, label: &str, primary: bool) -> El {
         .child(text(label).font(UI_TEXT).color(if primary { Color::WHITE } else { p.text }))
 }
 
+/// The radio mark an "Open with" row carries: a ring, filled in when chosen.
+fn radio_dot(p: Paint, picked: bool) -> El {
+    let ring = if picked { p.accent_fill } else { p.tertiary };
+    let dot = el()
+        .w(16.0)
+        .h(16.0)
+        .radius(8.0)
+        .border(p.hair * 2.0, ring)
+        .center();
+    if picked {
+        dot.child(el().w(8.0).h(8.0).radius(4.0).fill(p.accent_fill))
+    } else {
+        dot
+    }
+}
+
+/// The tick box beside "Always use this application".
+fn check_box(p: Paint, on: bool) -> El {
+    let mark = el()
+        .w(16.0)
+        .h(16.0)
+        .radius(3.0)
+        .border(p.hair * 2.0, if on { p.accent_fill } else { p.tertiary })
+        .center();
+    if on {
+        mark.fill(p.accent_fill).child(ico(p, Ico::Check, 11.0, Color::WHITE))
+    } else {
+        mark
+    }
+}
+
 /// The modal dialog: delete confirmation, paste conflict, rename or new folder.
 fn dialog_overlay(s: &App, p: Paint) -> El {
     let Some(dialog) = &s.dialog else {
@@ -4885,6 +4934,159 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
                         }
                     })),
             )
+        }
+        Dialog::OpenWith { path, name, data, selected, remember } => {
+            let path = path.clone();
+            let picked = selected.clone();
+            let mut panel = base().child(
+                text(format!("Open “{name}” with")).font(TILE_TEXT).color(p.text).truncate(),
+            );
+            let mut loaded: Option<&openwith::OpenWith> = None;
+            match data {
+                None => {
+                    panel = panel.child(
+                        text("Looking for applications…").font(UI_TEXT).color(p.secondary),
+                    );
+                }
+                Some(d) => {
+                    loaded = Some(d);
+                    if let Some(reason) = &d.unsupported {
+                        panel = panel.child(
+                            text(reason.as_str()).font(UI_TEXT).color(p.secondary).w_full().wrap(),
+                        );
+                    } else if d.apps.is_empty() {
+                        let kind = if d.kind.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{} ", d.kind)
+                        };
+                        panel = panel.child(
+                            text(format!(
+                                "No application on this system says it can open {kind}files."
+                            ))
+                            .font(UI_TEXT)
+                            .color(p.secondary)
+                            .w_full()
+                            .wrap(),
+                        );
+                    } else {
+                        let default_id = d.default_app.clone();
+                        // Application lists run long: the whole set scrolls
+                        // inside a fixed height rather than growing the dialog.
+                        let mut list = col()
+                            .key("openwith-list")
+                            .w_full()
+                            .gap(2.0)
+                            .max_h(252.0)
+                            .scroll(ScrollSpec { stick_bottom: false });
+                        for app in &d.apps {
+                            let id = app.id.clone();
+                            let is_default = default_id.as_deref() == Some(app.id.as_str());
+                            let is_selected = picked.as_deref() == Some(app.id.as_str());
+                            let mut item = row()
+                                .w_full()
+                                .h(30.0)
+                                .px(8.0)
+                                .gap(10.0)
+                                .radius(4.0)
+                                .fill(Color::TRANSPARENT)
+                                .items_center()
+                                .hover(p.hover)
+                                .press(p.press)
+                                .child(radio_dot(p, is_selected))
+                                .child(
+                                    text(app.name.as_str())
+                                        .font(UI_TEXT)
+                                        .color(p.text)
+                                        .grow(1.0)
+                                        .min_w(0.0)
+                                        .truncate(),
+                                )
+                                .on_press(move |s: &mut App| {
+                                    if let Some(Dialog::OpenWith { selected, .. }) = &mut s.dialog {
+                                        *selected = Some(id.clone());
+                                    }
+                                });
+                            if is_selected {
+                                item = item.fill(p.row_sel);
+                            }
+                            if is_default {
+                                item = item.child(text("Default").font(CAPTION).color(p.accent));
+                            }
+                            list = list.child(item);
+                        }
+                        panel = panel.child(list);
+                    }
+                }
+            }
+
+            let via_picker = loaded.is_some_and(|d| d.default_via_picker);
+            let has_apps = loaded.is_some_and(|d| !d.apps.is_empty());
+
+            // Ours to honour on Linux and macOS. On Windows the association is
+            // hash-protected, so this row gives way to the system's own picker.
+            if loaded.is_some() && !via_picker {
+                let label = match loaded.and_then(|d| (!d.kind.is_empty()).then(|| d.kind.clone())) {
+                    Some(kind) => format!("Always use this application to open {kind} files"),
+                    None => "Always use this application for these files".to_string(),
+                };
+                panel = panel.child(
+                    row()
+                        .w_full()
+                        .gap(8.0)
+                        .radius(4.0)
+                        .items_center()
+                        .hover(p.hover)
+                        .child(check_box(p, *remember))
+                        .child(
+                            text(label)
+                                .font(CAPTION)
+                                .color(p.secondary)
+                                .grow(1.0)
+                                .min_w(0.0)
+                                .wrap(),
+                        )
+                        .on_press(|s: &mut App| {
+                            if let Some(Dialog::OpenWith { remember, .. }) = &mut s.dialog {
+                                *remember = !*remember;
+                            }
+                        }),
+                );
+            }
+
+            let mut footer = row()
+                .w_full()
+                .gap(8.0)
+                .items_center()
+                .child(el().grow(1.0))
+                .child(dialog_button(p, "Cancel", false).on_press(|s: &mut App| s.dialog = None));
+            if via_picker {
+                let target = path.clone();
+                footer = footer.child(
+                    dialog_button(p, "Choose another app…", false).on_press(move |s: &mut App| {
+                        if let Err(e) = shell::open_with_picker(&target) {
+                            s.notice = e;
+                        }
+                        s.dialog = None;
+                    }),
+                );
+            }
+            if has_apps {
+                let target = path.clone();
+                let app = picked.clone();
+                // Windows cannot be told a new default, so the one-off open is
+                // all that is left to honour there.
+                let commit = *remember && !via_picker;
+                footer = footer.child(
+                    dialog_button(p, "Open", true).on_press(move |s: &mut App| {
+                        if let Some(id) = &app {
+                            s.dialog = None;
+                            apply_open_with(s, &target, id, commit);
+                        }
+                    }),
+                );
+            }
+            panel.child(footer)
         }
     };
     el().key("dialog-overlay")
@@ -6276,6 +6478,63 @@ fn open_recent(s: &mut App, i: usize) {
     open_path(s, &path, is_dir);
     // The opened file moves to the front of the list.
     refresh_recent(s);
+}
+
+/// Show the dialog that asks which application opens this file. The platform's
+/// answer is collected on a worker thread: on Linux that runs `xdg-mime` twice.
+fn start_open_with(s: &mut App, path: String, name: String) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    s.openwith_rx = Some(rx);
+    s.dialog = Some(Dialog::OpenWith {
+        path: path.clone(),
+        name,
+        data: None,
+        selected: None,
+        remember: true,
+    });
+    std::thread::spawn(move || {
+        let _ = tx.send(openwith::open_with(&path));
+    });
+}
+
+/// Drain the "Open with" worker's answer into the open dialog; true to redraw.
+fn drain_openwith(s: &mut App) -> bool {
+    let Some(rx) = s.openwith_rx.take() else {
+        return false;
+    };
+    let mut answer = None;
+    while let Ok(data) = rx.try_recv() {
+        answer = Some(data);
+    }
+    let Some(data) = answer else {
+        // Still being listed; keep the receiver for the next frame.
+        s.openwith_rx = Some(rx);
+        return false;
+    };
+    let default = data.default_app.clone();
+    let first = data.apps.first().map(|app| app.id.clone());
+    if let Some(Dialog::OpenWith { data: slot, selected, .. }) = &mut s.dialog {
+        *slot = Some(data);
+        // The platform's current default is offered first, as Explorer does.
+        *selected = default.or(first);
+    }
+    true
+}
+
+/// Open the file in one chosen application, optionally making it the default
+/// for this file's type first.
+fn apply_open_with(s: &mut App, path: &str, app_id: &str, remember: bool) {
+    record_recent(s, path);
+    if remember {
+        if let Err(err) = openwith::set_default_app(path, app_id) {
+            s.notice = err;
+        } else {
+            s.notice = "Default application set".into();
+        }
+    }
+    if let Err(err) = openwith::open_with_app(path, app_id) {
+        s.notice = err;
+    }
 }
 
 /// Global shortcuts. Returns true when the key was handled. Editing keys are
@@ -7801,6 +8060,31 @@ fn main() {
                     signature: String::new(),
                 });
                 s.dialog = Some(Dialog::Update);
+            }),
+            ("openwithdlg", |s| {
+                s.view = View::Files;
+                s.mode = Mode::Details;
+                let (path, name) = match s
+                    .entries
+                    .iter()
+                    .find(|e| !e.is_dir && Path::new(&e.path).extension().is_some())
+                    .or_else(|| s.entries.first())
+                {
+                    Some(e) => (e.path.clone(), e.name.clone()),
+                    None => (String::new(), String::new()),
+                };
+                let data = openwith::open_with(&path);
+                let selected = data
+                    .default_app
+                    .clone()
+                    .or_else(|| data.apps.first().map(|app| app.id.clone()));
+                s.dialog = Some(Dialog::OpenWith {
+                    path,
+                    name,
+                    data: Some(data),
+                    selected,
+                    remember: true,
+                });
             }),
             ("marquee", |s| {
                 load(s, Fixture::Downloads);

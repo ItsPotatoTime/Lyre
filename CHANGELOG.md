@@ -27,6 +27,16 @@ release notes rather than a second copy of them.
   ones other programs added, with a tick per item and a count of how many are
   shown. Turning something off is remembered. It also lists every registration
   that exists but could not be read, with the reason.
+- **Open with, on every platform.** "Open with…" now opens a dialog listing the
+  applications that declare they can open that file's type, with the current
+  default marked and preselected. Choosing one opens the file there, and "Always
+  use this application" makes it the default. Linux reads `.desktop` entries and
+  records the choice with `xdg-mime`; macOS reads and writes LaunchServices role
+  handlers; Windows builds the list from the registry, out of `OpenWithProgids`,
+  `OpenWithList` and `SupportedTypes`, naming each entry from the executable's own
+  description so it reads "Firefox" rather than "firefox". Windows hash-protects
+  the default association, so changing it there still goes through the system's
+  own picker, which the dialog offers beside the list.
 
 ### Changed
 

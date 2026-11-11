@@ -31,6 +31,7 @@ mod win {
     use std::path::Path;
 
     const HKEY_CLASSES_ROOT: usize = 0xFFFF_FFFF_8000_0000;
+    const HKEY_CURRENT_USER: usize = 0xFFFF_FFFF_8000_0001;
     const KEY_READ: u32 = 0x0002_0019;
     const REG_SZ: u32 = 1;
     const REG_EXPAND_SZ: u32 = 2;
@@ -159,9 +160,15 @@ mod win {
 
     /// One string value under `subkey`, with the shell's two indirections resolved.
     fn value(subkey: &str, name: Option<&str>) -> Option<String> {
+        value_under(HKEY_CLASSES_ROOT, subkey, name)
+    }
+
+    /// The same read against any root: the per-user file associations live under
+    /// `HKEY_CURRENT_USER`, not in `HKEY_CLASSES_ROOT`.
+    fn value_under(root: usize, subkey: &str, name: Option<&str>) -> Option<String> {
         let path = wide(subkey);
         let mut key: usize = 0;
-        if unsafe { RegOpenKeyExW(HKEY_CLASSES_ROOT, path.as_ptr(), 0, KEY_READ, &mut key) } != 0 {
+        if unsafe { RegOpenKeyExW(root, path.as_ptr(), 0, KEY_READ, &mut key) } != 0 {
             return None;
         }
         let name_wide = name.map(wide);
@@ -412,6 +419,69 @@ mod win {
         Ok(())
     }
 
+    /// Open a file through one specific registered class rather than whatever
+    /// the machine would pick. `lpClass` names the handler (a ProgID) and the
+    /// open verb runs it, which is how an "Open with" row is honoured.
+    pub fn open_as(prog_id: &str, path: &str) -> Result<(), String> {
+        let verb_w = wide("open");
+        let file_w = wide(path);
+        let class_w = wide(prog_id);
+        let mut info: ExecuteInfo = unsafe { std::mem::zeroed() };
+        info.size = std::mem::size_of::<ExecuteInfo>() as u32;
+        info.verb = verb_w.as_ptr();
+        info.file = file_w.as_ptr();
+        info.class = class_w.as_ptr();
+        info.show = SW_SHOWNORMAL;
+        if unsafe { ShellExecuteExW(&mut info) } == 0 {
+            return Err(format!("Windows could not start {prog_id}."));
+        }
+        Ok(())
+    }
+
+    /// Registry reads for the "Open with" list, which browses the same classes
+    /// from a different direction than the context-menu verbs do.
+    pub fn reg_string(key: &str, name: Option<&str>) -> Option<String> {
+        value(key, name)
+    }
+
+    pub fn reg_user_string(key: &str, name: Option<&str>) -> Option<String> {
+        value_under(HKEY_CURRENT_USER, key, name)
+    }
+
+    pub fn reg_subkeys(key: &str) -> Vec<String> {
+        subkeys(key)
+    }
+
+    pub fn reg_key_exists(key: &str) -> bool {
+        key_exists(key)
+    }
+
+    /// Whether `key` defines a value at all. `SupportedTypes` records a type by
+    /// the value's *name* and leaves its data empty, so reading it back yields
+    /// nothing; only its presence answers.
+    pub fn reg_has_value(key: &str, name: &str) -> bool {
+        let path = wide(key);
+        let mut handle: usize = 0;
+        if unsafe { RegOpenKeyExW(HKEY_CLASSES_ROOT, path.as_ptr(), 0, KEY_READ, &mut handle) } != 0 {
+            return false;
+        }
+        let name_wide = wide(name);
+        let mut kind = 0u32;
+        let mut len = 0u32;
+        let status = unsafe {
+            RegQueryValueExW(
+                handle,
+                name_wide.as_ptr(),
+                std::ptr::null_mut(),
+                &mut kind,
+                std::ptr::null_mut(),
+                &mut len,
+            )
+        };
+        unsafe { RegCloseKey(handle) };
+        status == 0
+    }
+
     /// A background verb is a command line written for a folder: `%V`/`%1` take
     /// the folder's place, and the result runs through the command interpreter.
     fn run_background(verb: &str, folder: &str) -> Result<(), String> {
@@ -449,7 +519,10 @@ mod win {
 }
 
 #[cfg(target_os = "windows")]
-pub use win::{open_default, open_with_picker, run, verbs};
+pub use win::{
+    open_as, open_default, open_with_picker, reg_has_value, reg_key_exists, reg_string,
+    reg_subkeys, reg_user_string, run, verbs,
+};
 
 #[cfg(not(target_os = "windows"))]
 mod other {

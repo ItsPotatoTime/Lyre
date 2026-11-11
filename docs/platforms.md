@@ -108,19 +108,22 @@ the `.desktop` entries the desktop itself reads, opening goes through
 `gio launch`, and the default is a single file rewritten by `xdg-mime`.
 Everything can be listed and changed from inside the window.
 
-**Windows** is closed in two specific ways. The list of applications for a type
-lives partly in AppX manifests that are activated through COM rather than shell
-commands, so a from-scratch enumeration returns ProgIDs that cannot be launched
-without `IApplicationActivationManager`. And the default is a `UserChoice` key
-carrying a hash Windows validates, so writing it is tampering that the OS
-reverts. Explorer itself answers "Choose another app" by opening
-`SHOpenWithDialog`, which is what Lyre does: the operating system's own picker,
-which knows every registered app and sets the default through the sanctioned
-path.
+**macOS** keeps the same three answers in LaunchServices. The type is the UTI the
+system resolves for the file's extension, the candidates and the current default
+are role handlers for that UTI, and both are readable and settable through its C
+API, so the window lists the bundles and "Always use this application" is
+honoured. An application launches by bundle id through `open -b`.
 
-**macOS** has no application list of its own here yet: the Unix implementation
-looks for `.desktop` entries, which macOS does not have, so the list comes back
-empty and opening a file goes to the system's own association through `open`.
+**Windows** lists its applications from the registry; only the default is out of
+reach. A candidate is a ProgID named under the extension's `OpenWithProgids`,
+listed in `SystemFileAssociations\.ext\OpenWithList`, or accepted by an
+`Applications\<exe>\SupportedTypes` entry. The name shown is the executable's own
+`FileDescription`, which is the string the shell itself uses, so the list reads
+"Firefox" rather than "firefox". The *default* is a `UserChoice` key carrying a
+hash Windows validates, so writing it is tampering that the OS reverts: changing
+it goes through `SHOpenWithDialog`, which is what Explorer itself calls for
+"Choose another app", and the window offers exactly that. Picking a row still
+opens the file once, in that application, without touching the association.
 
 ## Context menu items from other programs
 

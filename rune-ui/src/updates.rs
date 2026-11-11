@@ -140,6 +140,48 @@ fn verify(data: &[u8], signature_b64: &str) -> Result<(), String> {
         .map_err(|_| "The update signature does not match the project key; refusing to install.".to_string())
 }
 
+/// Replace a file by staging the new bytes beside it and renaming over it.
+///
+/// Two constraints force this shape. On Linux the kernel refuses to write to a
+/// running executable at all (`ETXTBSY`, "Text file busy"), so the download
+/// cannot be written over the AppImage being executed. And a rename can only
+/// cross within one filesystem, so staging in the system temporary folder and
+/// moving across would fail where `/tmp` is its own mount. The copy is therefore
+/// written next to the target, given its executable bit, and renamed into place,
+/// which is atomic: the running process keeps the old file until it exits.
+///
+/// The staging name starts with a dot so a leftover from a failed attempt is not
+/// mistaken for the application, and anything left over is removed.
+#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
+fn replace_beside(target: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
+    let folder = target
+        .parent()
+        .ok_or_else(|| "That file has no folder to write beside.".to_string())?;
+    let name = target
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .ok_or_else(|| "That file has no name.".to_string())?;
+    let staged = folder.join(format!(".{name}.update"));
+
+    std::fs::write(&staged, bytes).map_err(|e| {
+        format!("Could not write the update beside {}: {e}", target.display())
+    })?;
+    // The replacement must be runnable even though it was just written.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755)) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(format!("Could not mark the update executable: {e}"));
+        }
+    }
+    if let Err(e) = std::fs::rename(&staged, target) {
+        let _ = std::fs::remove_file(&staged);
+        return Err(format!("Could not replace {}: {e}", target.display()));
+    }
+    Ok(())
+}
+
 /// Write the installer somewhere temporary and hand it to the platform.
 #[cfg(target_os = "windows")]
 fn install(bytes: &[u8], _url: &str) -> Result<(), String> {
@@ -153,12 +195,11 @@ fn install(bytes: &[u8], _url: &str) -> Result<(), String> {
 
 #[cfg(all(unix, not(target_os = "macos")))]
 fn install(bytes: &[u8], _url: &str) -> Result<(), String> {
-    // An AppImage replaces itself in place.
-    let exe = std::env::current_exe().map_err(|e| format!("Could not locate this application: {e}"))?;
-    std::fs::write(&exe, bytes).map_err(|e| format!("Could not replace the AppImage: {e}"))?;
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755));
-    Ok(())
+    // An AppImage replaces itself. It cannot be written over directly, because it
+    // is the file being executed, so it is staged beside and renamed into place.
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("Could not locate this application: {e}"))?;
+    replace_beside(&exe, bytes)
 }
 
 #[cfg(target_os = "macos")]
@@ -221,6 +262,39 @@ mod tests {
         assert_eq!(base64_decode("TWE=").unwrap(), b"Ma");
         assert_eq!(base64_decode("TQ==").unwrap(), b"M");
         assert_eq!(base64_decode("").unwrap(), b"");
+    }
+
+    #[test]
+    fn replacing_a_file_stages_beside_it_and_leaves_nothing_behind() {
+        let dir = std::env::temp_dir().join(format!("lyre-update-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("Lyre.AppImage");
+        std::fs::write(&target, b"the old build").unwrap();
+
+        replace_beside(&target, b"the new build").expect("replacement should succeed");
+
+        assert_eq!(std::fs::read(&target).unwrap(), b"the new build");
+        // The staged copy is renamed, not copied, so nothing is left beside it.
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name != "Lyre.AppImage")
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "a staged copy was left behind: {leftovers:?}"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+            assert!(mode & 0o111 != 0, "the replacement must be executable");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

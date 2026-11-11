@@ -756,6 +756,10 @@ struct App {
     transfer: Option<Transfer>,
     op_rx: Option<std::sync::mpsc::Receiver<OpMsg>>,
     op_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Handler items for the open menu, memoised by the selection they were read
+    /// for: building them instantiates a third-party DLL, which is far too much
+    /// to repeat on every frame the menu is drawn.
+    menu_handler_rows: RefCell<Option<(String, Vec<shell::Verb>)>>,
     /// The open modal dialog (delete confirm, paste conflict, rename, new folder).
     dialog: Option<Dialog>,
     /// The "Open with" worker's answer: listing applications touches the disk
@@ -2058,6 +2062,7 @@ fn init() -> App {
         transfer: None,
         op_rx: None,
         op_cancel: None,
+        menu_handler_rows: RefCell::new(None),
         dialog: None,
         openwith_rx: None,
         searching: false,
@@ -3819,35 +3824,102 @@ fn menu_heading(p: Paint, label: &str) -> El {
 fn shell_verb_rows(
     s: &App,
     p: Paint,
-    path: Option<&str>,
+    paths: &[String],
     is_dir: bool,
     background: bool,
 ) -> (Vec<El>, f32) {
     let mut rows = Vec::new();
     let mut h = 0.0;
-    let enabled: Vec<shell::Verb> = shell::verbs(path, is_dir, background)
-        .into_iter()
-        .filter(|v| item_shown(s, &v.id, false))
-        .collect();
-    if enabled.is_empty() {
+    let mut trees = shell::verbs(paths.first().map(String::as_str), is_dir, background);
+    trees.extend(menu_handlers(s, paths, is_dir, background));
+    push_verb_rows(s, p, &trees, paths, &mut rows, &mut h);
+    if rows.is_empty() {
         return (rows, h);
     }
-    rows.push(menu_sep(p));
-    h += 9.0;
-    for v in enabled {
-        let verb = v.clone();
-        let target = path.unwrap_or("").to_string();
-        rows.push(
-            menu_item(p, &v.label, None, Some(v.source.as_str()), false).on_press(move |s: &mut App| {
-                if let Err(e) = shell::run(&verb, &target) {
-                    s.notice = e;
-                }
-                s.menu = None;
-            }),
-        );
-        h += MENU_ROW_H;
+    let mut all = Vec::with_capacity(rows.len() + 1);
+    all.push(menu_sep(p));
+    all.extend(rows);
+    (all, h + 9.0)
+}
+
+/// Handler items for the open menu, memoised by the selection they were read for.
+/// Building them instantiates a third-party DLL, which is far too much work to
+/// repeat on every frame the menu is drawn.
+fn menu_handlers(s: &App, paths: &[String], is_dir: bool, background: bool) -> Vec<shell::Verb> {
+    if s.handler_loaded.is_empty() {
+        return Vec::new();
     }
-    (rows, h)
+    let key = format!("{is_dir}|{background}|{}", paths.join("\u{1}"));
+    if let Some((cached, verbs)) = s.menu_handler_rows.borrow().as_ref()
+        && *cached == key
+    {
+        return verbs.clone();
+    }
+    let verbs = shell::handlers(paths, is_dir, background, &s.handler_loaded);
+    *s.menu_handler_rows.borrow_mut() = Some((key, verbs.clone()));
+    verbs
+}
+
+/// The paths a context action applies to: the whole selection when the clicked
+/// item is part of it, otherwise just that item. Explorer behaves this way, and
+/// an extension needs all of them, not the one the pointer happened to be over.
+fn context_paths(s: &App, target: usize) -> Vec<String> {
+    let pick = |index: usize| -> Option<String> {
+        if s.searching {
+            s.search_hits.get(index).map(|hit| hit.entry.path.clone())
+        } else {
+            s.entries.get(index).map(|entry| entry.path.clone())
+        }
+    };
+    if s.selected.len() > 1 && s.selected.contains(&target) {
+        let picked: Vec<String> = s.selected.iter().filter_map(|index| pick(*index)).collect();
+        if !picked.is_empty() {
+            return picked;
+        }
+    }
+    pick(target).into_iter().collect()
+}
+
+/// Append a verb tree to a menu, parents as a heading over the items under them.
+fn push_verb_rows(
+    s: &App,
+    p: Paint,
+    verbs: &[shell::Verb],
+    paths: &[String],
+    rows: &mut Vec<El>,
+    h: &mut f32,
+) {
+    for verb in verbs {
+        if verb.children.is_empty() {
+            if !item_shown(s, &verb.id, false) {
+                continue;
+            }
+            let picked = verb.clone();
+            let target = paths.to_vec();
+            let hint = (!verb.source.is_empty()).then_some(verb.source.as_str());
+            rows.push(
+                menu_item(p, &verb.label, None, hint, false).on_press(move |s: &mut App| {
+                    if let Err(e) = shell::run(&picked, &target) {
+                        s.notice = e;
+                    }
+                    s.menu = None;
+                }),
+            );
+            *h += MENU_ROW_H;
+        } else {
+            // A parent is only worth drawing when something under it is on.
+            if !verb
+                .children
+                .iter()
+                .any(|child| item_shown(s, &child.id, false))
+            {
+                continue;
+            }
+            rows.push(menu_heading(p, &verb.label));
+            *h += 24.0;
+            push_verb_rows(s, p, &verb.children, paths, rows, h);
+        }
+    }
 }
 
 /// Anchor a flyout just below its trigger, from the trigger's drawn rect.
@@ -4278,7 +4350,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                             h += MENU_ROW_H;
                         }
                     }
-                    let (shell_rows, shell_h) = shell_verb_rows(s, p, Some(&path), is_dir, false);
+                    let (shell_rows, shell_h) = shell_verb_rows(s, p, &context_paths(s, target), is_dir, false);
                     rows.extend(shell_rows);
                     h += shell_h;
                     rows.push(menu_sep(p));
@@ -4375,7 +4447,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                         h += MENU_ROW_H;
                     }
                     let root = s.root.to_string_lossy().into_owned();
-                    let (shell_rows, shell_h) = shell_verb_rows(s, p, Some(&root), true, true);
+                    let (shell_rows, shell_h) = shell_verb_rows(s, p, std::slice::from_ref(&root), true, true);
                     rows.extend(shell_rows);
                     h += shell_h;
                     let ctx_root = root.clone();
@@ -4647,7 +4719,8 @@ fn customize_groups(s: &App) -> Vec<CustomGroup> {
 
     // Third-party extensions. Their items only exist once the person lets Lyre
     // load the DLL, so the group carries that switch above them.
-    for handler in shell::handlers(path, is_dir, background, &s.handler_loaded) {
+    let target: Vec<String> = path.map(|path| vec![path.to_string()]).unwrap_or_default();
+    for handler in shell::handlers(&target, is_dir, background, &s.handler_loaded) {
         let clsid = handler.verb.clone();
         let loaded = !clsid.is_empty()
             && s.handler_loaded
@@ -8403,6 +8476,57 @@ fn main() {
 #[cfg(all(test, target_os = "windows"))]
 mod customize_tests {
     use super::*;
+
+    /// The menu has to carry the extension's items, and they have to be read for
+    /// the whole selection rather than the item under the pointer.
+    #[test]
+    fn a_loaded_extension_survives_a_multi_file_selection() {
+        let dir = std::env::temp_dir().join(format!("lyre-multi-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let paths: Vec<String> = (0..3)
+            .map(|n| {
+                let file = dir.join(format!("part{n}.txt"));
+                std::fs::write(&file, b"x").unwrap();
+                file.to_string_lossy().into_owned()
+            })
+            .collect();
+
+        // What the customize dialog offers for the same selection.
+        let mut s = init();
+        s.customize_path = Some(paths[0].clone());
+        let groups = customize_groups(&s);
+        let Some(index) = groups
+            .iter()
+            .position(|group| group.owner.to_lowercase().contains("7-zip"))
+        else {
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        };
+        s.handler_loaded.push(groups[index].lines[0].load.clone().unwrap());
+
+        // Reading it for three files at once still names its commands.
+        let rows = menu_handlers(&s, &paths, false, false);
+        let children: Vec<&shell::Verb> = rows.iter().flat_map(|row| row.children.iter()).collect();
+        assert!(
+            children
+                .iter()
+                .any(|item| item.label.to_lowercase().contains("archive")),
+            "a multiple selection should still offer the archive commands: {:?}",
+            children.iter().map(|item| &item.label).collect::<Vec<_>>()
+        );
+
+        // And context actions cover the selection, not just the clicked item.
+        s.selected = vec![0, 1, 2];
+        assert_eq!(context_paths(&s, 1).len(), 3);
+        // An item outside the selection is on its own.
+        if let Some(entry) = s.entries.get(2) {
+            s.selected = vec![0];
+            assert_eq!(context_paths(&s, 2), vec![entry.path.clone()]);
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     /// The dialog has to list what actually exists, including the extensions
     /// that draw their own items, which the old flat list never showed at all.

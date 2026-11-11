@@ -46,12 +46,12 @@ pub fn registrations(_classes: &[String]) -> Vec<Registration> {
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn items(_clsid: &str, _path: &str) -> Result<Vec<Verb>, String> {
+pub fn items(_clsid: &str, _paths: &[String]) -> Result<Vec<Verb>, String> {
     Err("Third-party menu handlers exist only on Windows.".into())
 }
 
 #[cfg(not(target_os = "windows"))]
-pub fn invoke(_clsid: &str, _path: &str, _command: u32) -> Result<(), String> {
+pub fn invoke(_clsid: &str, _paths: &[String], _command: u32) -> Result<(), String> {
     Err("Third-party menu handlers exist only on Windows.".into())
 }
 
@@ -82,7 +82,7 @@ mod probes {
             .filter(|reg| reg.label.to_lowercase().contains("7-zip"))
         {
             println!("\n--- items from {} ({}) ---", reg.label, reg.clsid);
-            match super::items(&reg.clsid, &probe) {
+            match super::items(&reg.clsid, std::slice::from_ref(&probe)) {
                 Ok(items) => {
                     println!("{} items", items.len());
                     for item in &items {
@@ -231,11 +231,12 @@ mod win {
         }
     }
 
-    /// The handler instance, initialised with the file it is being asked about.
+    /// The handler instance, initialised with the files it is being asked about.
     ///
     /// `IShellExtInit::Initialize` is how a handler learns the selection; without
-    /// it, QueryContextMenu draws a menu for nothing.
-    fn handler(clsid: &str, path: &str) -> Result<IContextMenu, String> {
+    /// it, QueryContextMenu draws a menu for nothing, and a handler given one
+    /// path cannot act on a multiple selection.
+    fn handler(clsid: &str, paths: &[String]) -> Result<IContextMenu, String> {
         let guid = parse_guid(clsid).ok_or_else(|| format!("{clsid} is not a class id."))?;
         ensure_com();
         // SAFETY: the CLSID is well formed and this is the documented activation.
@@ -243,8 +244,10 @@ mod win {
             let unknown: windows::core::IUnknown =
                 CoCreateInstance(&guid, None, CLSCTX_INPROC_SERVER)
                     .map_err(|err| format!("Windows could not load that extension: {err}"))?;
-            let data = crate::osdrag::win::data_object_for(std::path::Path::new(path))
-                .ok_or_else(|| "Could not describe that file to the extension.".to_string())?;
+            let files: Vec<std::path::PathBuf> =
+                paths.iter().map(std::path::PathBuf::from).collect();
+            let data = crate::osdrag::win::data_object_for(&files)
+                .ok_or_else(|| "Could not describe that selection to the extension.".to_string())?;
             if let Ok(init) = unknown.cast::<IShellExtInit>() {
                 let _ = init.Initialize(None, Some(&data), None);
             }
@@ -323,9 +326,9 @@ mod win {
         }
     }
 
-    /// What this handler would add to a menu for this file.
-    pub fn items(clsid: &str, path: &str) -> Result<Vec<Verb>, String> {
-        let menu = handler(clsid, path)?;
+    /// What this handler would add to a menu for this selection.
+    pub fn items(clsid: &str, paths: &[String]) -> Result<Vec<Verb>, String> {
+        let menu = handler(clsid, paths)?;
         // SAFETY: a menu handle that is destroyed before returning, and the
         // command range Explorer uses.
         unsafe {
@@ -353,8 +356,8 @@ mod win {
     }
 
     /// Run one item the handler drew.
-    pub fn invoke(clsid: &str, path: &str, command: u32) -> Result<(), String> {
-        let menu = handler(clsid, path)?;
+    pub fn invoke(clsid: &str, paths: &[String], command: u32) -> Result<(), String> {
+        let menu = handler(clsid, paths)?;
         // SAFETY: the ordinal is relative to the same command range the items
         // were read in, which is the documented way to invoke one.
         unsafe {

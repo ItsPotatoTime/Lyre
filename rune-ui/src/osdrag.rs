@@ -771,10 +771,10 @@ pub mod win {
         }
     }
 
-    /// The same data object for one path, for code that hands a file to a shell
-    /// extension rather than to a drag session.
-    pub(crate) fn data_object_for(path: &std::path::Path) -> Option<IDataObject> {
-        unsafe { file_data_object(&[path.to_path_buf()]) }
+    /// The same data object for a set of paths, for code that hands files to a
+    /// shell extension rather than to a drag session.
+    pub(crate) fn data_object_for(paths: &[std::path::PathBuf]) -> Option<IDataObject> {
+        unsafe { file_data_object(paths) }
     }
 
     /// A 32-bit top-down DIB of the preview, with premultiplied alpha: the

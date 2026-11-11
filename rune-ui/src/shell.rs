@@ -487,12 +487,13 @@ mod win {
     /// A handler is only queried when the person allowed it: querying one loads
     /// its DLL into this process, which is third-party code.
     pub fn handlers(
-        path: Option<&str>,
+        paths: &[String],
         is_dir: bool,
         background: bool,
         load: &[String],
     ) -> Vec<Verb> {
-        let classes = handler_classes(path, is_dir, background);
+        let first = paths.first().map(String::as_str);
+        let classes = handler_classes(first, is_dir, background);
         let mut found = Vec::new();
         for handler in crate::handlers::registrations(&classes) {
             let allowed = load
@@ -500,8 +501,7 @@ mod win {
                 .any(|clsid| clsid.eq_ignore_ascii_case(&handler.clsid));
             let mut children = Vec::new();
             if allowed
-                && let Some(target) = path
-                && let Ok(items) = crate::handlers::items(&handler.clsid, target)
+                && let Ok(items) = crate::handlers::items(&handler.clsid, paths)
             {
                 children = items;
                 for child in &mut children {
@@ -642,41 +642,51 @@ mod win {
         execute("open", "cmd.exe", Some(&format!("/c {line}")))
     }
 
-    pub fn run(verb: &Verb, path: &str) -> Result<(), String> {
+    pub fn run(verb: &Verb, paths: &[String]) -> Result<(), String> {
+        let first = paths.first().map(String::as_str).unwrap_or_default();
         match &verb.run {
             Run::Shell => {
                 if verb.background {
-                    run_background(&verb.verb, path)
+                    run_background(&verb.verb, first)
                 } else {
-                    execute(&verb.verb, path, None)
+                    execute(&verb.verb, first, None)
                 }
             }
-            Run::Command(template) => run_template(template, path),
-            Run::Handler { clsid, command } => crate::handlers::invoke(clsid, path, *command),
+            Run::Command(template) => run_template(template, paths),
+            Run::Handler { clsid, command } => crate::handlers::invoke(clsid, paths, *command),
         }
     }
 
-    /// A command line read from the registry, run as a template. Cascading
-    /// submenu items can only be started this way: the shell resolves their
-    /// names while drawing a menu, so `ShellExecuteEx` cannot be handed one.
-    fn run_template(template: &str, path: &str) -> Result<(), String> {
+    /// A command line read from the registry, run as a template against the whole
+    /// selection. Cascading submenu items can only be started this way: the shell
+    /// resolves their names while drawing a menu, so `ShellExecuteEx` cannot be
+    /// handed one.
+    fn run_template(template: &str, paths: &[String]) -> Result<(), String> {
         if template.trim().is_empty() {
             return Err("That item has no command to run.".into());
         }
-        let quoted = format!("\"{path}\"");
+        let quote = |path: &str| format!("\"{path}\"");
+        let first = paths.first().map(|path| quote(path)).unwrap_or_default();
+        let all: Vec<String> = paths.iter().map(|path| quote(path)).collect();
         let mut line = template.to_string();
         for token in ["%V", "%L", "%1"] {
             // The token may be quoted already, and the quotes belong to the path.
             let surround = format!("\"{token}\"");
             if line.contains(&surround) {
-                line = line.replace(&surround, &quoted);
+                line = line.replace(&surround, &first);
             } else {
-                line = line.replace(token, &quoted);
+                line = line.replace(token, &first);
             }
         }
-        // The rest describe a multi-selection, which one item does not have.
-        for token in ["%*", "%2", "%3", "%4", "%5", "%6", "%7", "%8", "%9"] {
+        // `%*` is the whole selection; without it a command written for one file
+        // still has to be handed the others.
+        let wanted_all = template.contains("%*");
+        line = line.replace("%*", &all.join(" "));
+        for token in ["%2", "%3", "%4", "%5", "%6", "%7", "%8", "%9"] {
             line = line.replace(token, "");
+        }
+        if !wanted_all && paths.len() > 1 {
+            line = format!("{line} {}", all[1..].join(" "));
         }
         execute("open", "cmd.exe", Some(&format!("/c {line}")))
     }
@@ -705,7 +715,7 @@ mod other {
     }
     /// No third-party menu extensions exist away from Windows.
     pub fn handlers(
-        _path: Option<&str>,
+        _paths: &[String],
         _is_dir: bool,
         _background: bool,
         _load: &[String],

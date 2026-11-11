@@ -20,7 +20,7 @@ Unicode true
 ; relative path here is relative to packaging/rune/windows, not to wherever it
 ; was invoked from. Three levels up is the repository root.
 !ifndef ICON
-  !define ICON "..\..\..\src-tauri\icons\icon.ico"
+  !define ICON "..\..\..\packaging\icons\icon.ico"
 !endif
 
 ; Newer NSIS pulls in WinMessages.nsh through MUI2, which already defines this.

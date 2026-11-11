@@ -1,3 +1,3 @@
 // The application icon, and the resource id the window loads it by.
 // Paths are relative to this crate's folder, where the build script runs.
-1 ICON "../src-tauri/icons/icon.ico"
+1 ICON "../packaging/icons/icon.ico"

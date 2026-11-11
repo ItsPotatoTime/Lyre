@@ -98,8 +98,8 @@ jobs:
           chmod +x "$APPDIR/AppRun" "$APPDIR/usr/bin/lyre-rune"
           cp packaging/rune/lyre.desktop "$APPDIR/lyre.desktop"
           cp packaging/rune/lyre.desktop "$APPDIR/usr/share/applications/lyre.desktop"
-          cp src-tauri/icons/icon.png "$APPDIR/lyre.png"
-          cp src-tauri/icons/icon.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/lyre.png"
+          cp packaging/icons/icon.png "$APPDIR/lyre.png"
+          cp packaging/icons/icon.png "$APPDIR/usr/share/icons/hicolor/256x256/apps/lyre.png"
           curl -fsSL -o appimagetool \
             https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
           chmod +x appimagetool
@@ -127,7 +127,7 @@ jobs:
           mkdir -p dist/Lyre.app/Contents/MacOS dist/Lyre.app/Contents/Resources
           cp target/universal/lyre-rune dist/Lyre.app/Contents/MacOS/lyre-rune
           sed "s/@VERSION@/$VERSION/g" packaging/rune/macos/Info.plist > dist/Lyre.app/Contents/Info.plist
-          cp src-tauri/icons/icon.icns dist/Lyre.app/Contents/Resources/icon.icns
+          cp packaging/icons/icon.icns dist/Lyre.app/Contents/Resources/icon.icns
           tar -czf dist/Lyre_universal.app.tar.gz -C dist Lyre.app
 
       - name: Sign (Linux)

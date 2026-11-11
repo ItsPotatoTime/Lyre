@@ -16,7 +16,7 @@ fn main() {
         // The `.rc` is beside this crate's manifest, so its icon path climbs one
         // level to the icon set the packaging uses.
         println!("cargo:rerun-if-changed=lyre.rc");
-        println!("cargo:rerun-if-changed=../src-tauri/icons/icon.ico");
+        println!("cargo:rerun-if-changed=../packaging/icons/icon.ico");
         // The result names the compiled resource; nothing needs it afterwards.
         let _ = embed_resource::compile("lyre.rc", embed_resource::NONE);
     }

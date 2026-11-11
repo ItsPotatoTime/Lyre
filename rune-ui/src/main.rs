@@ -1561,7 +1561,16 @@ fn refresh_visible(s: &mut App) {
             let ea = &s.entries[a];
             let eb = &s.entries[b];
             let base = match s.sort {
-                1 => ea.modified.cmp(&eb.modified),
+                // The timestamp, not the text that shows it: "4/30/2026" and
+                // "10/20/2026" compare the wrong way round as strings, which
+                // made this sort look random. An entry with no timestamp goes
+                // last rather than first.
+                1 => match (ea.modified_at, eb.modified_at) {
+                    (Some(a), Some(b)) => a.cmp(&b),
+                    (Some(_), None) => std::cmp::Ordering::Less,
+                    (None, Some(_)) => std::cmp::Ordering::Greater,
+                    (None, None) => std::cmp::Ordering::Equal,
+                },
                 2 => ea.type_label.cmp(&eb.type_label),
                 3 => ea.size.cmp(&eb.size),
                 _ => ea.name.to_lowercase().cmp(&eb.name.to_lowercase()),
@@ -1576,7 +1585,9 @@ fn refresh_visible(s: &mut App) {
     if s.keep_order {
         // authored groups already set by the fixture
     } else if s.group_by_date && s.view == View::Files {
-        order.sort_by(|&a, &b| s.entries[b].modified.cmp(&s.entries[a].modified));
+        // Newest first, so today leads and the days run backwards, as Explorer
+        // groups them. Same key as the sort above: the timestamp, not its text.
+        order.sort_by(|&a, &b| s.entries[b].modified_at.cmp(&s.entries[a].modified_at));
         order.sort_by(|&a, &b| s.entries[b].is_dir.cmp(&s.entries[a].is_dir));
         let mut groups: Vec<(usize, String)> = Vec::new();
         let mut last = String::new();
@@ -9027,6 +9038,105 @@ mod start_tests {
         }
         assert!(matches!(s.view, View::Home), "a plain launch opens on Home");
         assert_eq!(s.tab, "Home");
+    }
+}
+
+#[cfg(test)]
+mod sort_tests {
+    use super::*;
+    use std::time::{Duration, UNIX_EPOCH};
+
+    /// A folder or file with a chosen size, timestamp and type name.
+    fn item(name: &str, is_dir: bool, size: u64, day: u64, type_label: &str) -> Entry {
+        Entry {
+            name: name.to_string(),
+            path: format!("C:/probe/{name}"),
+            is_dir,
+            size: if is_dir { 0 } else { size },
+            modified: format_time(day * 86_400),
+            modified_at: Some(UNIX_EPOCH + Duration::from_secs(day * 86_400)),
+            type_label: type_label.to_string(),
+            kind: if is_dir { Kind::Folder } else { Kind::Text },
+            hidden: false,
+            system: false,
+            fixture: false,
+            fixture_size: String::new(),
+        }
+    }
+
+    fn order_with(sort: u8, desc: bool, entries: Vec<Entry>) -> Vec<String> {
+        let mut s = init();
+        s.view = View::Files;
+        s.keep_order = false;
+        s.count_override = None;
+        s.searching = false;
+        s.search_edit.text.clear();
+        s.filter = Filter::All;
+        s.group_by_date = false;
+        s.sort = sort;
+        s.sort_desc = desc;
+        s.entries = entries;
+        refresh_visible(&mut s);
+        s.visible
+            .iter()
+            .map(|&index| s.entries[index].name.clone())
+            .collect()
+    }
+
+    /// Day 40 is February, day 300 is November, so as text "11/…" sorts before
+    /// "2/…" and the old string comparison put the older file last.
+    fn probe() -> Vec<Entry> {
+        vec![
+            item("zeta", true, 0, 50, "File folder"),
+            item("b-late", false, 10, 300, "Text document"),
+            item("a-early", false, 500, 40, "Text document"),
+            item("c-early", false, 50, 40, "Image"),
+        ]
+    }
+
+    #[test]
+    fn date_modified_orders_by_the_timestamp_not_its_text() {
+        assert_eq!(
+            order_with(1, false, probe()),
+            ["zeta", "a-early", "c-early", "b-late"]
+        );
+        assert_eq!(
+            order_with(1, true, probe()),
+            ["zeta", "b-late", "a-early", "c-early"]
+        );
+    }
+
+    #[test]
+    fn name_size_and_type_order_as_expected() {
+        assert_eq!(
+            order_with(0, false, probe()),
+            ["zeta", "a-early", "b-late", "c-early"]
+        );
+        assert_eq!(
+            order_with(0, true, probe()),
+            ["zeta", "c-early", "b-late", "a-early"]
+        );
+        assert_eq!(
+            order_with(3, false, probe()),
+            ["zeta", "b-late", "c-early", "a-early"]
+        );
+        assert_eq!(
+            order_with(3, true, probe()),
+            ["zeta", "a-early", "c-early", "b-late"]
+        );
+        // Image beats Text document, whatever the direction.
+        let by_type = order_with(2, false, probe());
+        assert_eq!(by_type[1], "c-early");
+    }
+
+    #[test]
+    fn folders_lead_in_every_direction() {
+        for sort in 0..4u8 {
+            for desc in [false, true] {
+                let order = order_with(sort, desc, probe());
+                assert_eq!(order.first().map(String::as_str), Some("zeta"));
+            }
+        }
     }
 }
 

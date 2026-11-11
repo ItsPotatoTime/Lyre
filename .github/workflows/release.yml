@@ -111,8 +111,13 @@ jobs:
         run: |
           $version = $env:GITHUB_REF_NAME -replace '^v',''
           New-Item -ItemType Directory -Force dist | Out-Null
-          makensis /DVERSION=$version /DBINARY=rune-ui/target/release/lyre-rune.exe `
-            /DOUTFILE="dist/Lyre_${version}_x64-setup.exe" packaging/rune/windows/lyre.nsi
+          # Absolute paths: makensis runs from the script's folder, so a relative
+          # binary or output path would resolve inside packaging/rune/windows and
+          # fail to find the build, or leave the setup where nothing uploads it.
+          makensis /DVERSION=$version `
+            /DBINARY="$env:GITHUB_WORKSPACE\rune-ui\target\release\lyre-rune.exe" `
+            /DOUTFILE="$env:GITHUB_WORKSPACE\dist\Lyre_${version}_x64-setup.exe" `
+            packaging/rune/windows/lyre.nsi
 
       - name: Package (macOS .app)
         if: matrix.platform == 'macos'

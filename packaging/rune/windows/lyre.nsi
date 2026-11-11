@@ -16,12 +16,18 @@ Unicode true
 !ifndef OUTFILE
   !define OUTFILE "Lyre-setup.exe"
 !endif
-; Paths are relative to the directory makensis is invoked from (the repo root).
+; makensis changes its working directory to this script's folder, so every
+; relative path here is relative to packaging/rune/windows, not to wherever it
+; was invoked from. Three levels up is the repository root.
 !ifndef ICON
-  !define ICON "src-tauri/icons/icon.ico"
+  !define ICON "..\..\..\src-tauri\icons\icon.ico"
 !endif
 
-!define WM_CLOSE 0x0010
+; Newer NSIS pulls in WinMessages.nsh through MUI2, which already defines this.
+; Defining it again aborts the build, so it is only defined when missing.
+!ifndef WM_CLOSE
+  !define WM_CLOSE 0x0010
+!endif
 !define PRODUCT "Lyre"
 !define REGKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\${PRODUCT}"
 

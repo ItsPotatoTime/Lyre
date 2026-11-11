@@ -59,6 +59,67 @@ pub fn invoke(_clsid: &str, _paths: &[String], _command: u32) -> Result<(), Stri
 
 #[cfg(all(test, target_os = "windows"))]
 mod probes {
+    /// Temporary: runs a real archive command and checks the file appears.
+    #[test]
+    #[ignore]
+    fn invoke_real_7zip() {
+        let dir = std::env::temp_dir().join(format!("lyre-invoke-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("probe.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        let paths: Vec<String> = (0..3)
+            .map(|n| {
+                let each = dir.join(format!("probe{n}.txt"));
+                std::fs::write(&each, b"hello").unwrap();
+                each.to_string_lossy().into_owned()
+            })
+            .collect();
+        let regs = super::registrations(&["*".to_string(), "AllFilesystemObjects".to_string()]);
+        let Some(zip) = regs
+            .iter()
+            .find(|reg| reg.label.to_lowercase().contains("7-zip"))
+        else {
+            return;
+        };
+        let items = super::items(&zip.clsid, &paths).unwrap();
+        let target = items
+            .iter()
+            .find(|item| item.label.starts_with("Add to \""))
+            .expect("an Add to named archive item");
+        let command = match &target.run {
+            crate::shell::Run::Handler { command, .. } => *command,
+            _ => panic!("expected a handler item"),
+        };
+        println!("invoking {:?} (id {command})", target.label);
+        let result = super::invoke(&zip.clsid, &paths, command);
+        println!("invoke = {result:?}");
+        std::thread::sleep(std::time::Duration::from_secs(4));
+        let produced: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        println!("directory now holds: {produced:?}");
+        // The archive should hold all three, not just the first.
+        if let Some(archive) = produced.iter().find(|name| name.ends_with(".7z")) {
+            let listing = std::process::Command::new(r"C:\Program Files\7-Zip\7z.exe")
+                .arg("l")
+                .arg(dir.join(archive))
+                .output();
+            if let Ok(listing) = listing {
+                let text = String::from_utf8_lossy(&listing.stdout);
+                let count = text
+                    .lines()
+                    .filter(|line| line.contains("probe") && line.contains(".txt"))
+                    .count();
+                println!("archive lists {count} probe files");
+                assert_eq!(count, 3, "all three files should be in the archive");
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Temporary: loads a real handler to see whether its items come back.
     #[test]
     #[ignore]
@@ -358,19 +419,42 @@ mod win {
     /// Run one item the handler drew.
     pub fn invoke(clsid: &str, paths: &[String], command: u32) -> Result<(), String> {
         let menu = handler(clsid, paths)?;
-        // SAFETY: the ordinal is relative to the same command range the items
-        // were read in, which is the documented way to invoke one.
+        // SAFETY: the menu handle lives for the whole call, and the ordinal is
+        // relative to the same command range the items were read in.
         unsafe {
+            let popup = CreatePopupMenu();
+            if popup.is_null() {
+                return Err("Windows could not create a menu to ask into.".into());
+            }
+            // A handler builds its item state while drawing the menu, so it has
+            // to be asked once here too: invoking on a fresh instance, or with no
+            // menu drawn at all, is an invalid argument to it.
+            let prepared = menu.QueryContextMenu(
+                windows::Win32::UI::WindowsAndMessaging::HMENU(popup),
+                0,
+                ID_FIRST,
+                ID_LAST,
+                CMF_NORMAL,
+            );
+            if prepared.is_err() {
+                DestroyMenu(popup);
+                return Err("That extension refused to describe its menu.".into());
+            }
+            let owner = crate::frame::hwnd().unwrap_or(0);
             let info = CMINVOKECOMMANDINFOEX {
                 cbSize: std::mem::size_of::<CMINVOKECOMMANDINFOEX>() as u32,
                 fMask: CMIC_MASK_UNICODE,
+                // A handler that asks something shows it over this window.
+                hwnd: windows::Win32::Foundation::HWND(owner as *mut c_void),
                 lpVerb: windows::core::PCSTR((command - ID_FIRST) as usize as *const u8),
                 lpVerbW: windows::core::PCWSTR((command - ID_FIRST) as usize as *const u16),
                 nShow: windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL.0,
                 ..Default::default()
             };
-            menu.InvokeCommand(&info as *const CMINVOKECOMMANDINFOEX as *const CMINVOKECOMMANDINFO)
-                .map_err(|err| format!("Windows could not run that item: {err}"))
+            let result = menu
+                .InvokeCommand(&info as *const CMINVOKECOMMANDINFOEX as *const CMINVOKECOMMANDINFO);
+            DestroyMenu(popup);
+            result.map_err(|err| format!("Windows could not run that item: {err}"))
         }
     }
 }

@@ -45,19 +45,30 @@ function assetUrl(filename: string): string {
 }
 
 /**
- * Tauri's signer decodes the key as standard base64, whose alphabet has no `-`
- * or `_`. A key that has been through anything URL-safe arrives as base64url and
- * is rejected with "Invalid symbol 95" (the underscore) or 45 (the dash). Since
- * no valid standard-base64 string contains either character, translating them
- * back is unambiguous. Padding is restored too, because base64url drops it.
+ * The signer decodes the key file as base64 to get the key text, then decodes
+ * the key line inside that text. A key line that has been through anything
+ * URL-safe carries `_` or `-`, which standard base64 does not, and the second
+ * decode is what fails: "Invalid symbol 95" is the underscore. Both markers are
+ * unambiguous, so translating them is safe, and padding is restored per line
+ * because base64url drops it. A key that needs nothing is returned untouched.
  */
 function normaliseKey(secret: string): string {
   const trimmed = secret.trim();
-  if (!/[-_]/.test(trimmed)) return trimmed;
-  const translated = trimmed.replace(/-/g, "+").replace(/_/g, "/");
-  const padding = "=".repeat((4 - (translated.length % 4)) % 4);
-  console.log("rune-release: key is base64url; translated to standard base64");
-  return translated + padding;
+  const outer = Buffer.from(trimmed, "base64");
+  const text = outer.toString("utf8");
+  if (!text || !/[-_]/.test(text)) return trimmed;
+
+  const fixed = text
+    .split("\n")
+    .map((line) => {
+      // The comment line is not base64 and is not part of the key.
+      if (line.startsWith("untrusted comment") || !/[-_]/.test(line)) return line;
+      const translated = line.replace(/-/g, "+").replace(/_/g, "/");
+      return translated + "=".repeat((4 - (translated.length % 4)) % 4);
+    })
+    .join("\n");
+  console.log("rune-release: key line was base64url; translated to standard base64");
+  return Buffer.from(fixed, "utf8").toString("base64");
 }
 
 function sign(artifact: string, key: string): void {

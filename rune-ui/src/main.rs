@@ -778,6 +778,9 @@ struct App {
     #[cfg(target_os = "windows")]
     pending_os_drag: Option<(Vec<PathBuf>, Option<osdrag::DragPreview>)>,
     /// The window scale, for turning OS drop pixels into window points.
+    /// The letters typed so far, for jumping to a name by typing it.
+    type_ahead: String,
+    type_ahead_at: Instant,
     /// The window size in physical pixels that was last written to settings.
     /// `window_pending` is a size being dragged, which replaces it only once it
     /// has stopped changing.
@@ -1638,6 +1641,13 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
     {
         osdrag::win::request_start(hwnd, paths, preview);
     }
+    // The mouse's side buttons walk the same history as Alt+Left and Alt+Right.
+    // `poll` runs before the frame is drawn, so the change is on screen already.
+    match frame::take_side_button() {
+        Some(1) => go_back(s),
+        Some(2) => go_forward(s),
+        _ => {}
+    }
     // Remember the window's size, but only once a resize has stopped. Rune has no
     // resize event, so it is sampled here; writing the settings on every frame of
     // a drag would be wasteful, and nothing else would wake the window after the
@@ -2347,6 +2357,8 @@ fn init() -> App {
         os_drag: None,
         #[cfg(target_os = "windows")]
         pending_os_drag: None,
+        type_ahead: String::new(),
+        type_ahead_at: Instant::now(),
         window_settled: (0, 0),
         window_pending: None,
         window_changed_at: Instant::now(),
@@ -7392,6 +7404,10 @@ fn handle_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
             s.notice = "Stopped reading the folder".into();
             return true;
         }
+        if !s.selected.is_empty() {
+            clear_selection(s);
+            return true;
+        }
         return false;
     }
     if s.dialog.is_some() || s.search_edit.focused {
@@ -7420,6 +7436,107 @@ fn handle_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
     if ev.is_command('w') {
         close_tab_at(s, s.active_tab);
         return true;
+    }
+    // Alt plus an arrow walks the history. Checked before the plain arrows below,
+    // which move the selection instead.
+    if ev.mods.alt {
+        match ev.key {
+            Key::Left => {
+                go_back(s);
+                return true;
+            }
+            Key::Right => {
+                go_forward(s);
+                return true;
+            }
+            Key::Up => {
+                go_up(s);
+                return true;
+            }
+            Key::Enter => {
+                open_properties(s);
+                return true;
+            }
+            _ => {}
+        }
+    }
+    if ev.key == Key::Function(5) {
+        refresh_folder(s);
+        return true;
+    }
+    if ev.key == Key::Function(4) {
+        begin_address_edit(s);
+        return true;
+    }
+    if ev.key == Key::Function(3) || ev.is_command('f') || ev.is_command('e') {
+        s.search_edit.focused = true;
+        return true;
+    }
+    if ev.is_command('b') {
+        s.nav_open = !s.nav_open;
+        return true;
+    }
+    // Ctrl+Shift+N and Ctrl+Shift+C come before the plain Ctrl letters so the
+    // shifted forms are not mistaken for new-tab and copy.
+    if ev.mods.ctrl && ev.mods.shift {
+        match &ev.key {
+            Key::Text(t) if t.eq_ignore_ascii_case("n") => {
+                begin_new_folder(s);
+                return true;
+            }
+            Key::Text(t) if t.eq_ignore_ascii_case("c") => {
+                copy_path(s, tx);
+                return true;
+            }
+            // Explorer's large-icons and details accelerators. The digit arrives
+            // as its shifted symbol on most layouts, so both spellings count.
+            Key::Text(t) if t.as_str() == "2" || t.as_str() == "@" => {
+                s.mode = Mode::Tiles;
+                return true;
+            }
+            Key::Text(t) if t.as_str() == "6" || t.as_str() == "^" => {
+                s.mode = Mode::Details;
+                return true;
+            }
+            _ => {}
+        }
+    }
+    // Ctrl+1 through Ctrl+9 select a tab; 9 is the last, as in a browser.
+    if ev.mods.ctrl
+        && let Key::Text(t) = &ev.key
+        && let Ok(digit) = t.parse::<usize>()
+        && (1..=9).contains(&digit)
+        && !s.tabs.is_empty()
+    {
+        let index = if digit == 9 {
+            s.tabs.len() - 1
+        } else {
+            (digit - 1).min(s.tabs.len() - 1)
+        };
+        switch_tab(s, index);
+        return true;
+    }
+    // Typing jumps to the first name that starts with what has been typed, the
+    // buffer clearing after a pause so two separate jumps do not compound.
+    if let Key::Text(text) = &ev.key
+        && !ev.mods.ctrl
+        && !ev.mods.alt
+        && !ev.mods.cmd
+        && !text.is_empty()
+    {
+        // A space is not the start of a name; it toggles the focused row.
+        if text == " " {
+            toggle_focused(s);
+            return true;
+        }
+        if s.type_ahead_at.elapsed() > std::time::Duration::from_millis(900) {
+            s.type_ahead.clear();
+        }
+        s.type_ahead.push_str(&text.to_lowercase());
+        s.type_ahead_at = Instant::now();
+        if jump_to_prefix(s) {
+            return true;
+        }
     }
     match ev.key {
         Key::Delete => {
@@ -7454,6 +7571,15 @@ fn handle_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
             move_focus(s, display_len(s).saturating_sub(1), ev.mods, tx);
             true
         }
+        Key::PageUp => {
+            move_focus(s, focus_row(s).saturating_sub(10), ev.mods, tx);
+            true
+        }
+        Key::PageDown => {
+            let last = display_len(s).saturating_sub(1);
+            move_focus(s, (focus_row(s) + 10).min(last), ev.mods, tx);
+            true
+        }
         Key::Tab if ev.mods.cmd || ev.mods.ctrl => {
             let len = s.tabs.len();
             if len > 1 {
@@ -7463,6 +7589,91 @@ fn handle_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
             true
         }
         _ => false,
+    }
+}
+
+/// Reload the folder on screen, the way F5 does.
+fn refresh_folder(s: &mut App) {
+    if s.view == View::Files {
+        let root = s.root.clone();
+        set_location(s, root);
+    } else if s.view == View::ThisPc {
+        refresh_volumes(s);
+    } else {
+        refresh_recent(s);
+    }
+}
+
+/// The Properties dialog for the focused row, as Alt+Enter asks for it.
+fn open_properties(s: &mut App) {
+    let Some(index) = s.focused.or_else(|| s.selected.first().copied()) else {
+        return;
+    };
+    let entry = if s.searching {
+        s.search_hits.get(index).map(|hit| &hit.entry)
+    } else {
+        s.entries.get(index)
+    };
+    if let Some(entry) = entry {
+        let details = metadata::describe(
+            Path::new(&entry.path),
+            entry.is_dir,
+            kind_label(entry.kind),
+        );
+        s.dialog = Some(Dialog::Properties(Box::new(details)));
+    }
+}
+
+/// Put the selected paths on the clipboard as text, one per line.
+fn copy_path(s: &mut App, tx: &mut Tx) {
+    let paths = selected_paths(s);
+    if paths.is_empty() {
+        return;
+    }
+    let text: Vec<String> = paths
+        .iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect();
+    tx.copy(text.join("\n"));
+    s.notice = if paths.len() == 1 {
+        "Path copied to clipboard".into()
+    } else {
+        format!("{} paths copied to clipboard", paths.len())
+    };
+}
+
+/// Select or deselect the focused row, which is what Space does in Explorer.
+fn toggle_focused(s: &mut App) {
+    let Some(index) = s.focused else { return };
+    if s.selected.contains(&index) {
+        s.selected.retain(|&selected| selected != index);
+        s.selection_detail.clear();
+    } else {
+        select_entry(s, index);
+    }
+}
+
+/// Focus and select the first row whose name begins with what has been typed.
+fn jump_to_prefix(s: &mut App) -> bool {
+    if s.type_ahead.is_empty() {
+        return false;
+    }
+    let prefix = s.type_ahead.clone();
+    let mut hit = None;
+    for row in 0..display_len(s) {
+        let (index, entry) = display_entry(s, row);
+        if display_name(s, entry).to_lowercase().starts_with(&prefix) {
+            hit = Some(index);
+            break;
+        }
+    }
+    match hit {
+        Some(index) => {
+            select_entry(s, index);
+            s.focused = Some(index);
+            true
+        }
+        None => false,
     }
 }
 

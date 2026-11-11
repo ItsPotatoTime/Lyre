@@ -47,6 +47,17 @@ pub fn content_size() -> Option<(u32, u32)> {
     None
 }
 
+/// The mouse side button pressed since the last call: 1 is back, 2 forward.
+#[cfg(target_os = "windows")]
+pub fn take_side_button() -> Option<u8> {
+    imp::take_side_button()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn take_side_button() -> Option<u8> {
+    None
+}
+
 pub fn minimize() {
     imp::minimize();
 }
@@ -64,8 +75,12 @@ mod imp {
     use rune::WindowHandle;
     use rune::raw_window_handle::RawWindowHandle;
     use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicU8, Ordering};
 
     static HWND: OnceLock<isize> = OnceLock::new();
+    /// The last side button pressed, for `poll` to take: 1 is back, 2 forward.
+    static SIDE_BUTTON: AtomicU8 = AtomicU8::new(0);
+    const WM_XBUTTONUP: u32 = 0x020C;
 
     #[repr(C)]
     struct Rect {
@@ -171,12 +186,31 @@ mod imp {
                     }
                 }
             }
+            // The side buttons on a mouse. Windows delivers them as
+            // WM_XBUTTONUP with the button in the high word, and Rune has no
+            // notion of them, so they are caught here and left for `poll`.
+            if msg == WM_XBUTTONUP {
+                let which = ((wparam >> 16) & 0xFFFF) as u8;
+                if which == 1 || which == 2 {
+                    SIDE_BUTTON.store(which, Ordering::Relaxed);
+                }
+                // Handled: returning zero would let the default proc beep.
+                return 1;
+            }
             DefSubclassProc(hwnd, msg, wparam, lparam)
         }
     }
 
     pub fn hwnd() -> Option<isize> {
         HWND.get().copied()
+    }
+
+    /// The side button pressed since the last call, if any.
+    pub fn take_side_button() -> Option<u8> {
+        match SIDE_BUTTON.swap(0, std::sync::atomic::Ordering::Relaxed) {
+            0 => None,
+            which => Some(which),
+        }
     }
 
     /// The client area, which is what the layout sees and what a saved size has

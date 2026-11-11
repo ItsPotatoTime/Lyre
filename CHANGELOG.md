@@ -8,6 +8,43 @@ release notes rather than a second copy of them.
 
 Nothing yet.
 
+## [0.3.1]
+
+A patch release for what the rewrite got wrong.
+
+### Fixed
+
+- **The keyboard shortcuts are back.** The rewrite kept only a handful, so
+  `Alt+Left`/`Right`/`Up` for history, `F5` refresh, `F4`, `F3` and `Ctrl+F`/`E`,
+  `Ctrl+B`, `Ctrl+1` to `Ctrl+9`, `Ctrl+Shift+N`, `Alt+Enter`, `Ctrl+Shift+C`,
+  `Ctrl+Shift+2`/`6`, `PageUp`/`PageDown`, `Space`, `Escape` clearing the
+  selection, and typing to jump to a name all work again. So do the two side
+  buttons on a mouse, which walk the same history as `Alt+Left` and `Alt+Right`;
+  Windows delivers those to the window directly, since the toolkit has no notion
+  of them. `F11` and `Shift+F10` are still missing: the first needs full-screen
+  support the toolkit does not expose, and the second needs a pointer position to
+  anchor the menu at.
+- **Sorting by Date modified compared the date's text, not the date.**
+  "4/30/2026" and "10/20/2026" were ordered as strings, so November came before
+  February and the list looked unsorted. The timestamp that sits beside that text
+  is what the sort uses now, here and in Group by date.
+- **The rail chevrons on This PC and Network did nothing.** They had no state
+  behind them, and the row carried the click. Opening This PC now lists the drives
+  read at that moment, and Network says browsing is not implemented rather than
+  offering an arrow that opens nothing.
+- **Drives in the rail were named by their letter and could not be right-clicked.**
+  An unlabelled system drive read "C:". They use the same name the This PC cards
+  do, "Local Disk (C:)", and open the same menu, so an inserted stick can be
+  ejected from the rail.
+- **The window forgot its size.** It opens at the size it was left at, clamped to
+  the screen it opens on and raised to the window's minimum where it is smaller.
+  Reading the size back is Windows-only; elsewhere the window opens at its default
+  and nothing is saved.
+- **The chosen sort and view were lost at every launch.** They were being saved,
+  and then startup replaced them: opening on Home loads a fixture that resets the
+  mode, the sort and the preview pane, and that reset was written back as though it
+  had been chosen.
+
 ## [0.3.0]
 
 This release is the interface rewritten. Lyre's window is no longer a web page:

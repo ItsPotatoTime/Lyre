@@ -6,7 +6,14 @@ release notes rather than a second copy of them.
 
 ## [Unreleased]
 
-Nothing yet.
+### Fixed
+
+- **The update signature is no longer encoded twice.** The release script encoded
+  each signature one level deeper than the manifest carries, so a client refused
+  it with "Invalid encoding in minisign data". New releases store the signature
+  file exactly as `tauri signer sign` writes it, and the client decodes a second
+  time when the first does not parse, so manifests published the old way keep
+  verifying.
 
 ## [0.3.1]
 

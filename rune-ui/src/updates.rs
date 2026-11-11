@@ -134,7 +134,19 @@ fn verify(data: &[u8], signature_b64: &str) -> Result<(), String> {
     let public_key = PublicKey::from_base64(key_line).map_err(|e| format!("The public key could not be read: {e}"))?;
     let sig_file = base64_decode(signature_b64).map_err(|_| "The update signature is malformed.".to_string())?;
     let sig_text = String::from_utf8_lossy(&sig_file);
-    let signature = Signature::decode(&sig_text).map_err(|e| format!("The update signature could not be read: {e}"))?;
+    let signature = match Signature::decode(&sig_text) {
+        Ok(signature) => signature,
+        Err(_) => {
+            // Releases up to 0.3.1 encoded the `.sig` file, which is already
+            // base64, one level too deep. Decoding once more recovers the
+            // minisign text, so those manifests still verify.
+            let inner = base64_decode(sig_text.trim())
+                .map_err(|_| "The update signature is malformed.".to_string())?;
+            let inner_text = String::from_utf8_lossy(&inner);
+            Signature::decode(&inner_text)
+                .map_err(|e| format!("The update signature could not be read: {e}"))?
+        }
+    };
     public_key
         .verify(data, &signature, false)
         .map_err(|_| "The update signature does not match the project key; refusing to install.".to_string())
@@ -295,6 +307,25 @@ mod tests {
         }
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Ignored: checks the real published manifest against the real download.
+    /// Run with `--ignored` after `gh release download`, which is how the
+    /// double encoding was found and how this fix is proved.
+    #[test]
+    #[ignore]
+    fn the_published_manifest_signature_verifies() {
+        let setup = std::fs::read("../dist/Lyre_0.3.1_x64-setup.exe")
+            .expect("download the 0.3.1 setup into dist/");
+        let manifest: Manifest = serde_json::from_slice(
+            &std::fs::read("../dist/published/latest.json").expect("download latest.json into dist/published/"),
+        )
+        .expect("the manifest parses");
+        let platform = manifest
+            .platforms
+            .get("windows-x86_64")
+            .expect("the manifest names this platform");
+        verify(&setup, &platform.signature).expect("the published signature should verify");
     }
 
     #[test]

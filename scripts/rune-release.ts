@@ -119,7 +119,11 @@ function sign(artifact: string, key: string): void {
   if (!accepted) fail("no reading of TAURI_SIGNING_PRIVATE_KEY was accepted");
 
   const sigPath = `${artifact}.sig`;
-  const signature = Buffer.from(readFileSync(sigPath)).toString("base64");
+  // `tauri signer sign` already writes the signature file as base64 text, which
+  // is exactly what the manifest carries and what the client decodes once.
+  // Encoding the file again put the signature one level too deep, and the client
+  // refused it with "Invalid encoding in minisign data".
+  const signature = readFileSync(sigPath, "utf8").trim();
   const fragment = { key, url: assetUrl(basename(artifact)), signature };
   // The key is in the name so one artifact (a universal macOS build) can carry
   // several platform entries without the fragments overwriting each other.

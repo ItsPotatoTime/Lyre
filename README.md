@@ -4,8 +4,8 @@ A fast, cross-platform file manager in the Windows 11 Explorer design language.
 
 Lyre reads a folder through a parallel Rust scanner and paints the first rows
 while the rest are still arriving, so a folder of 20,000 entries is on screen in
-under 20 ms. Windows, macOS and Linux from one codebase: Rust core, Tauri v2
-shell, React 19 interface.
+under 20 ms. Windows, macOS and Linux from one codebase: a Rust core drawn by
+Rune's own GPU renderer, with no webview and no JavaScript in the shipped app.
 
 ![Linux](https://img.shields.io/badge/Linux-tested-2ea44f?style=flat-square)
 ![Windows](https://img.shields.io/badge/Windows-tested%20in%20a%20VM-2ea44f?style=flat-square)
@@ -158,24 +158,27 @@ recorded here, this README claims nothing about it.
 
 ## Build and run
 
-Needs Rust, Bun, and Tauri's prerequisites for the platform. On Linux that is the
-development packages for `webkit2gtk-4.1`, `gtk3` and `libsoup3`.
+The shipped application is `rune-ui/`, a Rust crate. It needs Rust and Bun; there
+is no webview to install. On Linux it builds against the X11/Wayland development
+packages that Rune's windowing brings in.
 
 > [!TIP]
-> Two commands get you a window: `bun install`, then `bun dev`.
+> Two commands get you a window: `bun install`, then `bun dev:rune`.
 
 ```bash
 bun install
-bun dev        # compiles the Rust core and opens the window on your filesystem
-bun buildit    # builds for whichever OS is running it
+bun dev:rune       # builds the crate and opens the window
+bun buildit --rune # release build for whichever OS is running it
 ```
 
-`bun dev` starts Vite on port 1420, or on the next free port if that one is taken,
-and tells Tauri the same number, so the window and the dev server cannot
-disagree. `bun buildit` detects the platform: it picks the installer formats the
-machine can actually produce, and on Windows builds in a separate copy of the
-tree so the two operating systems never share object files. Flags, port
-handling and the Windows build steps are in [docs/building.md](docs/building.md).
+`bun buildit --rune` writes `rune-ui/target/release/lyre-rune`. The release
+workflow builds the same binary on each platform and packages it: an NSIS setup
+on Windows, an AppImage on Linux, a universal `.app` on macOS. Flags are in
+[docs/building.md](docs/building.md).
+
+The repository still contains the earlier Tauri application (`src/` and
+`src-tauri/`), and `bun dev` and `bun buildit` without `--rune` still build it.
+It is no longer what ships, and the release workflow does not touch it.
 
 The interface also runs in a plain browser against a synthetic filesystem, which
 is how the layout is developed without rebuilding Rust:

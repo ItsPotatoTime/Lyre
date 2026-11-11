@@ -3,7 +3,8 @@
 //! Rune's `Tx::minimize` refuses a borderless window on every platform and there
 //! is no `Tx::maximize`, so the drawn buttons drive the native window directly:
 //! - Windows: `ShowWindow` minimizes/maximizes, DWM rounds the frame, and a
-//!   `WM_NCHITTEST` subclass gives draggable resize edges.
+//!   subclass gives draggable resize edges (`WM_NCHITTEST`) and runs the
+//!   drag-out handoff between winit's event callbacks.
 //! - macOS: `NSWindow` miniaturize/performZoom; rounded corners come from Rune's
 //!   `MacWindowOptions` (set in `main`).
 //! - Linux: X11 uses EWMH (`_NET_WM_STATE`) and `XIconifyWindow`; Hyprland uses
@@ -77,6 +78,7 @@ mod imp {
         fn IsZoomed(hwnd: isize) -> i32;
         fn GetWindowRect(hwnd: isize, rect: *mut Rect) -> i32;
         fn DefSubclassProc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
+        fn RedrawWindow(hwnd: isize, rect: *const core::ffi::c_void, region: *mut core::ffi::c_void, flags: u32) -> i32;
     }
     #[link(name = "comctl32")]
     unsafe extern "system" {
@@ -96,8 +98,9 @@ mod imp {
     const HTBOTTOMLEFT: isize = 16;
     const HTBOTTOMRIGHT: isize = 17;
     const BORDER: i32 = 8;
+    const RDW_INTERNALPAINT: u32 = 0x0002;
 
-    unsafe extern "system" fn hit_test(
+    unsafe extern "system" fn subclass(
         hwnd: isize,
         msg: u32,
         wparam: usize,
@@ -106,6 +109,14 @@ mod imp {
         _data: usize,
     ) -> isize {
         unsafe {
+            // The drag-out handoff runs here, between winit's event callbacks:
+            // OLE's modal loop then pumps frames re-entrantly, so the window
+            // keeps painting (and hover highlights) for the whole drag.
+            if msg == crate::osdrag::win::drag_message() {
+                crate::osdrag::win::run_pending();
+                RedrawWindow(hwnd, std::ptr::null(), std::ptr::null_mut(), RDW_INTERNALPAINT);
+                return 0;
+            }
             if msg == WM_NCHITTEST && IsZoomed(hwnd) == 0 {
                 let x = (lparam as u16) as i16 as i32;
                 let y = ((lparam >> 16) as u16) as i16 as i32;
@@ -157,7 +168,7 @@ mod imp {
                         (&preference as *const u32).cast(),
                         core::mem::size_of::<u32>() as u32,
                     );
-                    SetWindowSubclass(hwnd, hit_test, 1, 0);
+                    SetWindowSubclass(hwnd, subclass, 1, 0);
                 }
             }
         });

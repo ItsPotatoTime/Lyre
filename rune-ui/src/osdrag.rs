@@ -10,7 +10,8 @@
 //! the one moment the bytes are guaranteed to exist, and understands the
 //! virtual-file formats (`FileDescriptorW`/`FileContents`) archivers and mail
 //! clients use instead of `CF_HDROP`. A drag that leaves the window hands the
-//! same gesture to `DoDragDrop` on a worker thread.
+//! same gesture to `DoDragDrop` on the pressing thread, carrying the shell's
+//! own data object, which is the one OLE accepts as a drag source.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,16 +23,38 @@ pub struct OsDrop {
     pub at: (f32, f32),
 }
 
-static SENDER: std::sync::OnceLock<std::sync::mpsc::Sender<OsDrop>> = std::sync::OnceLock::new();
-
-/// The window's drop target is registered at native creation, after `init`
-/// built the channel; this is how the two meet.
-pub fn set_sender(tx: std::sync::mpsc::Sender<OsDrop>) {
-    let _ = SENDER.set(tx);
+/// What the OS drag session tells the window: where the drag hovers, and the
+/// final drop. Points are screen pixels, the drop's included.
+pub enum OsDragMsg {
+    Hover(Option<(f32, f32)>),
+    Drop(OsDrop),
 }
 
-pub fn sender() -> Option<std::sync::mpsc::Sender<OsDrop>> {
-    SENDER.get().cloned()
+/// The picture an OS drag shows under the pointer, as straight-alpha sRGB
+/// RGBA8: the item's own icon. Lyre's in-window ghost cannot follow the pointer
+/// past the window edge, so the OS draws this instead once the gesture leaves.
+#[cfg(target_os = "windows")]
+pub struct DragPreview {
+    pub width: u32,
+    pub height: u32,
+    pub rgba: Vec<u8>,
+}
+
+static SENDER: std::sync::Mutex<Option<std::sync::mpsc::Sender<OsDragMsg>>> =
+    std::sync::Mutex::new(None);
+
+/// The window's drop target is registered at native creation, after `init`
+/// built the channel; this is how the two meet. The last built app is the one
+/// that runs (the startup scan builds an app too), so its sender wins: keeping
+/// the first instead left every OS drop on a channel nobody read.
+pub fn set_sender(tx: std::sync::mpsc::Sender<OsDragMsg>) {
+    if let Ok(mut sender) = SENDER.lock() {
+        *sender = Some(tx);
+    }
+}
+
+pub fn sender() -> Option<std::sync::mpsc::Sender<OsDragMsg>> {
+    SENDER.lock().ok()?.clone()
 }
 
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
@@ -148,7 +171,7 @@ pub fn sweep_stale() {
 // ---------------------------------------------------------------------------
 #[cfg(target_os = "windows")]
 pub mod win {
-    use super::{OsDrop, stage};
+    use super::{DragPreview, OsDragMsg, OsDrop, stage};
     use std::ffi::c_void;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -158,14 +181,15 @@ pub mod win {
     const DROPEFFECT_COPY: u32 = 1;
     const DROPEFFECT_MOVE: u32 = 2;
     const S_OK: i32 = 0;
-    const E_NOTIMPL: i32 = -2147467263;
     const DRAGDROP_S_DROP: i32 = 0x00040100;
     const DRAGDROP_S_CANCEL: i32 = 0x00040101;
     const DRAGDROP_S_USEDEFAULTCURSORS: i32 = 0x00040102;
     const TYMED_ISTREAM: u32 = 4;
     const MK_LBUTTON: u32 = 1;
+    const RDW_INTERNALPAINT: u32 = 0x0002;
 
     #[repr(C)]
+    #[derive(Clone, Copy)]
     struct Point {
         x: i32,
         y: i32,
@@ -182,11 +206,12 @@ pub mod win {
     #[repr(C)]
     struct FormatEtc {
         cf_format: u16,
-        _pad: u16,
-        tymed: u32,
+        /// `DVTARGETDEVICE *`: COM reads it at the pointer's own alignment, so
+        /// the clip format is followed by padding, not by the next DWORD.
+        _ptd: *mut c_void,
         _aspect: u32,
         _lindex: i32,
-        _pad2: u32,
+        tymed: u32,
     }
 
     #[repr(C)]
@@ -217,12 +242,6 @@ pub mod win {
         fn OleInitialize(reserved: *mut c_void) -> i32;
         fn RegisterDragDrop(hwnd: isize, target: *mut c_void) -> i32;
         fn RevokeDragDrop(hwnd: isize) -> i32;
-        fn DoDragDrop(
-            data: *mut c_void,
-            source: *mut c_void,
-            effects: u32,
-            effect_out: *mut u32,
-        ) -> i32;
         fn ReleaseStgMedium(medium: *mut StgMedium);
     }
     #[link(name = "kernel32")]
@@ -236,12 +255,29 @@ pub mod win {
         fn RegisterClipboardFormatW(name: *const u16) -> u16;
         fn ReleaseCapture() -> i32;
         fn ScreenToClient(hwnd: isize, pt: *mut Point) -> i32;
+        fn GetForegroundWindow() -> isize;
+        fn GetWindowThreadProcessId(hwnd: isize, pid: *mut u32) -> u32;
+        fn GetAsyncKeyState(vkey: i32) -> i16;
+        fn PostMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> i32;
+        fn RegisterWindowMessageW(name: *const u16) -> u32;
+        fn RedrawWindow(hwnd: isize, rect: *const c_void, region: *mut c_void, flags: u32) -> i32;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCurrentThreadId() -> u32;
     }
 
     /// OLE tracks the pointer itself; the UI thread must let go of the Win32
     /// capture first, or the drag loop never sees a move and the drag dies.
     pub fn release_capture() {
         unsafe { ReleaseCapture() };
+    }
+
+    /// Whether the left button is still down. A handoff deferred by one frame
+    /// has to check: a release that arrives first must cancel the drag, not
+    /// start one that drops on whatever window is under the pointer.
+    pub fn button_held() -> bool {
+        unsafe { GetAsyncKeyState(0x01) as u16 & 0x8000 != 0 }
     }
 
     /// IDropTarget points are screen pixels; the hit test wants window points.
@@ -303,9 +339,12 @@ pub mod win {
         #[allow(dead_code)]
         vtable: &'static TargetVtable,
         refs: AtomicUsize,
-        tx: Sender<OsDrop>,
+        tx: Sender<OsDragMsg>,
         descriptor: u16,
         contents: u16,
+        hwnd: isize,
+        /// What DragEnter accepted; DragOver carries no data object to re-ask.
+        accepted: bool,
     }
 
     #[repr(C)]
@@ -321,16 +360,27 @@ pub mod win {
 
     unsafe extern "system" fn query(this: *mut Target, _iid: *const c_void, out: *mut *mut c_void) -> i32 {
         unsafe {
+            if std::env::var_os("LYRE_TRACE").is_some() {
+                eprintln!("[drop] QueryInterface");
+            }
             *out = this.cast();
             (*this).refs.fetch_add(1, Ordering::Relaxed);
         }
         S_OK
     }
     unsafe extern "system" fn add(this: *mut Target) -> u32 {
-        unsafe { (*this).refs.fetch_add(1, Ordering::Relaxed) as u32 + 1 }
+        unsafe {
+            if std::env::var_os("LYRE_TRACE").is_some() {
+                eprintln!("[drop] AddRef");
+            }
+            (*this).refs.fetch_add(1, Ordering::Relaxed) as u32 + 1
+        }
     }
     unsafe extern "system" fn release(this: *mut Target) -> u32 {
         unsafe {
+            if std::env::var_os("LYRE_TRACE").is_some() {
+                eprintln!("[drop] Release");
+            }
             let left = (*this).refs.fetch_sub(1, Ordering::Relaxed) as u32 - 1;
             if left == 0 {
                 drop(Box::from_raw(this));
@@ -338,27 +388,49 @@ pub mod win {
             left
         }
     }
+    /// Tell the window where the drag is, and wake it: the message alone is
+    /// only drained by a frame, and OLE's loop asks for one through this
+    /// redraw. A drag the target refused lights nothing.
+    unsafe fn hover(this: *mut Target, pt: Option<Point>) {
+        unsafe {
+            let at = pt.map(|p| (p.x as f32, p.y as f32));
+            let _ = (*this).tx.send(OsDragMsg::Hover(at));
+            RedrawWindow((*this).hwnd, std::ptr::null(), std::ptr::null_mut(), RDW_INTERNALPAINT);
+        }
+    }
+
     unsafe extern "system" fn enter(
         this: *mut Target,
         data: *mut c_void,
         _keys: u32,
-        _pt: Point,
+        pt: Point,
         effect: *mut u32,
     ) -> i32 {
         unsafe {
-            *effect = if accepts(data, (*this).descriptor) { DROPEFFECT_COPY } else { 0 };
+            (*this).accepted = accepts(data, (*this).descriptor);
+            *effect = if (*this).accepted { DROPEFFECT_COPY } else { 0 };
+            hover(this, (*this).accepted.then_some(pt));
             if std::env::var_os("LYRE_TRACE").is_some() {
-                eprintln!("[drop] DragEnter effect={}", *effect);
+                eprintln!("[drop] DragEnter effect={} pt=({},{})", *effect, pt.x, pt.y);
             }
         }
         S_OK
     }
-    unsafe extern "system" fn over(this: *mut Target, _keys: u32, _pt: Point, effect: *mut u32) -> i32 {
-        unsafe { *effect = DROPEFFECT_COPY };
-        let _ = this;
+    unsafe extern "system" fn over(this: *mut Target, _keys: u32, pt: Point, effect: *mut u32) -> i32 {
+        unsafe {
+            *effect = if (*this).accepted { DROPEFFECT_COPY } else { 0 };
+            hover(this, (*this).accepted.then_some(pt));
+        }
+        if std::env::var_os("LYRE_TRACE").is_some() {
+            eprintln!("[drop] DragOver");
+        }
         S_OK
     }
-    unsafe extern "system" fn leave(_this: *mut Target) -> i32 {
+    unsafe extern "system" fn leave(this: *mut Target) -> i32 {
+        unsafe { hover(this, None) };
+        if std::env::var_os("LYRE_TRACE").is_some() {
+            eprintln!("[drop] DragLeave");
+        }
         S_OK
     }
 
@@ -374,6 +446,7 @@ pub mod win {
         unsafe {
             let paths = collect(data, (*this).descriptor, (*this).contents);
             *effect = if paths.is_empty() { 0 } else { DROPEFFECT_COPY };
+            hover(this, None);
             if std::env::var_os("LYRE_TRACE").is_some() {
                 eprintln!("[drop] Drop pt=({},{}) paths={} first={:?}", pt.x, pt.y, paths.len(), paths.first());
             }
@@ -382,7 +455,7 @@ pub mod win {
                 if std::env::var_os("LYRE_TRACE").is_some() {
                     eprintln!("[drop] staged={} first={:?}", staged.len(), staged.first());
                 }
-                let _ = (*this).tx.send(OsDrop { paths: staged, at: (pt.x as f32, pt.y as f32) });
+                let _ = (*this).tx.send(OsDragMsg::Drop(OsDrop { paths: staged, at: (pt.x as f32, pt.y as f32) }));
             }
         }
         S_OK
@@ -405,7 +478,7 @@ pub mod win {
 
     unsafe fn has_format(data: *mut c_void, format: u16) -> bool {
         unsafe {
-            let mut etc = FormatEtc { cf_format: format, _pad: 0, tymed: TYMED_ISTREAM, _aspect: 1, _lindex: -1, _pad2: 0 };
+            let mut etc = FormatEtc { cf_format: format, _ptd: std::ptr::null_mut(), tymed: TYMED_ISTREAM, _aspect: 1, _lindex: -1 };
             let vtable = *(data as *const *const DataVtable);
             ((*vtable).query_get_data)(data, &mut etc) == S_OK
                 || {
@@ -417,7 +490,7 @@ pub mod win {
 
     unsafe fn get_medium(data: *mut c_void, format: u16, index: i32, tymed: u32) -> Option<StgMedium> {
         unsafe {
-            let mut etc = FormatEtc { cf_format: format, _pad: 0, tymed, _aspect: 1, _lindex: index, _pad2: 0 };
+            let mut etc = FormatEtc { cf_format: format, _ptd: std::ptr::null_mut(), tymed, _aspect: 1, _lindex: index };
             let mut medium: StgMedium = std::mem::zeroed();
             let vtable = *(data as *const *const DataVtable);
             if ((*vtable).get_data)(data, &mut etc, &mut medium) != S_OK {
@@ -537,7 +610,29 @@ pub mod win {
 
     /// Take over the window's drop target from winit's, so staging happens
     /// inside Drop rather than a frame later.
-    pub fn register(hwnd: isize, tx: Sender<OsDrop>) {
+    /// Whether OLE still keeps our target on the window, and which window the
+    /// cursor is over: the two facts that decide whether DragEnter can fire.
+    pub fn trace_registration(hwnd: isize) {
+        unsafe {
+            let prop = GetPropW(hwnd, wide("OleDropTargetInterface").as_ptr());
+            let mut pt = Point { x: 0, y: 0 };
+            GetCursorPos(&mut pt);
+            let over = WindowFromPoint(pt);
+            eprintln!(
+                "[drop] check hwnd={hwnd} prop={prop:?} cursor=({},{}) over={over}",
+                pt.x, pt.y
+            );
+        }
+    }
+
+    #[link(name = "user32")]
+    unsafe extern "system" {
+        fn GetPropW(hwnd: isize, name: *const u16) -> *mut c_void;
+        fn GetCursorPos(pt: *mut Point) -> i32;
+        fn WindowFromPoint(pt: Point) -> isize;
+    }
+
+    pub fn register(hwnd: isize, tx: Sender<OsDragMsg>) {
         unsafe {
             // OLE drag and drop needs OleInitialize, not plain CoInitializeEx:
             // without it DoDragDrop returns CO_E_NOT_SUPPORTED and a registered
@@ -552,6 +647,8 @@ pub mod win {
                 tx,
                 descriptor: format_name("FileDescriptorW"),
                 contents: format_name("FileContents"),
+                hwnd,
+                accepted: false,
             });
             let ptr = Box::into_raw(target);
             let revoked = RevokeDragDrop(hwnd);
@@ -567,185 +664,231 @@ pub mod win {
 
     // -- drag source ---------------------------------------------------------
     //
-    // Two COM objects: the data (CF_HDROP) and the drag source (continue and
-    // feedback), as DoDragDrop expects one of each.
+    // The data object is the shell's own, built from the dragged paths: the
+    // same one Explorer hands OLE, carrying CF_HDROP and every other format a
+    // target understands, an optimised move included. A hand-written vtable
+    // cannot serve here: OLE queries interfaces beyond its slots (INoMarshal,
+    // the drag helpers), and answers that were not real made it refuse the
+    // operation with CO_E_NOT_SUPPORTED, then fault once the queries were
+    // honest about what the object implements.
 
-    #[repr(C)]
-    struct Data {
-        #[allow(dead_code)]
-        vtable: &'static DataObjVtable,
-        refs: AtomicUsize,
-        hdrop: Vec<u8>,
+    static PENDING: std::sync::Mutex<Option<(Vec<PathBuf>, Option<DragPreview>)>> =
+        std::sync::Mutex::new(None);
+    static DRAG_MSG: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+    /// The registered message the frame subclass runs the handoff on.
+    pub fn drag_message() -> u32 {
+        *DRAG_MSG.get_or_init(|| unsafe { RegisterWindowMessageW(wide("LyreDragOut").as_ptr()) })
     }
 
-    #[repr(C)]
-    struct DataObjVtable {
-        query: unsafe extern "system" fn(*mut Data, *const c_void, *mut *mut c_void) -> i32,
-        add: unsafe extern "system" fn(*mut Data) -> u32,
-        release: unsafe extern "system" fn(*mut Data) -> u32,
-        get_data: unsafe extern "system" fn(*mut Data, *mut FormatEtc, *mut StgMedium) -> i32,
-        get_data_here: *const c_void,
-        query_get_data: unsafe extern "system" fn(*mut Data, *mut FormatEtc) -> i32,
-        _rest: [*const c_void; 6],
-    }
-
-    unsafe extern "system" fn d_query(this: *mut Data, _iid: *const c_void, out: *mut *mut c_void) -> i32 {
-        unsafe {
-            *out = this.cast();
-            (*this).refs.fetch_add(1, Ordering::Relaxed);
+    /// Queue the drag for the window's message pump instead of starting it
+    /// inside the frame callback: winit buffers redraws raised while its event
+    /// handler runs, so a DoDragDrop started there freezes the window for the
+    /// whole session. Between callbacks its modal loop pumps frames again.
+    pub fn request_start(hwnd: isize, paths: Vec<PathBuf>, preview: Option<DragPreview>) {
+        if let Ok(mut pending) = PENDING.lock() {
+            *pending = Some((paths, preview));
         }
-        S_OK
+        unsafe { PostMessageW(hwnd, drag_message(), 0, 0) };
     }
-    unsafe extern "system" fn d_add(this: *mut Data) -> u32 {
-        unsafe { (*this).refs.fetch_add(1, Ordering::Relaxed) as u32 + 1 }
-    }
-    unsafe extern "system" fn d_release(this: *mut Data) -> u32 {
-        unsafe {
-            let left = (*this).refs.fetch_sub(1, Ordering::Relaxed) as u32 - 1;
-            if left == 0 {
-                drop(Box::from_raw(this));
-            }
-            left
-        }
-    }
-    unsafe extern "system" fn d_get_data(this: *mut Data, etc: *mut FormatEtc, medium: *mut StgMedium) -> i32 {
-        unsafe {
-            if (*etc).cf_format != CF_HDROP {
-                return E_NOTIMPL;
-            }
-            let size = (*this).hdrop.len();
-            let global = GlobalAlloc(0x0002, size); // GMEM_MOVEABLE
-            if global.is_null() {
-                return E_NOTIMPL;
-            }
-            let ptr = GlobalLock(global);
-            std::ptr::copy_nonoverlapping((*this).hdrop.as_ptr(), ptr as *mut u8, size);
-            GlobalUnlock(global);
-            (*medium).tymed = 1;
-            (*medium).data = global;
-            (*medium)._unk = std::ptr::null_mut();
-            S_OK
+
+    /// Run the queued handoff on the window thread, from the subclass. A
+    /// release that beat the handoff cancels instead of dropping the files on
+    /// whatever window is under the pointer.
+    pub fn run_pending() {
+        let payload = PENDING.lock().ok().and_then(|mut p| p.take());
+        if let Some((paths, preview)) = payload
+            && button_held()
+        {
+            // The UI thread owns the Win32 capture from the press; OLE cannot
+            // take it from another thread, so let go first.
+            release_capture();
+            start_drag_out(&paths, preview);
         }
     }
-    #[link(name = "kernel32")]
-    unsafe extern "system" {
-        fn GlobalAlloc(flags: u32, bytes: usize) -> *mut c_void;
-    }
-    unsafe extern "system" fn d_query_data(_this: *mut Data, etc: *mut FormatEtc) -> i32 {
-        unsafe { if (*etc).cf_format == CF_HDROP { S_OK } else { E_NOTIMPL } }
-    }
 
-    /// The vtable holds null COM slots; COM reads it from any apartment.
-    struct SyncDataVtable(DataObjVtable);
-    unsafe impl Sync for SyncDataVtable {}
-
-    static DATA_VTABLE: SyncDataVtable = SyncDataVtable(DataObjVtable {
-        query: d_query,
-        add: d_add,
-        release: d_release,
-        get_data: d_get_data,
-        get_data_here: std::ptr::null(),
-        query_get_data: d_query_data,
-        _rest: [std::ptr::null(); 6],
-    });
-
-    #[repr(C)]
-    struct DragSource {
-        #[allow(dead_code)]
-        vtable: &'static DropSourceVtable,
-        refs: AtomicUsize,
-    }
-
-    #[repr(C)]
-    struct DropSourceVtable {
-        query: unsafe extern "system" fn(*mut DragSource, *const c_void, *mut *mut c_void) -> i32,
-        add: unsafe extern "system" fn(*mut DragSource) -> u32,
-        release: unsafe extern "system" fn(*mut DragSource) -> u32,
-        continue_drag: unsafe extern "system" fn(*mut DragSource, escape: i32, keys: u32) -> i32,
-        give_feedback: unsafe extern "system" fn(*mut DragSource, effect: u32) -> i32,
-    }
-
-    unsafe extern "system" fn src_query(this: *mut DragSource, _iid: *const c_void, out: *mut *mut c_void) -> i32 {
-        unsafe {
-            *out = this.cast();
-            (*this).refs.fetch_add(1, Ordering::Relaxed);
-        }
-        S_OK
-    }
-    unsafe extern "system" fn src_add(this: *mut DragSource) -> u32 {
-        unsafe { (*this).refs.fetch_add(1, Ordering::Relaxed) as u32 + 1 }
-    }
-    unsafe extern "system" fn src_release(this: *mut DragSource) -> u32 {
-        unsafe {
-            let left = (*this).refs.fetch_sub(1, Ordering::Relaxed) as u32 - 1;
-            if left == 0 {
-                drop(Box::from_raw(this));
-            }
-            left
-        }
-    }
-    unsafe extern "system" fn src_continue(_this: *mut DragSource, escape: i32, keys: u32) -> i32 {
-        if escape != 0 {
-            return DRAGDROP_S_CANCEL;
-        }
-        if keys & MK_LBUTTON == 0 {
-            return DRAGDROP_S_DROP;
-        }
-        S_OK
-    }
-    unsafe extern "system" fn src_feedback(_this: *mut DragSource, _effect: u32) -> i32 {
-        DRAGDROP_S_USEDEFAULTCURSORS
-    }
-
-    static SOURCE_VTABLE: DropSourceVtable = DropSourceVtable {
-        query: src_query,
-        add: src_add,
-        release: src_release,
-        continue_drag: src_continue,
-        give_feedback: src_feedback,
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::System::Com::IDataObject;
+    use windows::Win32::System::Ole::{DROPEFFECT, IDropSource, IDropSource_Impl};
+    use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
+    use windows::Win32::Foundation::{COLORREF, POINT, SIZE};
+    use windows::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS, DeleteObject, HBITMAP,
     };
+    use windows::Win32::System::Com::CLSCTX_ALL;
+    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+    use windows::Win32::UI::Shell::{
+        BHID_DataObject, CLSID_DragDropHelper, IDragSourceHelper, ILCreateFromPathW, ILFree,
+        IShellItemArray, SHDRAGIMAGE, SHCreateShellItemArrayFromIDLists,
+    };
+    use windows::core::{BOOL, HRESULT, PCWSTR};
+
+    /// The button state decides the session: release drops, Escape cancels,
+    /// anything else carries on. Default cursors show what the target allows.
+    #[windows::core::implement(IDropSource)]
+    struct DropSource;
+
+    #[allow(non_snake_case)]
+    impl IDropSource_Impl for DropSource_Impl {
+        fn QueryContinueDrag(
+            &self,
+            escape: BOOL,
+            keys: MODIFIERKEYS_FLAGS,
+        ) -> windows::core::HRESULT {
+            if escape.as_bool() {
+                HRESULT(DRAGDROP_S_CANCEL)
+            } else if keys & MODIFIERKEYS_FLAGS(MK_LBUTTON) == MODIFIERKEYS_FLAGS(0) {
+                HRESULT(DRAGDROP_S_DROP)
+            } else {
+                HRESULT(S_OK)
+            }
+        }
+
+        fn GiveFeedback(&self, _effect: DROPEFFECT) -> windows::core::HRESULT {
+            HRESULT(DRAGDROP_S_USEDEFAULTCURSORS)
+        }
+    }
+
+    /// The shell's `IDataObject` for these paths. The item ids are ours and are
+    /// freed once the array holds them.
+    unsafe fn file_data_object(paths: &[PathBuf]) -> Option<IDataObject> {
+        unsafe {
+            let wide: Vec<Vec<u16>> = paths
+                .iter()
+                .map(|p| p.as_os_str().encode_wide().chain(std::iter::once(0)).collect())
+                .collect();
+            let ids: Vec<*const ITEMIDLIST> = wide
+                .iter()
+                .map(|w| ILCreateFromPathW(PCWSTR::from_raw(w.as_ptr())).cast_const())
+                .collect();
+            let array: Option<IShellItemArray> = SHCreateShellItemArrayFromIDLists(&ids).ok();
+            for id in &ids {
+                if !id.is_null() {
+                    ILFree(Some(*id));
+                }
+            }
+            array?.BindToHandler(None, &BHID_DataObject).ok()
+        }
+    }
+
+    /// A 32-bit top-down DIB of the preview, with premultiplied alpha: the
+    /// shell's drag image is drawn with `AlphaBlend`, which expects it.
+    unsafe fn hbitmap(preview: &DragPreview) -> Option<HBITMAP> {
+        unsafe {
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: preview.width as i32,
+                    biHeight: -(preview.height as i32),
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let mut bits: *mut c_void = std::ptr::null_mut();
+            let bitmap = CreateDIBSection(None, &info, DIB_RGB_COLORS, &mut bits, None, 0).ok()?;
+            if bits.is_null() {
+                let _ = DeleteObject(bitmap.into());
+                return None;
+            }
+            let pixels = (preview.width as usize * preview.height as usize * 4).min(preview.rgba.len());
+            let dst = std::slice::from_raw_parts_mut(bits as *mut u8, pixels);
+            for (px, out) in preview.rgba[..pixels]
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .zip(dst.as_chunks_mut::<4>().0.iter_mut())
+            {
+                let alpha = px[3] as u32;
+                out[0] = (px[2] as u32 * alpha / 255) as u8;
+                out[1] = (px[1] as u32 * alpha / 255) as u8;
+                out[2] = (px[0] as u32 * alpha / 255) as u8;
+                out[3] = alpha as u8;
+            }
+            Some(bitmap)
+        }
+    }
+
+    /// Hand the preview to the shell's drag helper, which owns the copy it puts
+    /// under the pointer; without one, a drag shows only the OLE cursor.
+    unsafe fn set_drag_image(data: &IDataObject, preview: &DragPreview) {
+        unsafe {
+            let Some(bitmap) = hbitmap(preview) else { return };
+            if let Ok(helper) = windows::Win32::System::Com::CoCreateInstance::<_, IDragSourceHelper>(
+                &CLSID_DragDropHelper,
+                None,
+                CLSCTX_ALL,
+            ) {
+                let image = SHDRAGIMAGE {
+                    sizeDragImage: SIZE {
+                        cx: preview.width as i32,
+                        cy: preview.height as i32,
+                    },
+                    ptOffset: POINT {
+                        x: preview.width as i32 / 2,
+                        y: preview.height as i32 / 2,
+                    },
+                    hbmpDragImage: bitmap,
+                    // CLR_NONE: blend with the image's own alpha channel.
+                    crColorKey: COLORREF(0xFFFF_FFFF),
+                };
+                let _ = helper.InitializeFromBitmap(&image, data);
+            }
+            let _ = DeleteObject(bitmap.into());
+        }
+    }
 
     /// The gesture left the window: carry the same files into an OS drag so it
     /// can land in a browser, Explorer or anything else that takes files.
-    pub fn start_drag_out(paths: &[PathBuf]) {
-        let mut hdrop = vec![0u8; std::mem::size_of::<DropFiles>()];
-        let header: &mut DropFiles = unsafe { &mut *(hdrop.as_mut_ptr() as *mut DropFiles) };
-        header.p_files = hdrop.len() as u32;
-        header.f_wide = 1;
-        for path in paths {
-            let mut units = wide(&path.to_string_lossy());
-            units.pop();
-            for u in units {
-                hdrop.extend_from_slice(&u.to_ne_bytes());
-            }
-            hdrop.extend_from_slice(&0u16.to_ne_bytes());
-        }
-        hdrop.extend_from_slice(&0u16.to_ne_bytes());
+    pub fn start_drag_out(paths: &[PathBuf], preview: Option<DragPreview>) {
+        let trace = std::env::var_os("LYRE_TRACE").is_some();
         // OLE's modal drag loop must run on the thread that owns the press and
         // the foreground window: it captures the mouse there and pumps that
-        // thread's messages (so the window keeps painting). A worker thread
-        // cannot take the capture, and the drag dies at the window edge.
+        // thread's messages, so the window keeps painting.
         unsafe {
-            let data = Box::into_raw(Box::new(Data {
-                refs: AtomicUsize::new(1),
-                vtable: &DATA_VTABLE.0,
-                hdrop,
-            }));
-            let source = Box::into_raw(Box::new(DragSource {
-                refs: AtomicUsize::new(1),
-                vtable: &SOURCE_VTABLE,
-            }));
-            let mut effect = 0u32;
+            let Some(data) = file_data_object(paths) else {
+                if trace {
+                    eprintln!("[drag] the shell gave no data object for {} path(s)", paths.len());
+                }
+                return;
+            };
+            if let Some(preview) = &preview {
+                set_drag_image(&data, preview);
+            }
+            let source: IDropSource = DropSource.into();
+            let mut effect = DROPEFFECT(0);
             let started = std::time::Instant::now();
-            let hr = DoDragDrop(data.cast(), source.cast(), DROPEFFECT_COPY | DROPEFFECT_MOVE, &mut effect);
-            if std::env::var_os("LYRE_TRACE").is_some() {
+            if trace {
+                let fg = GetForegroundWindow();
+                let mut fg_pid = 0u32;
+                let fg_thread = GetWindowThreadProcessId(fg, &mut fg_pid);
                 eprintln!(
-                    "[drag] DoDragDrop hr={hr:#x} effect={effect} after {} ms",
+                    "[drag] pre-DoDragDrop fg={fg} fg_thread={fg_thread} self_thread={} lbutton={} items={}",
+                    GetCurrentThreadId(),
+                    GetAsyncKeyState(0x01),
+                    paths.len()
+                );
+            }
+            let hr = windows::Win32::System::Ole::DoDragDrop(
+                &data,
+                &source,
+                DROPEFFECT(DROPEFFECT_COPY | DROPEFFECT_MOVE),
+                &mut effect,
+            );
+            if trace {
+                eprintln!(
+                    "[drag] DoDragDrop hr={hr:?} effect={} after {} ms",
+                    effect.0,
                     started.elapsed().as_millis()
                 );
             }
-            d_release(data);
-            src_release(source);
+            // The session is over wherever it ended: a cancel over this window
+            // need not have called DragLeave, so clear the hover explicitly.
+            if let Some(tx) = super::sender() {
+                let _ = tx.send(OsDragMsg::Hover(None));
+            }
         }
     }
 
@@ -756,10 +899,21 @@ pub mod win {
         /// OLE calls through the pointer at offset zero; a refcount there is an
         /// access violation the moment RegisterDragDrop addrefs the target.
         #[test]
-        fn com_objects_start_with_their_vtable() {
+        fn the_target_starts_with_its_vtable() {
             assert_eq!(std::mem::offset_of!(Target, vtable), 0);
-            assert_eq!(std::mem::offset_of!(Data, vtable), 0);
-            assert_eq!(std::mem::offset_of!(DragSource, vtable), 0);
+        }
+
+        /// COM reads `FORMATETC` by its own layout: the target device pointer
+        /// follows the clip format at pointer alignment. Getting this wrong
+        /// makes every `GetData` land on another field and collect nothing.
+        #[cfg(target_pointer_width = "64")]
+        #[test]
+        fn format_etc_matches_the_com_layout() {
+            assert_eq!(std::mem::offset_of!(FormatEtc, _ptd), 8);
+            assert_eq!(std::mem::offset_of!(FormatEtc, _aspect), 16);
+            assert_eq!(std::mem::offset_of!(FormatEtc, _lindex), 20);
+            assert_eq!(std::mem::offset_of!(FormatEtc, tymed), 24);
+            assert_eq!(std::mem::size_of::<FormatEtc>(), 32);
         }
     }
 }

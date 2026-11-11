@@ -453,8 +453,9 @@ struct Marquee {
     auto_scroll: i8,
 }
 
-/// Drops the OS staged inside its own Drop handler: hit-test the landing point
-/// and copy them in, keeping the staging alive until the paste finishes.
+/// Drops and hovers the OS drag session sent: hit-test the landing point and
+/// copy drops in, keeping the staging alive until the paste finishes; light
+/// the hovered target the way an internal drag does.
 fn drain_osdrop(s: &mut App, tx: &mut Tx) -> bool {
     let mut msgs = Vec::new();
     if let Some(rx) = &s.osdrop_rx {
@@ -463,18 +464,48 @@ fn drain_osdrop(s: &mut App, tx: &mut Tx) -> bool {
         }
     }
     let any = !msgs.is_empty();
+    let mut hover = None;
     for m in msgs {
-        // OLE hands over screen pixels; the hit test wants window points.
-        #[cfg(target_os = "windows")]
-        let at = match frame::hwnd() {
-            Some(hwnd) => osdrag::win::to_window(hwnd, m.at.0, m.at.1, s.scale.get()),
-            None => m.at,
-        };
-        #[cfg(not(target_os = "windows"))]
-        let at = m.at;
-        apply_osdrop(tx, at, m.paths);
+        match m {
+            osdrag::OsDragMsg::Drop(m) => {
+                // OLE hands over screen pixels; the hit test wants window points.
+                #[cfg(target_os = "windows")]
+                let at = match frame::hwnd() {
+                    Some(hwnd) => osdrag::win::to_window(hwnd, m.at.0, m.at.1, s.scale.get()),
+                    None => m.at,
+                };
+                #[cfg(not(target_os = "windows"))]
+                let at = m.at;
+                apply_osdrop(tx, at, m.paths);
+            }
+            // Only the last hover of the frame matters, and a drop ends the
+            // session with a leave, so the last word after a drop is always off.
+            osdrag::OsDragMsg::Hover(at) => hover = Some(at),
+        }
+    }
+    if let Some(at) = hover {
+        match at {
+            None => s.os_hover = None,
+            Some(at) => {
+                #[cfg(target_os = "windows")]
+                let at = match frame::hwnd() {
+                    Some(hwnd) => osdrag::win::to_window(hwnd, at.0, at.1, s.scale.get()),
+                    None => at,
+                };
+                tx.element_at(at.0, at.1, move |s: &mut App, picked, _tx: &mut Tx| {
+                    s.os_hover = os_hover_key(s, picked.as_ref().map(|p| p.path()));
+                });
+            }
+        }
     }
     any
+}
+
+/// The highlight key for the element under an OS drag: the same key an
+/// internal drag's hit test produces, and nothing over unkeyed space.
+fn os_hover_key(s: &App, picked: Option<&str>) -> Option<String> {
+    let key = picked.map(|p| parse_drop_target(s, p).0).unwrap_or_default();
+    (!key.is_empty()).then_some(key)
 }
 
 /// One staged drop at a window point: hit-test, then copy into the target.
@@ -527,6 +558,15 @@ fn drag_paths(s: &App, ei: usize) -> Vec<PathBuf> {
     } else {
         vec![PathBuf::from(&s.entries[ei].path)]
     }
+}
+
+/// The icon the OS draws under the pointer once a drag leaves the window:
+/// Lyre's own ghost is a window overlay and cannot follow it out there.
+#[cfg(target_os = "windows")]
+fn drag_preview(s: &App, ei: usize) -> Option<osdrag::DragPreview> {
+    let entry = s.entries.get(ei)?;
+    let (width, height, rgba) = imagery::icon_rgba(&entry.path, entry.is_dir, 48)?;
+    Some(osdrag::DragPreview { width, height, rgba })
 }
 
 /// On macOS the OS runs the drag session (rune's drag_out), so the row offers
@@ -679,13 +719,21 @@ struct App {
     tail_folders: Vec<(String, String)>,
     /// Drops the OS thread staged and handed over, and the staging roots the
     /// running paste still needs alive.
-    osdrop_rx: Option<std::sync::mpsc::Receiver<osdrag::OsDrop>>,
+    osdrop_rx: Option<std::sync::mpsc::Receiver<osdrag::OsDragMsg>>,
     drop_staged: Vec<PathBuf>,
+    /// The element key an OS drag hovers over: the same highlight an internal
+    /// drag paints, without the ghost — the OS draws its own drag image.
+    os_hover: Option<String>,
     /// The payload of our own macOS drag session, so a drop back onto this
     /// window keeps the move/copy rule instead of always copying.
     os_drag: Option<Vec<String>>,
+    /// A drag that left the window, waiting for the frame that paints without
+    /// its ghost before OLE's modal loop takes the pointer over.
+    #[cfg(target_os = "windows")]
+    pending_os_drag: Option<(Vec<PathBuf>, Option<osdrag::DragPreview>)>,
     /// The window scale, for turning OS drop pixels into window points.
     scale: std::cell::Cell<f32>,
+    trace_tick: u64,
     thumb_cache: RefCell<HashMap<String, Image>>,
     /// Cut/copy clipboard, the running transfer, its worker channel and cancel.
     clipboard: Option<(Vec<PathBuf>, fileops::Mode)>,
@@ -924,6 +972,7 @@ fn close_tab_at(s: &mut App, index: usize) {
     s.address_edit = None;
     s.drag = None;
     s.drag_press = None;
+    s.os_hover = None;
     rescan_restored(s);
 }
 
@@ -1419,6 +1468,16 @@ fn refresh_visible(s: &mut App) {
 /// Rune calls this before each frame. Search edits land in `TextEdit` through
 /// `on_edit`, which only binds the field, so the row order is recomputed here.
 fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
+    // The gesture left the window last frame, which drew no ghost; now carry it
+    // into an OS drag. The handoff is posted to the window's message pump, not
+    // run here: inside this callback winit buffers every redraw, and OLE's
+    // modal loop would freeze the window for the whole drag.
+    #[cfg(target_os = "windows")]
+    if let Some((paths, preview)) = s.pending_os_drag.take()
+        && let Some(hwnd) = frame::hwnd()
+    {
+        osdrag::win::request_start(hwnd, paths, preview);
+    }
     let sig = prefs_signature(s);
     if sig != s.prefs_sig {
         persist(s);
@@ -1473,6 +1532,13 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
     sync_watch(s);
     changed |= drain_watch(s);
     changed |= drain_osdrop(s, tx);
+    if std::env::var_os("LYRE_TRACE").is_some() && s.trace_tick % 60 == 0 {
+        #[cfg(target_os = "windows")]
+        if let Some(hwnd) = frame::hwnd() {
+            osdrag::win::trace_registration(hwnd);
+        }
+    }
+    s.trace_tick = s.trace_tick.wrapping_add(1);
     // Clicking away from the address editor cancels it, as Explorer does.
     if s.address_edit.as_ref().is_some_and(|e| !e.focused) {
         s.address_edit = None;
@@ -1538,6 +1604,7 @@ fn set_location(s: &mut App, path: PathBuf) {
     s.address_edit = None;
     s.drag = None;
     s.drag_press = None;
+    s.os_hover = None;
     let (entries, scan_ms) = scan(&path);
     let crumbs: Vec<String> = path
         .components()
@@ -1641,6 +1708,7 @@ fn load(s: &mut App, f: Fixture) {
     s.address_edit = None;
     s.drag = None;
     s.drag_press = None;
+    s.os_hover = None;
     s.preview = false;
     s.contextual = false;
     s.mode = Mode::Details;
@@ -1874,7 +1942,7 @@ fn init() -> App {
     let (icon_tx, icon_jobs) = std::sync::mpsc::channel::<IconJob>();
     let (icon_done, icon_rx) = std::sync::mpsc::channel::<IconDone>();
     let (rescan_tx, rescan_rx) = std::sync::mpsc::channel::<watch::Refreshed>();
-    let (osdrop_tx, osdrop_rx) = std::sync::mpsc::channel::<osdrag::OsDrop>();
+    let (osdrop_tx, osdrop_rx) = std::sync::mpsc::channel::<osdrag::OsDragMsg>();
     osdrag::set_sender(osdrop_tx);
     osdrag::sweep_stale();
     std::thread::spawn(move || {
@@ -1954,8 +2022,12 @@ fn init() -> App {
         tail_folders: Vec::new(),
         osdrop_rx: Some(osdrop_rx),
         drop_staged: Vec::new(),
+        os_hover: None,
         os_drag: None,
+        #[cfg(target_os = "windows")]
+        pending_os_drag: None,
         scale: std::cell::Cell::new(1.0),
+        trace_tick: 0,
         thumb_cache: RefCell::new(HashMap::new()),
         clipboard: None,
         transfer: None,
@@ -5431,7 +5503,7 @@ fn parse_drop_target(s: &App, path: &str) -> (String, Option<DropTarget>) {
 
 /// Whether the element under a drag's pointer is its current target.
 fn drop_hot(s: &App, key: &str) -> bool {
-    s.drag.as_ref().is_some_and(|d| d.target_key == key)
+    s.drag.as_ref().is_some_and(|d| d.target_key == key) || s.os_hover.as_deref() == Some(key)
 }
 
 /// The gesture on a row: past the threshold it becomes a file drag carrying
@@ -5496,10 +5568,9 @@ fn row_drag(s: &mut App, rect_i: usize, ei: usize, d: &mut rune::Drag, tx: &mut 
                     let paths: Vec<PathBuf> = dr.paths.iter().map(PathBuf::from).collect();
                     s.drag = None;
                     s.drag_press = None;
-                    // The UI thread owns the Win32 capture from the press; OLE
-                    // cannot take it from another thread, so let go first.
-                    osdrag::win::release_capture();
-                    osdrag::win::start_drag_out(&paths);
+                    // Hand over on the next frame, so this one paints without
+                    // the ghost before the OS takes the pointer over.
+                    s.pending_os_drag = Some((paths, drag_preview(s, ei)));
                     return;
                 }
             }
@@ -6210,9 +6281,10 @@ fn open_recent(s: &mut App, i: usize) {
 /// Global shortcuts. Returns true when the key was handled. Editing keys are
 /// left to a focused field or an open dialog.
 fn handle_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
-    if ev.key == Key::Escape && s.drag.is_some() {
+    if ev.key == Key::Escape && (s.drag.is_some() || s.os_hover.is_some()) {
         s.drag = None;
         s.drag_press = None;
+        s.os_hover = None;
         return true;
     }
     if s.address_edit.is_some() {
@@ -7617,6 +7689,10 @@ fn main() {
                     mode: fileops::Mode::Copy,
                 });
             }),
+            ("oshover", |s| {
+                load(s, Fixture::Downloads);
+                s.os_hover = Some(format!("row:{}", s.entries[2].path));
+            }),
             ("crumbmenu", |s| {
                 load(s, Fixture::Downloads);
                 s.tail_folders = fs::read_dir(&s.root)
@@ -8081,6 +8157,33 @@ mod tests {
         let (key, target) = parse_drop_target(&s, "main/rows");
         assert_eq!(key, "");
         assert_eq!(target, None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// An OS drag hovering the window lights the same target an internal drag
+    /// would — the round-trip drag's folder highlight — and a leave clears it.
+    #[test]
+    fn os_hover_lights_the_drop_target_and_clears() {
+        let base = std::env::temp_dir().join(format!("lyre-oshover-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(base.join("zdir")).unwrap();
+        std::fs::write(base.join("a.txt"), b"x").unwrap();
+        let mut s = init();
+        s.view = View::Files;
+        s.root = base.clone();
+        s.entries = scan(&base).0;
+        refresh_visible(&mut s);
+        let row_path = format!("window/list-area/viewport/rows/{}/#0/#1", base.join("zdir").to_string_lossy());
+        let key = os_hover_key(&s, Some(&row_path)).unwrap();
+        assert_eq!(key, format!("row:{}", base.join("zdir").to_string_lossy()));
+        s.os_hover = Some(key.clone());
+        assert!(drop_hot(&s, &key));
+        assert!(!drop_hot(&s, "tab-0"));
+        // Unkeyed space (the list background) lights nothing, as internal drags.
+        assert_eq!(os_hover_key(&s, Some("main/rows")), None);
+        assert_eq!(os_hover_key(&s, None), None);
+        s.os_hover = None;
+        assert!(!drop_hot(&s, &key));
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -1094,6 +1094,8 @@ dependencies = [
  "serde_json",
  "ureq",
  "wayland-client",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]

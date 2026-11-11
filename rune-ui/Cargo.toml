@@ -16,6 +16,20 @@ serde_json = "1"
 ureq = { version = "2", features = ["json"] }
 minisign-verify = "0.2"
 semver = "1"
+[target.'cfg(target_os = "windows")'.dependencies]
+# The shell's own drag data object and a real IDropSource, so OLE accepts the
+# drag-off-the-window handoff instead of refusing a hand-written vtable.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_System_Ole",
+    "Win32_System_SystemServices",
+    "Win32_Graphics_Gdi",
+    "Win32_UI_Shell",
+    "Win32_UI_Shell_Common",
+] }
+# `#[implement]` expands to paths in this crate, so it is a real dependency.
+windows-core = "0.62"
 [target.'cfg(target_os = "linux")'.dependencies]
 # Wayland drag-out: dlopen libwayland at runtime, as Rune itself does, so the
 # Linux build needs no wayland development packages.

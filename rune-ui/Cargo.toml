@@ -36,6 +36,13 @@ windows-core = "0.62"
 # Linux build needs no wayland development packages.
 wayland-client = { version = "0.31", features = ["dlopen"] }
 
+[target.'cfg(windows)'.build-dependencies]
+# Compiles the application icon into the executable as a Windows resource: that
+# is the icon Explorer draws for the file, and the handle the window sets on
+# itself for the titlebar and taskbar. Scoped to Windows so the other platforms
+# build without it.
+embed-resource = "3"
+
 [profile.dev]
 opt-level = 1
 

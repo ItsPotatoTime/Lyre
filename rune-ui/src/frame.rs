@@ -79,6 +79,19 @@ mod imp {
         fn GetWindowRect(hwnd: isize, rect: *mut Rect) -> i32;
         fn DefSubclassProc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
         fn RedrawWindow(hwnd: isize, rect: *const core::ffi::c_void, region: *mut core::ffi::c_void, flags: u32) -> i32;
+        fn LoadImageW(
+            instance: *mut core::ffi::c_void,
+            name: *const u16,
+            kind: u32,
+            width: i32,
+            height: i32,
+            flags: u32,
+        ) -> *mut core::ffi::c_void;
+        fn SendMessageW(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
+    }
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> *mut core::ffi::c_void;
     }
     #[link(name = "comctl32")]
     unsafe extern "system" {
@@ -169,9 +182,39 @@ mod imp {
                         core::mem::size_of::<u32>() as u32,
                     );
                     SetWindowSubclass(hwnd, subclass, 1, 0);
+                    apply_icon(hwnd);
                 }
             }
         });
+    }
+
+    /// Put the embedded icon in the titlebar, taskbar and alt-tab list.
+    ///
+    /// A window class with no icon of its own gets the generic one, so it is set
+    /// explicitly afterwards. The handle comes from the resource the build script
+    /// compiled in, which is the same icon Explorer draws for the file, so the
+    /// two can never disagree.
+    unsafe fn apply_icon(hwnd: isize) {
+        const WM_SETICON: u32 = 0x0080;
+        const ICON_SMALL: usize = 0;
+        const ICON_BIG: usize = 1;
+        const IMAGE_ICON: u32 = 1;
+        /// The id `lyre.rc` gives the icon.
+        const ICON_RESOURCE: usize = 1;
+
+        let module = unsafe { GetModuleHandleW(core::ptr::null()) };
+        if module.is_null() {
+            return;
+        }
+        for (which, size) in [(ICON_SMALL, 16), (ICON_BIG, 32)] {
+            // The resource id is passed where a name would go, as the API expects.
+            let name = ICON_RESOURCE as *const u16;
+            let icon = unsafe { LoadImageW(module, name, IMAGE_ICON, size, size, 0) };
+            if icon.is_null() {
+                continue;
+            }
+            unsafe { SendMessageW(hwnd, WM_SETICON, which, icon as isize) };
+        }
     }
 
     pub fn minimize() {

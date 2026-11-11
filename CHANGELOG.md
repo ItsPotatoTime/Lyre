@@ -12,6 +12,14 @@ Nothing yet.
 
 ### Added
 
+- **The app has its icon back.** The executable carried no icon resource and the
+  window set none, so Explorer drew the generic file icon and the titlebar,
+  taskbar and alt-tab showed the generic window icon. The icon is now compiled
+  into the binary by a Windows-only build script, using the icon set the packaging
+  already ships, and the frame loads that resource and sets it for both the small
+  and large slots so the two cannot disagree. macOS and Linux need nothing here:
+  their icons come from the `.app` bundle and the `.desktop` entry the packaging
+  writes.
 - **Follow the desktop's appearance.** The appearance menu is now Follow system,
   Light and Dark. Following reads the desktop's own setting: the registry on
   Windows, re-read every couple of seconds so a change while Lyre is running is

@@ -6,6 +6,8 @@ dist-ssr
 src-tauri/target
 src-tauri/gen
 rune-ui/target
+rune-ui/target-*
+rune-ui/trace.log
 .cairn
 .playwright-mcp
 .reference

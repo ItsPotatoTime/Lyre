@@ -752,10 +752,7 @@ mod other {
     ) -> Vec<Verb> {
         Vec::new()
     }
-    pub fn handler_classes(_path: Option<&str>, _is_dir: bool, _background: bool) -> Vec<String> {
-        Vec::new()
-    }
-    pub fn run(_verb: &Verb, _path: &str) -> Result<(), String> {
+    pub fn run(_verb: &Verb, _paths: &[String]) -> Result<(), String> {
         Err("System menu items need Windows.".into())
     }
     pub fn open_default(_path: &str) -> Result<(), String> {

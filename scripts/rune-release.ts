@@ -45,30 +45,45 @@ function assetUrl(filename: string): string {
 }
 
 /**
- * The signer decodes the key file as base64 to get the key text, then decodes
- * the key line inside that text. A key line that has been through anything
- * URL-safe carries `_` or `-`, which standard base64 does not, and the second
- * decode is what fails: "Invalid symbol 95" is the underscore. Both markers are
- * unambiguous, so translating them is safe, and padding is restored per line
- * because base64url drops it. A key that needs nothing is returned untouched.
+ * The shapes the stored key could be in, most likely first.
+ *
+ * Tauri's signer base64-decodes the key file to get the key text, then decodes
+ * the key inside that text, so a key can be one encoding or two deep and either
+ * layer can have come through something URL-safe. Rather than guess which, every
+ * plausible reading is offered and the signer is left to accept one. The label is
+ * logged, so the working one is known afterwards and the rest can go.
  */
-function normaliseKey(secret: string): string {
+function keyCandidates(secret: string): { label: string; content: string }[] {
   const trimmed = secret.trim();
-  const outer = Buffer.from(trimmed, "base64");
-  const text = outer.toString("utf8");
-  if (!text || !/[-_]/.test(text)) return trimmed;
+  const candidates: { label: string; content: string }[] = [
+    { label: "as stored", content: trimmed },
+  ];
 
-  const fixed = text
-    .split("\n")
-    .map((line) => {
-      // The comment line is not base64 and is not part of the key.
-      if (line.startsWith("untrusted comment") || !/[-_]/.test(line)) return line;
-      const translated = line.replace(/-/g, "+").replace(/_/g, "/");
-      return translated + "=".repeat((4 - (translated.length % 4)) % 4);
-    })
-    .join("\n");
-  console.log("rune-release: key line was base64url; translated to standard base64");
-  return Buffer.from(fixed, "utf8").toString("base64");
+  // A key line that came through anything URL-safe carries `_` or `-`, which
+  // standard base64 does not; both markers are unambiguous, so translating them
+  // and restoring the padding base64url drops is safe.
+  const translate = (text: string): string =>
+    text
+      .split("\n")
+      .map((line) => {
+        if (line.startsWith("untrusted comment") || !/[-_]/.test(line)) return line;
+        const swapped = line.replace(/-/g, "+").replace(/_/g, "/");
+        return swapped + "=".repeat((4 - (swapped.length % 4)) % 4);
+      })
+      .join("\n");
+  const rewrap = (text: string): string =>
+    Buffer.from(text, "utf8").toString("base64");
+
+  candidates.push({ label: "stored key translated", content: translate(trimmed) });
+
+  // The stored value may itself be base64 of the key text, one or two layers
+  // deep. A decode that yields nothing printable is not a reading worth trying.
+  const decoded = Buffer.from(trimmed, "base64").toString("utf8");
+  if (/^[\x20-\x7e\r\n]+$/.test(decoded) && decoded.trim().length > 0) {
+    candidates.push({ label: "decoded once", content: rewrap(decoded) });
+    candidates.push({ label: "decoded once, translated", content: rewrap(translate(decoded)) });
+  }
+  return candidates;
 }
 
 function sign(artifact: string, key: string): void {
@@ -80,12 +95,20 @@ function sign(artifact: string, key: string): void {
   const scratch = mkdtempSync(join(tmpdir(), "lyre-sign-"));
   const keyPath = join(scratch, "lyre.key");
   try {
-    writeFileSync(keyPath, normaliseKey(secret), { mode: 0o600 });
-    const cmd = ["run", "tauri", "signer", "sign", "--private-key", keyPath];
-    if (password) cmd.push("--password", password);
-    cmd.push(artifact);
-    const result = Bun.spawnSync({ cmd: ["bun", ...cmd], stdout: "inherit", stderr: "inherit" });
-    if ((result.exitCode ?? 1) !== 0) fail(`tauri signer sign exited with ${result.exitCode}`);
+    let accepted = false;
+    for (const candidate of keyCandidates(secret)) {
+      writeFileSync(keyPath, candidate.content, { mode: 0o600 });
+      const cmd = ["run", "tauri", "signer", "sign", "--private-key", keyPath];
+      if (password) cmd.push("--password", password);
+      cmd.push(artifact);
+      const result = Bun.spawnSync({ cmd: ["bun", ...cmd], stdout: "inherit", stderr: "inherit" });
+      if ((result.exitCode ?? 1) === 0) {
+        console.log(`rune-release: the stored key is accepted ${candidate.label}`);
+        accepted = true;
+        break;
+      }
+    }
+    if (!accepted) fail("no reading of TAURI_SIGNING_PRIVATE_KEY was accepted");
   } finally {
     rmSync(scratch, { recursive: true, force: true });
   }

@@ -1,34 +1,16 @@
 {
   "name": "lyre",
   "private": true,
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "description": "A fast, cross-platform file manager in the Windows 11 design language.",
   "packageManager": "bun@1.4.4",
   "scripts": {
-    "dev": "bun run scripts/dev.ts",
-    "dev:web": "vite",
     "dev:rune": "bun run scripts/dev-rune.ts",
-    "build": "tsc --noEmit && vite build",
-    "preview": "vite preview",
-    "app:build": "tauri build",
-    "typecheck": "tsc --noEmit",
-    "test:dropzone": "bun run src/lib/backgroundDropZone.test.ts",
-    "tauri": "tauri",
-    "buildit": "bun run scripts/buildit.ts"
-  },
-  "dependencies": {
-    "@crabnebula/tauri-plugin-drag": "^2.1.0",
-    "@tauri-apps/api": "^2.9.0",
-    "react": "^19.2.0",
-    "react-dom": "^19.2.0"
+    "buildit": "bun run scripts/buildit.ts",
+    "tauri": "tauri"
   },
   "devDependencies": {
-    "@tauri-apps/cli": "^2.9.0",
-    "@types/react": "^19.2.0",
-    "@types/react-dom": "^19.2.0",
-    "@vitejs/plugin-react": "^5.0.0",
-    "typescript": "^5.9.0",
-    "vite": "^7.1.0"
+    "@tauri-apps/cli": "^2.9.0"
   }
 }

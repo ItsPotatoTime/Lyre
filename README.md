@@ -101,7 +101,8 @@ Per-platform detail, the AUR submission steps and the release procedure are in
 | 20,000 files, tmpfs | 20,000 | 13 ms | 15 ms |
 
 ```bash
-cd src-tauri && cargo test --lib bench_twenty_thousand -- --ignored --nocapture
+# The benchmark harness this measured went with the earlier application; the
+# numbers below are what it reported, and the scanner is the one rune-ui uses.
 ```
 
 The second column is what the window gets first, because the scan streams: rows
@@ -118,7 +119,7 @@ A recursive search, warm, one query at a time:
 | `/home` | 929,929 | 226 ms | 226 ms | 213 ms |
 
 ```bash
-cd src-tauri && cargo test --lib bench_real_tree -- --ignored --nocapture
+# Same harness, same note: it is no longer in the tree.
 ```
 
 The cost is the walk, not the number of matches: seventeen thousand hits and no
@@ -136,7 +137,7 @@ in a large directory feels like:
 | `dcmnt` (fuzzy) | 30,000 | 4.8 ms |
 
 ```bash
-cd src-tauri && cargo test --lib bench_packed_folder -- --ignored --nocapture
+# Same harness, same note: it is no longer in the tree.
 ```
 
 ### Memory
@@ -176,9 +177,8 @@ workflow builds the same binary on each platform and packages it: an NSIS setup
 on Windows, an AppImage on Linux, a universal `.app` on macOS. Flags are in
 [docs/building.md](docs/building.md).
 
-The repository still contains the earlier Tauri application (`src/` and
-`src-tauri/`), and `bun dev` and `bun buildit` without `--rune` still build it.
-It is no longer what ships, and the release workflow does not touch it.
+The earlier Tauri application that used to live in `src/` and `src-tauri/` has
+been removed, now that the Rune crate is what ships. It remains in git history.
 
 The interface also runs in a plain browser against a synthetic filesystem, which
 is how the layout is developed without rebuilding Rust:
@@ -245,28 +245,21 @@ Platform differences are real and are described in
   a Windows registration exists but cannot be read, or belongs to the Windows 11
   modern menu, the customise list names it instead of quietly leaving it out.
   [Platform detail](docs/platforms.md#context-menu-items-from-other-programs)
-- A synchronous snapshot inside `IDropTarget::Drop` needs a small, documented
-  patch to wry, and the outgoing drag needs one to `drag`. Both live under
-  `src-tauri/vendor/`; upgrading either dependency means reapplying the
-  `Lyre patch` comments. Sources that offer only virtual file descriptors
-  instead of `CF_HDROP`, and web pages that cannot traverse a dropped folder,
-  remain limited by the other side.
+- Dragging out and dropping back in are implemented directly against the shell,
+  in `rune-ui/src/osdrag.rs`, which supplies the shell's own data object and a
+  real drop target rather than patching a webview. Sources that offer only
+  virtual file descriptors instead of `CF_HDROP`, and web pages that cannot
+  traverse a dropped folder, remain limited by the other side.
   [Platform detail](docs/platforms.md#dragging-out-of-an-archive)
-- On Linux the webview itself tops out near 60 fps whatever the display does. The
-  measurements are in [docs/performance.md](docs/performance.md).
 
 ## Verification
 
 ```bash
-bun run typecheck
-bun run build
-bun run test:dropzone
-cd src-tauri && cargo test
-cd src-tauri && cargo clippy
-cd src-tauri && cargo test --lib dropstage
-cd src-tauri && cargo test -p lyre-drophook
-# Real Windows change notification, run by hand on a desktop:
-cd src-tauri && cargo test a_saved_file_wakes_the_watcher -- --ignored --nocapture
+cargo test --manifest-path rune-ui/Cargo.toml
+cargo clippy --manifest-path rune-ui/Cargo.toml --all-targets
+# Real Windows change notification, real registry and menu extensions, run by
+# hand on a desktop:
+cargo test --manifest-path rune-ui/Cargo.toml -- --ignored --nocapture
 ```
 
 The real drag paths still want a hand on a desktop. Open an archive with twenty
@@ -280,25 +273,25 @@ interface does not have it.
 ## Project layout
 
 ```
-src/
-  App.tsx               window state, tabs, history, shortcuts
-  components/           chrome, navigation, list, menus, icons
-  lib/ipc.ts            the only place that talks to Rust
-  lib/useDirectory.ts   streaming scan into a sorted, render-ready array
-  lib/sort.ts           one comparator, ICU collation
-  lib/mock.ts           synthetic filesystem for browser development
-  styles/               tokens, base, chrome, content
-src-tauri/
-  src/scan.rs           the scanner
+rune-ui/
+  src/main.rs           the window: chrome, rows, menus, dialogs, shortcuts
+  src/shell.rs          registry verbs, Open with, running through the shell
+  src/handlers.rs       third-party menu extensions, loaded on request
+  src/osdrag.rs         drag out to the shell, and drops back in
+  src/fileops.rs        copy, move, delete, rename, conflicts, progress
   src/search.rs         matching, ranking, the walk
-  src/places.rs         known folders, volumes, breadcrumbs
   src/watch.rs          change notifications for the folder on screen
-  src/dropstage.rs      snapshots of drops a source is about to delete
-  src/lib.rs            commands, scan registry
-  vendor/wry/           patched wry: a synchronous hook in IDropTarget::Drop
-  vendor/drag/          patched drag: advertise copy and move together
-  vendor/lyre-drophook/ the local, dependency-free bridge between them
-docs/                   performance, platforms, building, behaviour
+  src/metadata.rs       what a file can say about itself
+  src/theme.rs          the appearance, and following the desktop
+  src/openwith.rs       which applications can open a file
+  src/defaultmanager.rs which program opens folders
+  src/updates.rs        updates from Lyre's own releases, signature checked
+  src/frame.rs          per-platform window behaviour
+  src/volumes.rs        drives and mounts
+  src/imagery.rs        shell icons and decoded previews
+packaging/              installers, icons, desktop entry, AppRun
+scripts/                dev:rune, buildit, release signing
+docs/                   performance, platforms, updates, behaviour, install
 PRODUCT.md              who this is for and what it is
 DESIGN.md               the visual system, as built
 ```

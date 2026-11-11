@@ -44,6 +44,22 @@ function assetUrl(filename: string): string {
   return `https://github.com/${repo}/releases/download/${tag}/${filename}`;
 }
 
+/**
+ * Tauri's signer decodes the key as standard base64, whose alphabet has no `-`
+ * or `_`. A key that has been through anything URL-safe arrives as base64url and
+ * is rejected with "Invalid symbol 95" (the underscore) or 45 (the dash). Since
+ * no valid standard-base64 string contains either character, translating them
+ * back is unambiguous. Padding is restored too, because base64url drops it.
+ */
+function normaliseKey(secret: string): string {
+  const trimmed = secret.trim();
+  if (!/[-_]/.test(trimmed)) return trimmed;
+  const translated = trimmed.replace(/-/g, "+").replace(/_/g, "/");
+  const padding = "=".repeat((4 - (translated.length % 4)) % 4);
+  console.log("rune-release: key is base64url; translated to standard base64");
+  return translated + padding;
+}
+
 function sign(artifact: string, key: string): void {
   const secret = process.env.TAURI_SIGNING_PRIVATE_KEY;
   if (!secret) fail("TAURI_SIGNING_PRIVATE_KEY is not set; refusing to sign");
@@ -53,7 +69,7 @@ function sign(artifact: string, key: string): void {
   const scratch = mkdtempSync(join(tmpdir(), "lyre-sign-"));
   const keyPath = join(scratch, "lyre.key");
   try {
-    writeFileSync(keyPath, secret, { mode: 0o600 });
+    writeFileSync(keyPath, normaliseKey(secret), { mode: 0o600 });
     const cmd = ["run", "tauri", "signer", "sign", "--private-key", keyPath];
     if (password) cmd.push("--password", password);
     cmd.push(artifact);

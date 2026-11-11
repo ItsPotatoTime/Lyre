@@ -105,6 +105,12 @@ jobs:
           chmod +x appimagetool
           ARCH=x86_64 ./appimagetool --appimage-extract-and-run "$APPDIR" "dist/Lyre_${VERSION}_amd64.AppImage"
 
+      # The runner has no NSIS, so makensis is not on PATH and the packaging step
+      # fails before it starts. Chocolatey's shim directory is already on PATH.
+      - name: Install NSIS
+        if: matrix.platform == 'windows'
+        run: choco install nsis --no-progress -y
+
       - name: Package (Windows NSIS)
         if: matrix.platform == 'windows'
         shell: pwsh

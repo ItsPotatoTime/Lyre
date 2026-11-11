@@ -24,9 +24,8 @@
  * a draft release, and a person publishes it.
  */
 
-import { readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join, basename } from "node:path";
+import { readFileSync, writeFileSync } from "node:fs";
+import { basename } from "node:path";
 
 const args = process.argv.slice(2);
 const command = args[0];
@@ -91,27 +90,33 @@ function sign(artifact: string, key: string): void {
   if (!secret) fail("TAURI_SIGNING_PRIVATE_KEY is not set; refusing to sign");
   const password = process.env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD ?? "";
 
-  // A scratch file keeps the key off the command line (and out of the logs).
-  const scratch = mkdtempSync(join(tmpdir(), "lyre-sign-"));
-  const keyPath = join(scratch, "lyre.key");
-  try {
-    let accepted = false;
-    for (const candidate of keyCandidates(secret)) {
-      writeFileSync(keyPath, candidate.content, { mode: 0o600 });
-      const cmd = ["run", "tauri", "signer", "sign", "--private-key", keyPath];
-      if (password) cmd.push("--password", password);
-      cmd.push(artifact);
-      const result = Bun.spawnSync({ cmd: ["bun", ...cmd], stdout: "inherit", stderr: "inherit" });
-      if ((result.exitCode ?? 1) === 0) {
-        console.log(`rune-release: the stored key is accepted ${candidate.label}`);
-        accepted = true;
-        break;
-      }
+  // The key goes through the environment, never `--private-key`. In this CLI that
+  // flag is decoded as the key itself rather than read as a file, which is why
+  // passing a path produced "Invalid symbol 95, offset 29": the underscore in the
+  // macOS temp path, and "symbol 58, offset 1" for the colon in the Windows one.
+  let accepted = false;
+  for (const candidate of keyCandidates(secret)) {
+    const env: Record<string, string> = {};
+    for (const [name, value] of Object.entries(process.env)) {
+      if (value !== undefined) env[name] = value;
     }
-    if (!accepted) fail("no reading of TAURI_SIGNING_PRIVATE_KEY was accepted");
-  } finally {
-    rmSync(scratch, { recursive: true, force: true });
+    env.TAURI_SIGNING_PRIVATE_KEY = candidate.content;
+    const cmd = ["run", "tauri", "signer", "sign"];
+    if (password) cmd.push("--password", password);
+    cmd.push(artifact);
+    const result = Bun.spawnSync({
+      cmd: ["bun", ...cmd],
+      stdout: "inherit",
+      stderr: "inherit",
+      env,
+    });
+    if ((result.exitCode ?? 1) === 0) {
+      console.log(`rune-release: the stored key is accepted ${candidate.label}`);
+      accepted = true;
+      break;
+    }
   }
+  if (!accepted) fail("no reading of TAURI_SIGNING_PRIVATE_KEY was accepted");
 
   const sigPath = `${artifact}.sig`;
   const signature = Buffer.from(readFileSync(sigPath)).toString("base64");

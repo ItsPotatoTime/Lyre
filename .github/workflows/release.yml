@@ -51,12 +51,30 @@ jobs:
       - name: Install Linux dependencies
         if: matrix.platform == 'linux'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            pkg-config libssl-dev libwayland-dev libx11-dev libx11-xcb-dev \
-            libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-shm0-dev \
-            libxcb-xfixes0-dev libxcb-xkb-dev libxkbcommon-dev libxkbcommon-x11-dev \
-            desktop-file-utils
+          set -u
+          # The runner's mirror has repeatedly failed to resolve
+          # azure.archive.ubuntu.com, which is infrastructure rather than this
+          # project. apt's own retries plus an outer loop ride that out instead of
+          # failing a release on a DNS blip, and the explicit check keeps a real
+          # failure a failure.
+          installed=0
+          for attempt in 1 2 3; do
+            if sudo apt-get update -o Acquire::Retries=5 \
+              && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -o Acquire::Retries=5 \
+                pkg-config libssl-dev libwayland-dev libx11-dev libx11-xcb-dev \
+                libxcb1-dev libxcb-render0-dev libxcb-shape0-dev libxcb-shm0-dev \
+                libxcb-xfixes0-dev libxcb-xkb-dev libxkbcommon-dev libxkbcommon-x11-dev \
+                desktop-file-utils; then
+              installed=1
+              break
+            fi
+            echo "dependency install attempt ${attempt} failed; retrying in 20s"
+            sleep 20
+          done
+          if [ "$installed" -ne 1 ]; then
+            echo "could not install the Linux build dependencies after 3 attempts"
+            exit 1
+          fi
 
       # Git for Windows puts a GNU link.exe on PATH; activate MSVC so rustc finds
       # the real one.

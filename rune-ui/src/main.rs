@@ -1198,7 +1198,13 @@ const PREFS_ID: &str = "lyre-rune";
 
 /// Restore the view state and collections saved by a previous run.
 fn load_prefs(s: &mut App) {
-    let prefs = rune::prefs::Prefs::open(PREFS_ID);
+    load_prefs_from(s, PREFS_ID);
+}
+
+/// The same restore against a named store, so a test can round-trip without
+/// touching the settings a person actually uses.
+fn load_prefs_from(s: &mut App, id: &str) {
+    let prefs = rune::prefs::Prefs::open(id);
     if let Some((sort, sort_desc, preview, mode, compact, filter, group, nav, hidden, dark)) =
         prefs.get::<(u8, bool, bool, u8, bool, u8, bool, bool, bool, bool)>("settings")
     {
@@ -1228,6 +1234,11 @@ fn load_prefs(s: &mut App) {
     if let Some(m) = prefs.get::<Vec<String>>("menu_shown") {
         s.menu_shown = m;
     }
+    // Extensions the person allowed Lyre to load stay allowed: re-asking on every
+    // launch would make the switch meaningless.
+    if let Some(h) = prefs.get::<Vec<String>>("handler_loaded") {
+        s.handler_loaded = h;
+    }
     if let Some(h) = prefs.get::<Vec<usize>>("hidden_places") {
         s.hidden_places = h;
     }
@@ -1253,7 +1264,12 @@ fn load_prefs(s: &mut App) {
 
 /// Write the whole view state and collections; poll calls this once per change.
 fn persist(s: &App) {
-    let mut prefs = rune::prefs::Prefs::open(PREFS_ID);
+    persist_to(s, PREFS_ID);
+}
+
+/// The same save against a named store, for tests.
+fn persist_to(s: &App, id: &str) {
+    let mut prefs = rune::prefs::Prefs::open(id);
     let settings = (
         s.sort,
         s.sort_desc,
@@ -1272,6 +1288,7 @@ fn persist(s: &App) {
     let _ = prefs.set("pinned", &s.pinned);
     let _ = prefs.set("menu_hidden", &s.menu_hidden);
     let _ = prefs.set("menu_shown", &s.menu_shown);
+    let _ = prefs.set("handler_loaded", &s.handler_loaded);
     let _ = prefs.set("hidden_places", &s.hidden_places);
     let _ = prefs.set("update_check_startup", &s.update_check_startup);
     let _ = prefs.set("prompt_default_manager", &s.prompt_default_manager);
@@ -1284,7 +1301,7 @@ fn persist(s: &App) {
 /// A cheap fingerprint of everything persisted, so poll saves only on change.
 fn prefs_signature(s: &App) -> String {
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{:?}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{:?}|{}",
         s.sort,
         s.sort_desc,
         s.preview,
@@ -1300,6 +1317,7 @@ fn prefs_signature(s: &App) -> String {
         s.pinned,
         s.menu_hidden,
         s.menu_shown,
+        s.handler_loaded,
         s.hidden_places,
         s.update_check_startup,
         s.prompt_default_manager,
@@ -8476,6 +8494,44 @@ fn main() {
 #[cfg(all(test, target_os = "windows"))]
 mod customize_tests {
     use super::*;
+
+    /// The reported bug: an extension had to be allowed again after every
+    /// restart. This round-trips the real save and restore through a store of its
+    /// own, so it neither depends on nor disturbs the person's settings.
+    #[test]
+    fn an_allowed_extension_survives_a_restart() {
+        let store = "lyre-rune-prefs-test";
+        let clsid = "{23170F69-40C1-278A-1000-000100020000}".to_string();
+
+        let mut before = init();
+        before.handler_loaded = vec![clsid.clone()];
+        persist_to(&before, store);
+
+        // A fresh launch, reading that store back.
+        let mut after = init();
+        after.handler_loaded.clear();
+        load_prefs_from(&mut after, store);
+        assert_eq!(after.handler_loaded, vec![clsid]);
+
+        // Leave nothing behind in the test store.
+        let mut prefs = rune::prefs::Prefs::open(store);
+        let _ = prefs.set("handler_loaded", &Vec::<String>::new());
+    }
+
+    /// Allowing an extension is a preference, not a session setting: it used to
+    /// be forgotten on restart, which made the switch pointless.
+    #[test]
+    fn allowing_an_extension_is_part_of_the_saved_state() {
+        let mut s = init();
+        let before = prefs_signature(&s);
+        s.handler_loaded
+            .push("{23170F69-40C1-278A-1000-000100020000}".into());
+        assert_ne!(
+            prefs_signature(&s),
+            before,
+            "changing it has to trigger the save"
+        );
+    }
 
     /// The menu has to carry the extension's items, and they have to be read for
     /// the whole selection rather than the item under the pointer.

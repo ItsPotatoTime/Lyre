@@ -6,6 +6,10 @@ release notes rather than a second copy of them.
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.3.0]
+
 ### Added
 
 - **Follow the desktop's appearance.** The appearance menu is now Follow system,
@@ -59,6 +63,12 @@ release notes rather than a second copy of them.
 
 ### Changed
 
+- **The Linux updater can replace itself at last.** Writing the new AppImage over
+  the running one is refused by the kernel, so an update from a packaged AppImage
+  failed with "Text file busy". The download is now staged in the AppImage's own
+  folder and renamed into place, which is atomic and cannot fail on a machine
+  where `/tmp` is a separate filesystem. This is compiled into the copy doing the
+  updating, so it takes effect from this version onward.
 - **Folders open without waiting.** The directory read moved off the UI thread.
   Navigating shows "Reading folder…" with a running item count in the status bar,
   Escape stops it, and a slow or very large folder no longer freezes the window.

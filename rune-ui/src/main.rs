@@ -2213,6 +2213,24 @@ fn load(s: &mut App, f: Fixture) {
     refresh_visible(s);
 }
 
+/// Start on Home without discarding the view and sort the person chose.
+///
+/// `load` lays a fixture out for the reference captures, so it resets the mode,
+/// the sort and the preview pane. Startup goes through Home now, which meant
+/// those resets replaced the restored choices before the first frame and were
+/// then saved back as though they had been chosen.
+fn load_home_preserving_view(s: &mut App) {
+    let mode = s.mode;
+    let sort = s.sort;
+    let sort_desc = s.sort_desc;
+    let preview = s.preview;
+    load(s, Fixture::Home);
+    s.mode = mode;
+    s.sort = sort;
+    s.sort_desc = sort_desc;
+    s.preview = preview;
+}
+
 fn init() -> App {
     // Where to start. An explicit path is a request: the folder handler passing a
     // folder to open, or LYRE_RUNE_PATH for development. With neither, the window
@@ -2394,7 +2412,7 @@ fn init() -> App {
     load_prefs(&mut app);
     if start_home {
         // Before the first tab is captured, so the tab strip agrees with the view.
-        load(&mut app, Fixture::Home);
+        load_home_preserving_view(&mut app);
     }
     refresh_visible(&mut app);
     app.tabs = vec![capture_tab(&app)];
@@ -9187,6 +9205,36 @@ mod start_tests {
         }
         assert!(matches!(s.view, View::Home), "a plain launch opens on Home");
         assert_eq!(s.tab, "Home");
+    }
+}
+
+#[cfg(test)]
+mod view_pref_tests {
+    use super::*;
+
+    /// The reported bug: a chosen sort and view came back as the default after a
+    /// restart, because starting on Home reset them and the reset was saved.
+    #[test]
+    fn the_chosen_view_and_sort_survive_starting_on_home() {
+        let mut s = init();
+        s.mode = Mode::List;
+        s.sort = 1;
+        s.sort_desc = true;
+        s.preview = true;
+
+        // What the fixture alone does, which is why this wrapper exists.
+        let mut plain = init();
+        plain.mode = Mode::List;
+        plain.sort = 1;
+        plain.preview = true;
+        load(&mut plain, Fixture::Home);
+        assert!(matches!(plain.mode, Mode::Details) && plain.sort == 0 && !plain.preview);
+
+        load_home_preserving_view(&mut s);
+        assert!(matches!(s.mode, Mode::List), "the view choice survives");
+        assert_eq!(s.sort, 1, "so does the sort column");
+        assert!(s.sort_desc, "and its direction");
+        assert!(s.preview, "and the preview pane");
     }
 }
 

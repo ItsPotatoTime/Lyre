@@ -793,6 +793,8 @@ struct App {
     /// Per-type facts for the previewed item, memoised by path: reading a file
     /// for its metadata must not happen on every frame the pane is drawn.
     preview_facts: RefCell<Option<(String, Vec<metadata::Fact>)>>,
+    /// Rail places whose list is open, by place index.
+    rail_open: Vec<usize>,
     /// The folder scan in flight: its channel, the folder it was asked for, and
     /// the flag that stops it.
     scan_rx: Option<std::sync::mpsc::Receiver<ScanMsg>>,
@@ -2306,6 +2308,7 @@ fn init() -> App {
         op_cancel: None,
         menu_handler_rows: RefCell::new(None),
         preview_facts: RefCell::new(None),
+        rail_open: Vec::new(),
         scan_rx: None,
         scan_want: None,
         scan_cancel: None,
@@ -5774,6 +5777,27 @@ fn rail_item(
 ) -> El {
     let active = s.nav == index;
     let ink = if active { p.text } else { p.secondary };
+    let open = s.rail_open.contains(&index);
+
+    // The body carries the press that opens the place, so the chevron beside it
+    // can expand the list without also navigating.
+    let body = row()
+        .grow(1.0)
+        .min_w(0.0)
+        .gap(8.0)
+        .items_center()
+        .child(place_glyph(index, 16.0))
+        .child(text(label).font(ROW_TEXT).color(ink).grow(1.0).min_w(0.0).truncate())
+        .on_press_tx(move |s: &mut App, tx: &mut Tx| {
+            navigate(s, index);
+            tx.instant();
+        });
+    let body = if pin {
+        body.child(ico(p, Ico::Pin, 10.0, p.tertiary))
+    } else {
+        body
+    };
+
     let mut item = row()
         .key(format!("rail-{index}"))
         .on_drop_files(move |s: &mut App, files, tx: &mut Tx| {
@@ -5801,24 +5825,69 @@ fn rail_item(
     if active {
         item = item.border(p.hair, p.sel_line);
     }
-    if chevron {
-        item = item.child(ico(p, Ico::ChevronRight, 9.0, p.tertiary));
+    item = if chevron {
+        let mark = if open { Ico::ChevronDown } else { Ico::ChevronRight };
+        item.child(
+            el()
+                .w(11.0)
+                .h_full()
+                .fill(Color::TRANSPARENT)
+                .center()
+                .child(ico(p, mark, 9.0, p.tertiary))
+                .on_press_tx(move |s: &mut App, tx: &mut Tx| {
+                    toggle_rail(s, index);
+                    tx.instant();
+                }),
+        )
     } else {
-        item = item.child(el().w(9.0));
+        item.child(el().w(11.0))
+    };
+    item.child(body)
+        .on_secondary_press(move |s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
+            s.menu = Some(Menu::Context { scope: CtxScope::Place, target: index, x: at.x, y: at.y });
+        })
+}
+
+/// Open or close the list under a rail place. Drives come and go, so the volume
+/// table is asked again each time This PC is opened rather than once at startup.
+fn toggle_rail(s: &mut App, place: usize) {
+    if let Some(at) = s.rail_open.iter().position(|open| *open == place) {
+        s.rail_open.remove(at);
+        return;
     }
-    item = item
-        .child(place_glyph(index, 16.0))
-        .child(text(label).font(ROW_TEXT).color(ink).grow(1.0).min_w(0.0).truncate());
-    if pin {
-        item = item.child(ico(p, Ico::Pin, 10.0, p.tertiary));
+    if place == 9 {
+        refresh_volumes(s);
     }
-    item.on_press_tx(move |s: &mut App, tx: &mut Tx| {
-        navigate(s, index);
-        tx.instant();
-    })
-    .on_secondary_press(move |s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
-        s.menu = Some(Menu::Context { scope: CtxScope::Place, target: index, x: at.x, y: at.y });
-    })
+    s.rail_open.push(place);
+}
+
+/// One row beneath an expanded rail place. A place with nothing to list says so
+/// rather than leaving the chevron looking broken.
+fn rail_leaf(p: Paint, label: &str, path: Option<&str>) -> El {
+    let leaf = row()
+        .w_full()
+        .h(24.0)
+        .pl(31.0)
+        .pr(8.0)
+        .gap(6.0)
+        .radius(4.0)
+        .items_center()
+        .child(
+            text(label)
+                .font(CAPTION)
+                .color(p.secondary)
+                .grow(1.0)
+                .min_w(0.0)
+                .truncate(),
+        );
+    match path {
+        Some(path) => {
+            let target = path.to_string();
+            leaf.hover(p.hover)
+                .on_press(move |s: &mut App| go(s, PathBuf::from(target.clone())))
+        }
+        None => leaf,
+    }
 }
 
 /// A pinned folder in the rail: opens its path, right-click offers unpin.
@@ -5890,10 +5959,28 @@ fn nav_rail(s: &App, p: Paint) -> El {
             rail = rail.child(pinned_item(s, p, pi, path));
         }
     }
-    let rail = rail.child(el().w_full().h(p.hair).fill(p.soft_line).my(5.0).key("rail-sep-2"))
-        .child(rail_item(s, p, 9, "This PC", true, false))
-        .child(rail_item(s, p, 10, "Network", true, false))
-        .child(el().grow(1.0));
+    let mut rail = rail
+        .child(el().w_full().h(p.hair).fill(p.soft_line).my(5.0).key("rail-sep-2"))
+        .child(rail_item(s, p, 9, "This PC", true, false));
+    if s.rail_open.contains(&9) {
+        if s.volumes.is_empty() {
+            rail = rail.child(rail_leaf(p, "No drives found", None));
+        }
+        for volume in &s.volumes {
+            let letter = volume.letter();
+            let title = match volume.label.trim() {
+                "" => letter,
+                label => format!("{label} ({letter})"),
+            };
+            let path = volume.path.to_string_lossy().into_owned();
+            rail = rail.child(rail_leaf(p, &title, Some(&path)));
+        }
+    }
+    rail = rail.child(rail_item(s, p, 10, "Network", true, false));
+    if s.rail_open.contains(&10) {
+        rail = rail.child(rail_leaf(p, "Network browsing is not implemented", None));
+    }
+    let rail = rail.child(el().grow(1.0));
     row().key("rail-wrap")
         .h_full()
         .child(rail)
@@ -9038,6 +9125,31 @@ mod start_tests {
         }
         assert!(matches!(s.view, View::Home), "a plain launch opens on Home");
         assert_eq!(s.tab, "Home");
+    }
+}
+
+#[cfg(test)]
+mod rail_tests {
+    use super::*;
+
+    /// The chevrons on This PC and Network were decoration: there was no state
+    /// behind them, so pressing one navigated instead of opening anything.
+    #[test]
+    fn a_chevron_opens_and_closes_its_list() {
+        let mut s = init();
+        assert!(s.rail_open.is_empty());
+
+        toggle_rail(&mut s, 9);
+        assert_eq!(s.rail_open, vec![9]);
+        toggle_rail(&mut s, 9);
+        assert!(s.rail_open.is_empty(), "pressing again closes it");
+
+        // Two places open independently, and closing one leaves the other.
+        toggle_rail(&mut s, 9);
+        toggle_rail(&mut s, 10);
+        assert_eq!(s.rail_open, vec![9, 10]);
+        toggle_rail(&mut s, 9);
+        assert_eq!(s.rail_open, vec![10]);
     }
 }
 

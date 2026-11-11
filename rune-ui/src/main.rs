@@ -2171,11 +2171,20 @@ fn load(s: &mut App, f: Fixture) {
 }
 
 fn init() -> App {
-    let root = std::env::var("LYRE_RUNE_PATH")
+    // Where to start. An explicit path is a request: the folder handler passing a
+    // folder to open, or LYRE_RUNE_PATH for development. With neither, the window
+    // opens on Home rather than on whatever folder the process happened to start
+    // in, which for an installed copy is its own install folder.
+    let requested = std::env::var("LYRE_RUNE_PATH")
         .map(PathBuf::from)
         .ok()
-        .or_else(|| defaultmanager::startup_path().map(PathBuf::from))
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        .or_else(|| defaultmanager::startup_path().map(PathBuf::from));
+    let start_home = requested.is_none();
+    let root = requested.unwrap_or_else(|| {
+        home_dir().unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+        })
+    });
     let (entries, scan_ms) = scan(&root);
     let crumbs: Vec<String> = root
         .components()
@@ -2336,6 +2345,10 @@ fn init() -> App {
         active_tab: 0,
     };
     load_prefs(&mut app);
+    if start_home {
+        // Before the first tab is captured, so the tab strip agrees with the view.
+        load(&mut app, Fixture::Home);
+    }
     refresh_visible(&mut app);
     app.tabs = vec![capture_tab(&app)];
     app.active_tab = 0;
@@ -8990,6 +9003,30 @@ mod customize_tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod start_tests {
+    use super::*;
+
+    /// An installed copy is launched from its own folder, so falling back to the
+    /// working directory opened Lyre in `%LOCALAPPDATA%\Programs\Lyre` instead of
+    /// the quick start screen.
+    #[test]
+    fn a_plain_launch_starts_on_home() {
+        if std::env::var_os("LYRE_RUNE_PATH").is_some() {
+            // A path in the environment is a request to open it; nothing to check.
+            return;
+        }
+        let s = init();
+        if s.view == View::Files {
+            // Only reachable if the shell handed a folder over, which the test
+            // harness never does; leave it rather than fail on a stray argument.
+            return;
+        }
+        assert!(matches!(s.view, View::Home), "a plain launch opens on Home");
+        assert_eq!(s.tab, "Home");
     }
 }
 

@@ -13,6 +13,11 @@
 //! drag-and-drop, system context menus, real shell thumbnails, and the reveal
 //! highlight.
 
+// A release build is a window, not a console program: without this, Windows
+// allocates a console for it and shows one alongside the window. Debug builds
+// keep it, because that is where the tracing and `--snap` output goes.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::HashMap;

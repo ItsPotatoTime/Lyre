@@ -63,6 +63,10 @@ Nothing yet.
 
 ### Changed
 
+- **No console window behind the app.** The release binary was linked as a
+  console program, so Windows opened a terminal alongside the window. Release
+  builds are now a window subsystem binary; debug builds keep the console,
+  because that is where the tracing and `--snap` output goes.
 - **The Linux updater can replace itself at last.** Writing the new AppImage over
   the running one is refused by the kernel, so an update from a packaged AppImage
   failed with "Text file busy". The download is now staged in the AppImage's own

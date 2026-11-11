@@ -10,154 +10,74 @@ Nothing yet.
 
 ## [0.3.0]
 
-### Added
+This release is the interface rewritten. Lyre's window is no longer a web page:
+it is drawn by Rune's own GPU renderer from Rust, with no webview, no React and no
+JavaScript anywhere in the shipped application. One native binary per platform now
+carries the whole file manager.
 
-- **The app has its icon back.** The executable carried no icon resource and the
-  window set none, so Explorer drew the generic file icon and the titlebar,
-  taskbar and alt-tab showed the generic window icon. The icon is now compiled
-  into the binary by a Windows-only build script, using the icon set the packaging
-  already ships, and the frame loads that resource and sets it for both the small
-  and large slots so the two cannot disagree. macOS and Linux need nothing here:
-  their icons come from the `.app` bundle and the `.desktop` entry the packaging
-  writes.
-- **Follow the desktop's appearance.** The appearance menu is now Follow system,
-  Light and Dark. Following reads the desktop's own setting: the registry on
-  Windows, re-read every couple of seconds so a change while Lyre is running is
-  picked up, and `defaults` or `gsettings` on macOS and freedesktop otherwise,
-  which settle it when the window starts and when the choice is made. A save from
-  before the option existed keeps the appearance it recorded.
-- **Folders refresh themselves.** Files another program saves, edits, renames or
-  deletes appear without pressing F5. Windows uses `ReadDirectoryChangesW`; Linux,
-  macOS and volumes that refuse a notification compare a fingerprint of names,
-  sizes and modified times on an interval that grows with the folder, from 500 ms
-  to 3 s. Bursts are collapsed into one re-read, an inline rename keeps its row
-  until the editor closes, and search results still refresh on the next query.
-- **The system's own context menu items, on Windows.** What other programs
-  register now appears in Lyre's menus: "Open in Windows Terminal", 7-Zip's
-  archive commands, and the rest. Verbs are read from the registry; a menu handler
-  is asked what it would draw, which is the same call the shell makes; and choosing
-  one runs it through the program that registered it. A new program is picked up
-  when its registration is there, with no list to maintain. Windows 11
-  `IExplorerCommand` handlers are still not read: they are activated through COM
-  and draw their own menu, so nothing about them is reachable from the registry.
-- **Customize this menu**, at the bottom of every right-click menu and in the More
-  menu. It lists everything that can appear in that menu, Lyre's own items and the
-  ones other programs added, with a tick per item and a count of how many are
-  shown. Turning something off is remembered. It also lists every registration
-  that exists but could not be read, with the reason.
-- **Customize this menu now shows everything, grouped by the program it comes
-  from.** The dialog lists Lyre's items, every registry verb, and the third-party
-  extensions that draw their own menus, with each owner as a group that opens on
-  hover and a switch that turns the whole owner on or off at once. Cascading
-  registry submenus are enumerated and runnable, and Shift-only items are listed
-  instead of dropped.
-- **7-Zip and its like can be listed at last.** Their items are built by a DLL at
-  runtime and exist nowhere in the registry, so the customize list shows each
-  extension by name and loads one only when its switch is turned on. On this
-  machine that turns 7-Zip's 19 hidden commands, "Add to <file>.zip" among them,
-  into individually switchable and runnable rows. Loading a third-party DLL is
-  the one thing here that can take the window down, which is why it is never
-  automatic.
-- **Open with, on every platform.** "Open with…" now opens a dialog listing the
-  applications that declare they can open that file's type, with the current
-  default marked and preselected. Choosing one opens the file there, and "Always
-  use this application" makes it the default. Linux reads `.desktop` entries and
-  records the choice with `xdg-mime`; macOS reads and writes LaunchServices role
-  handlers; Windows builds the list from the registry, out of `OpenWithProgids`,
-  `OpenWithList` and `SupportedTypes`, naming each entry from the executable's own
-  description so it reads "Firefox" rather than "firefox". Windows hash-protects
-  the default association, so changing it there still goes through the system's
-  own picker, which the dialog offers beside the list.
+### Why it was rewritten
 
-### Changed
+- **The web layer is gone.** The old application was a Rust core behind a Tauri
+  webview and a React interface, which meant shipping a browser engine inside a
+  file manager and paying for a DOM node per row. The window is now a single Rust
+  crate drawing its own rows, so a folder of twenty thousand entries costs the
+  scan and nothing else.
+- **The chrome belongs to the application.** The titlebar, tabs, address row,
+  command bar, resize edges, minimize and maximize are drawn and handled by Lyre
+  rather than borrowed from a native frame. The Windows 11 Explorer layout is the
+  layout on every platform instead of an approximation of one.
+- **The Tauri application is deleted.** `src/` and `src-tauri/`, the React
+  components, the Vite toolchain and the vendored wry and drag patches are gone
+  from the tree. The repository is one Rust crate, its packaging and its docs; the
+  old application remains in git history.
 
-- **No console window behind the app.** The release binary was linked as a
-  console program, so Windows opened a terminal alongside the window. Release
-  builds are now a window subsystem binary; debug builds keep the console,
-  because that is where the tracing and `--snap` output goes.
-- **The Linux updater can replace itself at last.** Writing the new AppImage over
-  the running one is refused by the kernel, so an update from a packaged AppImage
-  failed with "Text file busy". The download is now staged in the AppImage's own
-  folder and renamed into place, which is atomic and cannot fail on a machine
-  where `/tmp` is a separate filesystem. This is compiled into the copy doing the
-  updating, so it takes effect from this version onward.
-- **Folders open without waiting.** The directory read moved off the UI thread.
-  Navigating shows "Reading folder…" with a running item count in the status bar,
-  Escape stops it, and a slow or very large folder no longer freezes the window.
-  An answer that arrives for a folder you have already left is dropped rather than
-  drawn over the one you are looking at.
-- **What other programs add to the menu is off until it is asked for.** Every
-  system verb, handler and background item now starts disabled, so installing an
-  application cannot change what a right-click does. They stay listed in
-  "Customize this menu" and are switched on one at a time. Lyre's own items are
-  unchanged.
-- **The unused directory-mtime stamp is gone.** Editing a file in place leaves
-  the parent folder's timestamp alone, so it could never have detected the very
-  change this feature is for. The watcher compares names, sizes and modified
-  times instead.
+### What the window does
 
-### Fixed
+- **The Explorer layout**: tabs, history, breadcrumbs, the navigation rail, and
+  details, grid, list and tiles, with Home for favourites and recents, This PC
+  with live volumes, and a preview pane beside the list.
+- **Folders refresh themselves**, and one that is slow to read says so. The scan
+  runs off the UI thread, the status bar counts items as they arrive, and Escape
+  stops it.
+- **File operations with real progress**: copy, move, rename, delete to the trash,
+  conflict prompts, and a transfer that reports bytes while it runs.
+- **Dragging both ways, natively.** Files come in from Explorer, 7-Zip or a
+  browser and go back out to those same targets, implemented against the shell's
+  own data object and drop target rather than through a patched webview. An
+  archiver that deletes its temporary folder the instant the drag returns no
+  longer loses the files.
+- **Other programs' menu items**, read from Windows: registry verbs including
+  cascaded submenus, and the extensions whose items exist only because their DLL
+  builds them at runtime. "Customize this menu" groups everything by the program
+  that provides it, opens a group on hover, and loads a third-party extension only
+  when its switch is turned on. Registrations that cannot be read are named with
+  the reason instead of quietly missing.
+- **Open with**, on every platform: the applications that declare they can open
+  the file's type, with the current default marked and preselected, and the choice
+  can be made permanent where the platform allows it.
+- **Properties**, with what a file can say for itself: an image's dimensions and
+  aspect ratio, a text file's lines and words, a folder's contents, and the size
+  and timestamps of anything at all. The preview pane shows the same facts beside
+  the list.
+- **Appearance** follows the desktop or is held to light or dark, and each
+  platform is asked in its own place: the registry on Windows, `defaults` on
+  macOS, `gsettings` on freedesktop.
 
-- **Dragging out of 7-Zip, WinRAR or any other app now arrives intact.** An
-  archiver extracts into a temp folder and deletes it when `DoDragDrop` returns —
-  after wry has read `CF_HDROP` but before Tauri's queued event reaches the
-  webview. Worse, 7-Zip names only the *empty* temp folder at `DragEnter` and
-  extracts the members inside `IDropTarget::Drop`. A small documented patch to
-  wry calls back into Rust at exactly that moment, while the bytes exist; every
-  path under the system temp directory is held by hard link in a Lyre-owned
-  folder until the paste finishes. Detection is generic, so an unrecognised
-  archiver, browser or mail client works without a special case. Files outside
-  temp are never touched, and a source file is never renamed away.
-- **Dragging out of Lyre works with browsers and other copy-only targets.** The
-  drag source now advertises both copy and move rather than a single effect, so
-  the target picks the one it supports. Its plugin module and icon are warmed at
-  startup, because `DoDragDrop` has to begin while the button is still down; a
-  release that arrives first abandons the drag instead of dropping the files on
-  whatever window is under the cursor.
-- **Dropping onto the background of an open folder now works.** The background
-  drop zone used to live only on the file-list scroller, which is not rendered
-  for an empty folder; the column header and status bar are its siblings. A drop
-  on any of them found no target and was silently discarded, while dropping on a
-  folder row worked because rows carry their own zone. The content area and the
-  preview pane now stand for the folder on screen, and nearer zones still win.
-  Home and This PC are deliberately excluded: their paths are labels, not
-  directories.
-- **"Add to favorites" appeared twice in Customize this menu.** Windows registers
-  an "Add to Favorites" verb that duplicates Lyre's own row. A system entry whose
-  name matches one of Lyre's items in that menu is now left out, and each submenu
-  deduplicates against itself. A group left with no children is dropped rather
-  than becoming a clickable row, and an "Open" inside a program's own submenu is
-  left alone.
-- **The missing "Scan with Bitdefender" is explained rather than silent.** It is
-  a Windows 11 modern context menu command declared in a sparse MSIX package
-  (`desktop4:FileExplorerContextMenus`), not a verb or a `ContextMenuHandlers`
-  entry, so the classic walk cannot see it. The customise list now states that
-  gap, and `print_shell_verb_registrations` prints classic verb keys and
-  packaged-COM packages side by side.
-- **A registration that failed to load no longer looks like one that does not
-  exist.** Loading a menu handler means loading someone else's DLL. A missing DLL,
-  a refused selection or an unsupported initialiser were all swallowed, so the
-  item simply was not there. "Customize this menu" now names the program, the
-  class id and the reason; the ignored test
-  `print_what_the_installed_handlers_offer` prints the same for a whole machine.
-- **Handlers written against the newer initialisers are read.** Only
-  `IShellExtInit` was asked for, so a handler implementing
-  `IInitializeWithItem` or `IInitializeWithFile` instead never drew anything.
-  All three are tried, in that order.
-- **Background menu items are no longer all credited to Windows.** The folder's
-  own menu arrives whole, so there is no honest way to say which program owns a
-  row. Lyre now says nothing rather than filing a third party's item as a system
-  one.
-- **Linux and macOS no longer show a message about the Windows registry.** Each
-  says why other programs' items are unavailable in its own terms, and both show
-  only Lyre's own items. A menu id can no longer name a registry key outside the
-  one it was read from.
-- **PRODUCT.md described the first-pass plan as shipped state.** File operations,
-  search, drag and drop, thumbnails and the preview pane had all shipped, and the
-  signed update check is the one network request.
-- **`bun buildit` clears older installers from `build/`.** A build from a previous
-  version used to leave its `.exe`/`.msi` beside the new ones. `.workbuddy-ai/` is
-  now ignored by git and left out of the Windows build copy.
+### Notes for this version
+
+- Icons come from the packaging that already existed: a resource compiled into the
+  Windows binary, the `.app` bundle on macOS, the `.desktop` entry on Linux.
+  Release builds are window-subsystem binaries, so no console appears behind the
+  window.
+- Updates are signed and checked against the key compiled into the application. A
+  **0.2.0 AppImage on Linux cannot update itself to this version** and needs one
+  manual install: writing over a running AppImage is refused by the kernel, and
+  that fix only exists in 0.3.0's own updater. Windows updates from 0.2.0
+  normally; on macOS the archive is still opened for you and has to be moved into
+  place by hand.
+- Windows 11's modern context menu items are still not read. They are activated
+  through COM and draw their own menu, so nothing about them is reachable from the
+  registry, and the customize list says so rather than leaving a gap.
 
 ## [0.2.0]
 

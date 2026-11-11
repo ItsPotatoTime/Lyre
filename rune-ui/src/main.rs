@@ -32,6 +32,7 @@ mod fileops;
 mod frame;
 mod handlers;
 mod imagery;
+mod metadata;
 mod openwith;
 mod osdrag;
 mod search;
@@ -441,6 +442,8 @@ enum Dialog {
     NewFolder { parent: PathBuf, edit: TextEdit },
     DefaultManager,
     Update,
+    /// What can be said about one item, gathered when the dialog opens.
+    Properties(Box<metadata::Details>),
     /// `data` is None while the platform is still being asked; `selected` holds
     /// the app id the Open button would launch.
     OpenWith {
@@ -4375,8 +4378,20 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                     h += 9.0;
                     if menu_visible(s, "properties") {
                         rows.push(
-                            menu_item(p, "Properties", Some(Ico::Info), None, false).on_press(|s: &mut App| {
-                                s.preview = true;
+                            menu_item(p, "Properties", Some(Ico::Info), None, false).on_press(move |s: &mut App| {
+                                let entry = if s.searching {
+                                    s.search_hits.get(target).map(|h| &h.entry)
+                                } else {
+                                    s.entries.get(target)
+                                };
+                                if let Some(entry) = entry {
+                                    let details = metadata::describe(
+                                        Path::new(&entry.path),
+                                        entry.is_dir,
+                                        &kind_label(entry.kind),
+                                    );
+                                    s.dialog = Some(Dialog::Properties(Box::new(details)));
+                                }
                                 s.menu = None;
                             }),
                         );
@@ -5069,6 +5084,23 @@ fn check_box(p: Paint, on: bool) -> El {
     }
 }
 
+/// One label/value line of the Properties dialog.
+fn property_row(p: Paint, label: &str, value: &str) -> El {
+    row()
+        .w_full()
+        .gap(12.0)
+        .items_center()
+        .child(text(label).font(CAPTION).color(p.tertiary).w(92.0))
+        .child(
+            text(value)
+                .font(UI_TEXT)
+                .color(p.text)
+                .grow(1.0)
+                .min_w(0.0)
+                .truncate(),
+        )
+}
+
 /// The modal dialog: delete confirmation, paste conflict, rename or new folder.
 fn dialog_overlay(s: &App, p: Paint) -> El {
     let Some(dialog) = &s.dialog else {
@@ -5441,6 +5473,55 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
                 );
             }
             panel.child(footer)
+        }
+        Dialog::Properties(details) => {
+            let mut rows = col()
+                .key("properties-rows")
+                .w_full()
+                .gap(6.0)
+                .child(property_row(p, "Type", &details.kind));
+            if details.size > 0 {
+                rows = rows.child(property_row(p, "Size", &details.size_label()));
+            }
+            if !details.location.is_empty() {
+                rows = rows.child(property_row(p, "Location", &details.location));
+            }
+            for (label, at) in [
+                ("Modified", details.modified),
+                ("Created", details.created),
+                ("Accessed", details.accessed),
+            ] {
+                if let Some(at) = at {
+                    rows = rows.child(property_row(p, label, &format_time(at)));
+                }
+            }
+            // Whatever the type itself could tell us: dimensions, a text file's
+            // shape, what a folder holds.
+            for (label, value) in &details.extra {
+                rows = rows.child(property_row(p, label, value));
+            }
+            base()
+                .child(
+                    text(format!("Properties: {}", details.name))
+                        .font(TILE_TEXT)
+                        .color(p.text)
+                        .truncate(),
+                )
+                .child(
+                    col()
+                        .key("properties-scroll")
+                        .w_full()
+                        .max_h(320.0)
+                        .scroll(ScrollSpec { stick_bottom: false })
+                        .child(rows),
+                )
+                .child(
+                    row()
+                        .w_full()
+                        .gap(8.0)
+                        .child(el().grow(1.0))
+                        .child(dialog_button(p, "Close", true).on_press(|s: &mut App| s.dialog = None)),
+                )
         }
     };
     el().key("dialog-overlay")
@@ -8595,6 +8676,9 @@ mod customize_tests {
         std::fs::write(&file, b"x").unwrap();
 
         let mut s = init();
+        // Start from nothing allowed: the saved settings may already hold an
+        // extension the person switched on.
+        s.handler_loaded.clear();
         s.customize_open = true;
         s.customize_path = Some(file.to_string_lossy().into_owned());
         s.customize_is_dir = false;

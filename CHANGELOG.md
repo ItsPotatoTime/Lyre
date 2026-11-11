@@ -53,6 +53,11 @@ release notes rather than a second copy of them.
 
 ### Changed
 
+- **Folders open without waiting.** The directory read moved off the UI thread.
+  Navigating shows "Reading folder…" with a running item count in the status bar,
+  Escape stops it, and a slow or very large folder no longer freezes the window.
+  An answer that arrives for a folder you have already left is dropped rather than
+  drawn over the one you are looking at.
 - **What other programs add to the menu is off until it is asked for.** Every
   system verb, handler and background item now starts disabled, so installing an
   application cannot change what a right-click does. They stay listed in

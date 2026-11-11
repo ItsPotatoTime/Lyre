@@ -404,6 +404,22 @@ struct Transfer {
     stopping: bool,
 }
 
+/// What a folder scan reports back from its worker thread.
+enum ScanMsg {
+    /// How many entries have been read so far.
+    Progress(usize),
+    Done(Box<ScanDone>),
+}
+
+/// A finished scan. `path` is what it was asked for, so an answer that lands
+/// after the person has moved on can be recognised and dropped.
+struct ScanDone {
+    path: PathBuf,
+    entries: Vec<Entry>,
+    scan_ms: f64,
+    cancelled: bool,
+}
+
 /// Messages from the operation worker thread, drained in `poll`.
 enum OpMsg {
     Progress(fileops::Progress),
@@ -766,6 +782,13 @@ struct App {
     /// Per-type facts for the previewed item, memoised by path: reading a file
     /// for its metadata must not happen on every frame the pane is drawn.
     preview_facts: RefCell<Option<(String, Vec<metadata::Fact>)>>,
+    /// The folder scan in flight: its channel, the folder it was asked for, and
+    /// the flag that stops it.
+    scan_rx: Option<std::sync::mpsc::Receiver<ScanMsg>>,
+    scan_want: Option<PathBuf>,
+    scan_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// How many entries the running scan has reached, for the status bar.
+    scan_seen: usize,
     /// The open modal dialog (delete confirm, paste conflict, rename, new folder).
     dialog: Option<Dialog>,
     /// The "Open with" worker's answer: listing applications touches the disk
@@ -1043,11 +1066,31 @@ fn format_time(secs: u64) -> String {
     format!("{m}/{d}/{y}  {h12}:{:02} {ampm}", (within % 3600) / 60)
 }
 
+/// Scan a folder with nothing able to stop it. Used where there is nobody to
+/// cancel: the first frame, and the watcher's own rescan.
 pub(crate) fn scan(path: &Path) -> (Vec<Entry>, f64) {
+    scan_until(path, &std::sync::atomic::AtomicBool::new(false), |_| {})
+}
+
+/// Scan a folder, giving up when `cancel` is set and reporting how many items
+/// have been read so far. A folder of many thousand entries takes long enough
+/// that the window must not sit and wait for it.
+pub(crate) fn scan_until(
+    path: &Path,
+    cancel: &std::sync::atomic::AtomicBool,
+    mut progress: impl FnMut(usize),
+) -> (Vec<Entry>, f64) {
+    use std::sync::atomic::Ordering;
+
     let start = Instant::now();
     let mut entries = Vec::new();
     if let Ok(reader) = fs::read_dir(path) {
         for item in reader.flatten() {
+            // Checked per entry, so a cancelled read stops where it is rather
+            // than at the end of the folder.
+            if cancel.load(Ordering::Relaxed) {
+                break;
+            }
             let name = item.file_name().to_string_lossy().into_owned();
             let Ok(meta) = item.metadata() else { continue };
             let is_dir = meta.is_dir();
@@ -1083,6 +1126,11 @@ pub(crate) fn scan(path: &Path) -> (Vec<Entry>, f64) {
                 fixture: false,
                 fixture_size: String::new(),
             });
+            // Rare enough not to matter per entry, often enough that a slow
+            // folder visibly counts up.
+            if entries.len() % 256 == 0 {
+                progress(entries.len());
+            }
         }
     }
     entries.sort_by(|a, b| {
@@ -1599,6 +1647,12 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
     if s.update_busy {
         tx.wake_after(std::time::Duration::from_millis(60));
     }
+    changed |= drain_scan(s);
+    if s.scan_rx.is_some() {
+        // Keep frames coming so the count climbing is visible and the answer is
+        // picked up promptly.
+        tx.wake_after(std::time::Duration::from_millis(30));
+    }
     changed |= drain_openwith(s);
     if s.openwith_rx.is_some() {
         tx.wake_after(std::time::Duration::from_millis(16));
@@ -1650,13 +1704,98 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
     changed
 }
 
+/// Stop the scan in flight, if there is one, and forget its answer.
+fn cancel_scan(s: &mut App) {
+    use std::sync::atomic::Ordering;
+
+    if let Some(cancel) = s.scan_cancel.take() {
+        cancel.store(true, Ordering::Relaxed);
+    }
+    s.scan_rx = None;
+    s.scan_want = None;
+    s.scan_seen = 0;
+}
+
+/// Read the folder at `s.root` on a worker thread, so a slow one never freezes
+/// the window. Progress and the finished list arrive through `drain_scan`.
+fn begin_scan(s: &mut App) {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    cancel_scan(s);
+    let path = s.root.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    s.scan_rx = Some(rx);
+    s.scan_want = Some(path.clone());
+    s.scan_cancel = Some(cancel.clone());
+    let waker = s.waker.clone();
+    let flag = cancel.clone();
+    std::thread::spawn(move || {
+        let (entries, scan_ms) = scan_until(&path, &flag, |seen| {
+            let _ = tx.send(ScanMsg::Progress(seen));
+        });
+        let cancelled = flag.load(Ordering::Relaxed);
+        let answer = ScanDone {
+            path,
+            entries,
+            scan_ms,
+            cancelled,
+        };
+        if tx.send(ScanMsg::Done(Box::new(answer))).is_ok()
+            && let Some(wake) = waker
+        {
+            wake();
+        }
+    });
+}
+
+/// Drain the scan worker's messages; true to redraw.
+fn drain_scan(s: &mut App) -> bool {
+    let Some(rx) = s.scan_rx.take() else {
+        return false;
+    };
+    let mut done = None;
+    let mut changed = false;
+    while let Ok(msg) = rx.try_recv() {
+        match msg {
+            ScanMsg::Progress(seen) => {
+                s.scan_seen = seen;
+                changed = true;
+            }
+            ScanMsg::Done(result) => done = Some(result),
+        }
+    }
+    let Some(result) = done else {
+        // Still reading; keep the receiver for the next frame.
+        s.scan_rx = Some(rx);
+        return changed;
+    };
+    // An answer for a folder the person has already left is dropped, and the
+    // scan actually wanted keeps both its channel and its cancel flag.
+    if s.scan_want.as_deref() != Some(result.path.as_path()) {
+        s.scan_rx = Some(rx);
+        return changed;
+    }
+    s.scan_want = None;
+    s.scan_cancel = None;
+    s.scan_seen = 0;
+    if result.cancelled {
+        return changed;
+    }
+    s.entries = result.entries;
+    s.scan_ms = result.scan_ms;
+    refresh_visible(s);
+    true
+}
+
+/// Navigate to a folder and start reading it.
 fn set_location(s: &mut App, path: PathBuf) {
     clear_search(s);
     s.address_edit = None;
     s.drag = None;
     s.drag_press = None;
     s.os_hover = None;
-    let (entries, scan_ms) = scan(&path);
     let crumbs: Vec<String> = path
         .components()
         .map(|part| part.as_os_str().to_string_lossy().into_owned())
@@ -1664,8 +1803,10 @@ fn set_location(s: &mut App, path: PathBuf) {
         .collect();
     let tab = crumbs.last().cloned().unwrap_or_else(|| "Lyre".into());
     s.root = path;
-    s.entries = entries;
-    s.scan_ms = scan_ms;
+    // The list fills in when the worker answers; until then the status bar says
+    // the folder is being read.
+    s.entries.clear();
+    s.scan_ms = 0.0;
     s.crumbs = crumbs;
     s.tab = tab.clone();
     s.search = format!("Search {tab}");
@@ -1679,6 +1820,7 @@ fn set_location(s: &mut App, path: PathBuf) {
     s.keep_order = false;
     s.count_override = None;
     refresh_visible(s);
+    begin_scan(s);
 }
 
 fn go(s: &mut App, path: PathBuf) {
@@ -2088,6 +2230,10 @@ fn init() -> App {
         op_cancel: None,
         menu_handler_rows: RefCell::new(None),
         preview_facts: RefCell::new(None),
+        scan_rx: None,
+        scan_want: None,
+        scan_cancel: None,
+        scan_seen: 0,
         dialog: None,
         openwith_rx: None,
         searching: false,
@@ -4392,7 +4538,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                                     let details = metadata::describe(
                                         Path::new(&entry.path),
                                         entry.is_dir,
-                                        &kind_label(entry.kind),
+                                        kind_label(entry.kind),
                                     );
                                     s.dialog = Some(Dialog::Properties(Box::new(details)));
                                 }
@@ -7013,6 +7159,12 @@ fn handle_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
             s.menu = None;
             return true;
         }
+        // A folder still being read is the next thing Escape should stop.
+        if s.scan_rx.is_some() {
+            cancel_scan(s);
+            s.notice = "Stopped reading the folder".into();
+            return true;
+        }
         return false;
     }
     if s.dialog.is_some() || s.search_edit.focused {
@@ -8301,7 +8453,16 @@ fn status_bar(s: &App, p: Paint) -> El {
             .child(text(elapsed.as_str()).font(CAPTION).color(p.tertiary));
     }
 
-    let middle = if s.notice.is_empty() {
+    // A folder being read says so, and counts up, rather than looking empty.
+    let reading = s.scan_rx.is_some();
+    let progress = if reading && s.scan_seen > 0 {
+        format!("Reading folder… {} items", s.scan_seen)
+    } else {
+        "Reading folder…".to_string()
+    };
+    let middle = if reading {
+        progress.as_str()
+    } else if s.notice.is_empty() {
         s.selection_detail.as_str()
     } else {
         s.notice.as_str()
@@ -8320,7 +8481,14 @@ fn status_bar(s: &App, p: Paint) -> El {
             })
     };
     bar.child(
-        text(if s.count == 1 { "1 item".to_string() } else { format!("{} items", s.count) })
+        text(if reading {
+            // The count is unknown until the read finishes.
+            String::new()
+        } else if s.count == 1 {
+            "1 item".to_string()
+        } else {
+            format!("{} items", s.count)
+        })
             .font(CAPTION)
             .color(p.secondary),
     )
@@ -8434,6 +8602,14 @@ fn main() {
                 let root = s.root.to_string_lossy().into_owned();
                 s.favorites = vec![root.clone(), format!("{}\\src", root)];
                 s.pinned = vec![root];
+            }),
+            ("reading", |s| {
+                load(s, Fixture::Downloads);
+                // A channel nothing ever answers, so the state is drawn as it
+                // looks while a folder is still being read.
+                let (_, rx) = std::sync::mpsc::channel();
+                s.scan_rx = Some(rx);
+                s.scan_seen = 1024;
             }),
             ("customize", |s| {
                 load(s, Fixture::Downloads);
@@ -8756,6 +8932,97 @@ mod customize_tests {
         );
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+
+    #[test]
+    fn a_cancelled_scan_reads_nothing() {
+        let dir = std::env::temp_dir().join(format!("lyre-scan-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in 0..64 {
+            std::fs::write(dir.join(format!("f{n}.txt")), b"x").unwrap();
+        }
+        let cancelled = std::sync::atomic::AtomicBool::new(true);
+        let (entries, _) = scan_until(&dir, &cancelled, |_| {});
+        assert!(entries.is_empty(), "nothing is read once cancelled");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_long_scan_reports_how_far_it_has_read() {
+        let dir = std::env::temp_dir().join(format!("lyre-scan-progress-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in 0..300 {
+            std::fs::write(dir.join(format!("f{n}.txt")), b"x").unwrap();
+        }
+        let never = std::sync::atomic::AtomicBool::new(false);
+        let mut seen = Vec::new();
+        let (entries, _) = scan_until(&dir, &never, |count| seen.push(count));
+        assert_eq!(entries.len(), 300);
+        assert_eq!(seen, vec![256], "progress is reported as the read advances");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn navigating_fills_the_list_from_the_worker() {
+        let dir = std::env::temp_dir().join(format!("lyre-scan-nav-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in 0..3 {
+            std::fs::write(dir.join(format!("f{n}.txt")), b"x").unwrap();
+        }
+
+        let mut s = init();
+        go(&mut s, dir.clone());
+        assert!(s.scan_rx.is_some(), "the read is handed to a worker");
+        assert!(s.entries.is_empty(), "and the list does not wait for it");
+
+        // Drain the way `poll` does until the worker answers.
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while s.scan_rx.is_some() && Instant::now() < deadline {
+            drain_scan(&mut s);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(s.scan_rx.is_none(), "the worker finished in time");
+        assert_eq!(s.entries.len(), 3, "its answer became the list");
+        assert_eq!(s.root, dir);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_answer_for_a_folder_already_left_is_dropped() {
+        let mut s = init();
+        let shown = s.root.clone();
+        s.scan_want = Some(PathBuf::from("elsewhere"));
+        let (tx, rx) = std::sync::mpsc::channel();
+        s.scan_rx = Some(rx);
+
+        tx.send(ScanMsg::Done(Box::new(ScanDone {
+            path: shown.clone(),
+            entries: Vec::new(),
+            scan_ms: 1.0,
+            cancelled: false,
+        })))
+        .unwrap();
+
+        drain_scan(&mut s);
+        assert_eq!(s.root, shown, "the folder on screen does not change");
+        assert!(
+            s.scan_rx.is_some(),
+            "the scan actually wanted keeps its channel"
+        );
+        assert_eq!(
+            s.scan_want.as_deref(),
+            Some(Path::new("elsewhere")),
+            "and is still the one waited for"
+        );
     }
 }
 

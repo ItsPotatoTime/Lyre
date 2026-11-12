@@ -81,6 +81,12 @@ mod imp {
     /// The last side button pressed, for `poll` to take: 1 is back, 2 forward.
     static SIDE_BUTTON: AtomicU8 = AtomicU8::new(0);
     const WM_XBUTTONUP: u32 = 0x020C;
+    /// A browser Back or Forward key, or a mouse that reports its side buttons
+    /// this way rather than as an X button.
+    const WM_APPCOMMAND: u32 = 0x0319;
+    /// `GET_APPCOMMAND_LPARAM` of the high word: the command, without its flags.
+    const APPCOMMAND_BROWSER_BACKWARD: usize = 1;
+    const APPCOMMAND_BROWSER_FORWARD: usize = 2;
 
     #[repr(C)]
     struct Rect {
@@ -203,6 +209,23 @@ mod imp {
                 }
                 // Handled: returning zero would let the default proc beep.
                 return 1;
+            }
+            // Not every device reports the browser buttons as an X button:
+            // keyboards with Back/Forward keys, and some mice, send them as an
+            // app command instead. Both land on the same history step.
+            if msg == WM_APPCOMMAND {
+                let command = ((lparam >> 16) & 0x0FFF) as usize;
+                let which = match command {
+                    APPCOMMAND_BROWSER_BACKWARD => 1,
+                    APPCOMMAND_BROWSER_FORWARD => 2,
+                    _ => 0,
+                };
+                if which != 0 {
+                    SIDE_BUTTON.store(which, Ordering::Relaxed);
+                    RedrawWindow(hwnd, std::ptr::null(), std::ptr::null_mut(), RDW_INTERNALPAINT);
+                    // Handled, so Windows does not pass it on to the shell.
+                    return 1;
+                }
             }
             DefSubclassProc(hwnd, msg, wparam, lparam)
         }

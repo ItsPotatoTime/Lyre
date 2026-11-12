@@ -1889,12 +1889,14 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
         osdrag::win::request_start(hwnd, paths, preview);
     }
     // The mouse's side buttons walk the same history as Alt+Left and Alt+Right.
-    // `poll` runs before the frame is drawn, so the change is on screen already.
-    match frame::take_side_button() {
+    // `poll` runs before the frame is drawn, so the change is on screen already,
+    // as long as it is reported below: a step onto a page starts no scan, so
+    // nothing else would mark the frame.
+    let stepped = match frame::take_side_button() {
         Some(1) => go_back(s),
         Some(2) => go_forward(s),
-        _ => {}
-    }
+        _ => false,
+    };
     // Remember the window's size, but only once a resize has stopped. Rune has no
     // resize event, so it is sampled here; writing the settings on every frame of
     // a drag would be wasteful, and nothing else would wake the window after the
@@ -1937,7 +1939,9 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
             }
         }
     }
-    let mut changed = drain_op(s);
+    // A step taken from the side buttons is a change the view reads, and a step
+    // back to a page starts no scan whose answer would mark the frame otherwise.
+    let mut changed = drain_op(s) || stepped;
     // Keep frames coming while a transfer runs so its progress drains promptly.
     if s.transfer.is_some() {
         tx.wake_after(std::time::Duration::from_millis(60));
@@ -2297,7 +2301,10 @@ fn open_this_pc(s: &mut App) {
     refresh_volumes(s);
 }
 
-fn go_back(s: &mut App) {
+/// Step back, reporting whether the window has something new to draw: `poll`
+/// asks for a frame only when it is told so, and a step back to a page starts no
+/// scan whose answer would mark the frame instead.
+fn go_back(s: &mut App) -> bool {
     match s.history.pop() {
         Some(previous) => {
             s.forward.push(spot_of(s));
@@ -2305,9 +2312,11 @@ fn go_back(s: &mut App) {
         }
         None => s.notice = "Nothing to go back to".into(),
     }
+    true
 }
 
-fn go_forward(s: &mut App) {
+/// Step forward, with the same report as `go_back`.
+fn go_forward(s: &mut App) -> bool {
     match s.forward.pop() {
         Some(next) => {
             s.history.push(spot_of(s));
@@ -2315,6 +2324,7 @@ fn go_forward(s: &mut App) {
         }
         None => s.notice = "Nothing to go forward to".into(),
     }
+    true
 }
 
 /// Whether Up has somewhere to go.
@@ -4050,8 +4060,12 @@ fn nav_button(p: Paint, which: Ico, key: &str, action: usize, enabled: bool, tip
         .help(tip)
         .disabled(!enabled)
         .on_press(move |s: &mut App| match action {
-            0 => go_back(s),
-            1 => go_forward(s),
+            0 => {
+                go_back(s);
+            }
+            1 => {
+                go_forward(s);
+            }
             2 => go_up(s),
             _ => {
                 let path = s.root.clone();

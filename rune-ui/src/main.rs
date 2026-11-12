@@ -2648,6 +2648,7 @@ fn load(s: &mut App, f: Fixture) {
 }
 
 fn init() -> App {
+    let started = std::time::Instant::now();
     // Where to start. An explicit path is a request: the folder handler passing a
     // folder to open, or LYRE_RUNE_PATH for development. With neither, the window
     // opens on Quick Access rather than on whatever folder the process happened
@@ -2665,7 +2666,9 @@ fn init() -> App {
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
         }),
     };
+    let scan_at = std::time::Instant::now();
     let (entries, scan_ms) = scan(&root);
+    timing("init scan", scan_at);
     let crumbs: Vec<String> = root
         .components()
         .map(|p| p.as_os_str().to_string_lossy().into_owned())
@@ -2842,6 +2845,7 @@ fn init() -> App {
     refresh_visible(&mut app);
     app.tabs = vec![capture_tab(&app)];
     app.active_tab = 0;
+    timing("init total", started);
     app
 }
 
@@ -3902,6 +3906,14 @@ fn place_glyph(index: usize, size: f32) -> El {
 // ----------------------------------------------------------------- view ----
 
 fn view(s: &App, cx: &mut Cx<App>) -> El {
+    {
+        static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+        if FIRST.swap(false, std::sync::atomic::Ordering::Relaxed)
+            && let Some(start) = PROCESS_START.get()
+        {
+            timing("first view (since launch)", *start);
+        }
+    }
     let p = paint(s.dark, cx.env().scale);
     s.scale.set(cx.env().scale);
     // The thumb is a window-level overlay driven by the Files viewport; when
@@ -10072,7 +10084,18 @@ fn record_panics() {
     }));
 }
 
+/// When the process started, for the timing probe's "since launch" numbers.
+static PROCESS_START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// Probe: how long a step of startup took, when LYRE_TIMING is set.
+fn timing(label: &str, since: std::time::Instant) {
+    if std::env::var_os("LYRE_TIMING").is_some() {
+        eprintln!("[timing] {label}: {:.1} ms", since.elapsed().as_secs_f64() * 1000.0);
+    }
+}
+
 fn main() {
+    let start = *PROCESS_START.get_or_init(std::time::Instant::now);
     record_panics();
     // A launch the shell meant for Explorer itself (a /select reveal, a shell
     // namespace) is handed back rather than opened as a folder.
@@ -10082,6 +10105,7 @@ fn main() {
     // Before any window opens, so the first frame already shows the favorites
     // and pins the 0.2 application left behind.
     import_legacy_library();
+    timing("legacy import", start);
     let spec = AppSpec::<App> {
         scenes: &[
             ("dark", |s| {
@@ -10288,17 +10312,30 @@ fn main() {
         ],
         poll: Some(poll),
         on_key: Some(handle_key),
-        fonts: load_fonts(),
+        fonts: {
+            let at = std::time::Instant::now();
+            let fonts = load_fonts();
+            timing("fonts", at);
+            fonts
+        },
         families: ("Segoe UI, Inter", "Consolas, IBM Plex Mono"),
         ..AppSpec::new("Lyre", (1076.0, 600.0), init, view)
     };
-    let probe = init();
-    eprintln!(
-        "lyre-rune: {} entries in {} in {:.2} ms",
-        probe.entries.len(),
-        probe.root.display(),
-        probe.scan_ms
-    );
+    // The launch used to build a whole second App here just to say what it had
+    // scanned: one folder read and every preference, twice, before the window
+    // existed. The entry count is a development aid, so it is only asked for
+    // when someone asks for it.
+    if std::env::var_os("LYRE_REPORT_SCAN").is_some() {
+        let at = std::time::Instant::now();
+        let probe = init();
+        timing("probe init", at);
+        eprintln!(
+            "lyre-rune: {} entries in {} in {:.2} ms",
+            probe.entries.len(),
+            probe.root.display(),
+            probe.scan_ms
+        );
+    }
     // One window, no system frame. The tab strip is the titlebar now, so the
     // drawn minimize/maximize/close controls and window_drag own that job;
     // leaving decorations on would stack a second, native bar above it.

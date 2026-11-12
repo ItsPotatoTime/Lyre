@@ -22,6 +22,14 @@ release notes rather than a second copy of them.
 
 ### Changed
 
+- **A launch builds one App, not two.** `main` constructed a whole second App
+  before the window existed, only to print what it had scanned: one folder read
+  and every preference, twice. That count is now printed only when
+  `LYRE_REPORT_SCAN` asks for it, and `LYRE_TIMING=1` prints what each step of the
+  launch cost. With it, a launch on this machine is 27 ms to load the executable,
+  11 ms of the app's own work, and about 1.35 s inside Rune creating the GPU
+  device and its render pipelines, which is where the rest of the wait is.
+
 - **The window goes much smaller, and the layout holds.** The floor was 760 by
   480; it is now 400 by 280. Below about 700 points of width the command bar
   keeps its icons and drops their words, below 560 the file-operation buttons

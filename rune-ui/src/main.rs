@@ -514,6 +514,8 @@ enum Undo {
     Copied { pairs: Vec<(PathBuf, PathBuf)> },
     /// Items were moved away, so taking it back puts each one back.
     Moved { pairs: Vec<(PathBuf, PathBuf)> },
+    /// Items went to the trash, so taking it back brings them out again.
+    Trashed { items: Vec<fileops::Trashed> },
 }
 
 /// Messages from the update worker thread, drained in `poll`.
@@ -7841,6 +7843,9 @@ fn take_back(action: &Undo) -> Result<(), String> {
             }
             Ok(())
         }
+        Undo::Trashed { items } => {
+            fileops::restore(items).map_err(|e| format!("Could not take it out of the trash: {e}"))
+        }
     }
 }
 
@@ -7863,6 +7868,14 @@ fn put_back(action: &Undo) -> Result<(), String> {
                 fs::rename(from, to).map_err(|e| format!("Could not move it again: {e}"))?;
             }
             Ok(())
+        }
+        Undo::Trashed { items } => {
+            // Deleting again: the originals are what the trash recorded.
+            let paths: Vec<PathBuf> = items.iter().map(|item| item.original.clone()).collect();
+            let cancel = std::sync::atomic::AtomicBool::new(false);
+            fileops::delete(fileops::DeleteMode::Trash, &paths, &cancel, |_| true)
+                .map(|_| ())
+                .map_err(|e| format!("Could not delete it again: {e}"))
         }
     }
 }
@@ -7936,9 +7949,16 @@ fn start_delete(s: &mut App, mode: fileops::DeleteMode, paths: Vec<PathBuf>) {
             !worker_cancel.load(Ordering::Relaxed)
         };
         let result = fileops::delete(mode, &paths, &worker_cancel, emit);
-        // A delete is not taken back: to the trash it could be, but only by
-        // going through the shell's own recycle bin, which this does not do.
-        let _ = tx.send(OpMsg::Done { outcome: result, undo: None });
+        // A delete to the trash can be taken back; a permanent one cannot, so it
+        // records nothing to undo.
+        let (outcome, undo) = match result {
+            Ok(deleted) => {
+                let undo = (!deleted.trashed.is_empty()).then_some(Undo::Trashed { items: deleted.trashed });
+                (Ok(deleted.count), undo)
+            }
+            Err(e) => (Err(e), None),
+        };
+        let _ = tx.send(OpMsg::Done { outcome, undo });
     });
 }
 
@@ -11749,6 +11769,34 @@ mod undo_tests {
         undo_last(&mut s);
         assert_eq!(s.notice, "Nothing to undo");
         assert!(s.undo.is_empty() && s.redo.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The reported wish: a delete goes to the trash and comes back out of it.
+    #[test]
+    fn undo_brings_a_deleted_file_back_out_of_the_trash() {
+        let dir = scratch("trash");
+        let file = dir.join("gone.txt");
+        std::fs::write(&file, b"content").unwrap();
+        let mut s = open(&dir);
+        s.entries = scan(&dir).0;
+        s.visible = (0..s.entries.len()).collect();
+        select_all(&mut s);
+        start_delete(&mut s, fileops::DeleteMode::Trash, vec![file.clone()]);
+        wait(&mut s);
+        if file.exists() {
+            // A machine whose bin is turned off cannot delete this way at all.
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        assert_eq!(s.undo.len(), 1, "the delete is on the undo stack");
+
+        undo_last(&mut s);
+        assert!(file.exists(), "undo brought it back out of the trash");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "content");
+
+        redo_last(&mut s);
+        assert!(!file.exists(), "redo deleted it again");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -182,6 +182,69 @@ fn copy_link(_src: &Path, _dst: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// What a delete left behind, enough to put the item back: where it came from,
+/// when it went, and, where the trash is a folder this wrote to, where it is now
+/// and the note that names it.
+#[derive(Clone)]
+pub struct Trashed {
+    pub original: PathBuf,
+    pub when: std::time::SystemTime,
+    /// Where the item was put, and the note that names where it came from, on
+    /// systems whose trash is a folder this wrote to. On Windows the bin is the
+    /// shell's, and its own records answer both.
+    #[cfg(unix)]
+    pub trashed: Option<PathBuf>,
+    #[cfg(unix)]
+    pub info: Option<PathBuf>,
+}
+
+/// A finished delete: how many went, and what can be brought back.
+pub struct Deleted {
+    pub count: usize,
+    pub trashed: Vec<Trashed>,
+}
+
+/// Put deleted items back where they came from, newest first, so a folder is
+/// restored before anything that was inside it.
+pub fn restore(items: &[Trashed]) -> Result<(), String> {
+    for item in items.iter().rev() {
+        restore_one(item)?;
+    }
+    Ok(())
+}
+
+/// Bring one item back out of the trash.
+#[cfg(windows)]
+fn restore_one(item: &Trashed) -> Result<(), String> {
+    recycle::restore(&item.original, item.when)
+}
+
+/// Bring one item back out of the freedesktop trash, whose own note names where
+/// it came from.
+#[cfg(unix)]
+fn restore_one(item: &Trashed) -> Result<(), String> {
+    let (Some(trashed), Some(info)) = (item.trashed.as_ref(), item.info.as_ref()) else {
+        return Err("That deletion cannot be taken back.".into());
+    };
+    if item.original.exists() {
+        return Err(format!(
+            "{} is there again already.",
+            item.original.display()
+        ));
+    }
+    if let Some(parent) = item.original.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::rename(trashed, &item.original).map_err(|e| format!("Could not take it out of the trash: {e}"))?;
+    let _ = fs::remove_file(info);
+    Ok(())
+}
+
+#[cfg(not(any(windows, unix)))]
+fn restore_one(_item: &Trashed) -> Result<(), String> {
+    Err("Taking a deletion back is not available on this system.".into())
+}
+
 fn remove_item(path: &Path) -> Result<(), String> {
     let meta = fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if meta.is_dir() {
@@ -189,6 +252,42 @@ fn remove_item(path: &Path) -> Result<(), String> {
     } else {
         fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()))
     }
+}
+
+/// One Recycle Bin record: where the item came from and when it was deleted.
+///
+/// The file holds an 8-byte version, the size, the deletion time as a FILETIME,
+/// then the path: a fixed 260 UTF-16 units in the older format, or a length and
+/// then the path in the one Vista and later write.
+#[cfg(windows)]
+fn parse_i(data: &[u8]) -> Option<(PathBuf, u64)> {
+    if data.len() < 28 {
+        return None;
+    }
+    let version = u64::from_le_bytes(data[0..8].try_into().ok()?);
+    let deleted = u64::from_le_bytes(data[16..24].try_into().ok()?);
+    // The path is the rest of the record, ended by a NUL: the length before it
+    // is counted in characters by some writers and in bytes by others, so the
+    // terminator is the one thing that means the same thing either way.
+    let raw: &[u8] = match version {
+        1 => &data[24..],
+        2 => &data[28..],
+        _ => return None,
+    };
+    if raw.len() < 4 {
+        return None;
+    }
+    let units: Vec<u16> = raw
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .take_while(|unit| *unit != 0)
+        .collect();
+    if units.is_empty() {
+        return None;
+    }
+    Some((PathBuf::from(String::from_utf16_lossy(&units)), deleted))
 }
 
 /// Take an item away, for a step being undone. A folder goes with everything in
@@ -293,11 +392,12 @@ pub fn delete<F: FnMut(Progress) -> bool>(
     paths: &[PathBuf],
     cancel: &AtomicBool,
     mut emit: F,
-) -> Result<usize, String> {
+) -> Result<Deleted, String> {
     let total = paths.len();
     let total_bytes: u64 = paths.iter().map(|p| item_size(p)).sum();
     let mut done_bytes = 0u64;
     let mut deleted = 0usize;
+    let mut trashed: Vec<Trashed> = Vec::new();
     for (i, path) in paths.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             break;
@@ -309,13 +409,13 @@ pub fn delete<F: FnMut(Progress) -> bool>(
         let size = item_size(path);
         match mode {
             DeleteMode::Permanent => remove_item(path)?,
-            DeleteMode::Trash => trash_one(path)?,
+            DeleteMode::Trash => trashed.push(trash_one(path)?),
         }
         done_bytes += size;
         deleted += 1;
         emit(Progress { done: i + 1, total, name, done_bytes, total_bytes });
     }
-    Ok(deleted)
+    Ok(Deleted { count: deleted, trashed })
 }
 
 pub fn create_folder(parent: &Path, name: &str) -> Result<PathBuf, String> {
@@ -342,13 +442,16 @@ pub fn rename(path: &Path, new_name: &str) -> Result<PathBuf, String> {
 // ---------------------------------------------------------------------------
 
 #[cfg(windows)]
-fn trash_one(path: &Path) -> Result<(), String> {
-    recycle::send(&[path])
+fn trash_one(path: &Path) -> Result<Trashed, String> {
+    let when = std::time::SystemTime::now();
+    recycle::send(&[path])?;
+    Ok(Trashed { original: path.to_path_buf(), when })
 }
 
 #[cfg(windows)]
 mod recycle {
     use std::ffi::c_void;
+    use std::fs;
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
 
@@ -402,10 +505,111 @@ mod recycle {
             Err(format!("Windows would not move it to the Recycle Bin (code {result})."))
         }
     }
+
+    /// Put one item back where it came from, by finding its record in the bin.
+    ///
+    /// The bin keeps two files per deletion: `$I…`, which names the original
+    /// path and when it went, and `$R…`, which holds the item. Restoring is what
+    /// Explorer does when it takes one out: move the content back and drop the
+    /// record.
+    pub fn restore(original: &Path, when: std::time::SystemTime) -> Result<(), String> {
+        let want = original.to_string_lossy().to_lowercase();
+        // Only the bin of the drive it came from can hold it: a machine with
+        // four drives would otherwise be searched four times over.
+        let drive = original
+            .components()
+            .next()
+            .map(|part| part.as_os_str().to_string_lossy().trim_end_matches(':').to_string());
+        let mut best: Option<(i64, std::path::PathBuf, std::path::PathBuf)> = None;
+        for record in records(drive.as_deref()) {
+            if record.original.to_string_lossy().to_lowercase() != want {
+                continue;
+            }
+            let Some(deleted) = from_filetime(record.deleted) else { continue };
+            let delta = match (deleted.duration_since(when), when.duration_since(deleted)) {
+                (Ok(later), _) => later.as_secs() as i64,
+                (Err(_), Ok(earlier)) => -(earlier.as_secs() as i64),
+                _ => continue,
+            };
+            // The same name can be deleted twice; the deletion moment says which.
+            if delta.abs() > 300 {
+                continue;
+            }
+            if best.as_ref().is_none_or(|(seen, ..)| delta.abs() < seen.abs()) {
+                best = Some((delta, record.info, record.content));
+            }
+        }
+        let Some((_, info, content)) = best else {
+            return Err(format!(
+                "{} is not in the Recycle Bin any more.",
+                original.display()
+            ));
+        };
+        if original.exists() {
+            return Err(format!("{} is there again already.", original.display()));
+        }
+        if let Some(parent) = original.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        fs::rename(&content, original)
+            .map_err(|e| format!("Could not take it out of the Recycle Bin: {e}"))?;
+        let _ = fs::remove_file(&info);
+        Ok(())
+    }
+
+    /// One `$I` record.
+    pub(super) struct Record {
+        pub info: std::path::PathBuf,
+        pub content: std::path::PathBuf,
+        pub original: std::path::PathBuf,
+        pub deleted: u64,
+    }
+
+    /// Every record in every bin this account can read.
+    fn records(drive: Option<&str>) -> Vec<Record> {
+        use std::path::PathBuf;
+        let mut out = Vec::new();
+        let letters: Vec<char> = match drive.and_then(|d| d.chars().next()) {
+            Some(letter) => vec![letter],
+            None => ('A'..='Z').collect(),
+        };
+        for letter in letters {
+            let bin = PathBuf::from(format!("{}:\\$Recycle.Bin", letter));
+            let Ok(users) = fs::read_dir(&bin) else { continue };
+            for user in users.flatten() {
+                let Ok(items) = fs::read_dir(user.path()) else { continue };
+                for item in items.flatten() {
+                    let name = item.file_name();
+                    let name = name.to_string_lossy();
+                    if !name.starts_with("$I") {
+                        continue;
+                    }
+                    let Ok(data) = fs::read(item.path()) else { continue };
+                    let Some((original, deleted)) = super::parse_i(&data) else { continue };
+                    let content = item.path().with_file_name(format!("$R{}", &name[2..]));
+                    if !content.exists() {
+                        continue;
+                    }
+                    out.push(Record { info: item.path(), content, original, deleted });
+                }
+            }
+        }
+        out
+    }
+
+    /// A `$I` record's deletion time as a clock time: 100ns steps from 1601.
+    fn from_filetime(stamp: u64) -> Option<std::time::SystemTime> {
+        const EPOCH: u64 = 11_644_473_600;
+        let secs = stamp / 10_000_000;
+        if secs < EPOCH {
+            return None;
+        }
+        Some(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs - EPOCH))
+    }
 }
 
 #[cfg(unix)]
-fn trash_one(path: &Path) -> Result<(), String> {
+fn trash_one(path: &Path) -> Result<Trashed, String> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     let base = std::env::var_os("XDG_DATA_HOME")
@@ -437,7 +641,12 @@ fn trash_one(path: &Path) -> Result<(), String> {
         let _ = move_item(&target, path, &cancel, &mut |_| {});
         return Err(format!("Could not record the deletion: {e}"));
     }
-    Ok(())
+    Ok(Trashed {
+        original: path.to_path_buf(),
+        when: SystemTime::now(),
+        trashed: Some(target),
+        info: Some(info_path),
+    })
 }
 
 #[cfg(unix)]
@@ -477,7 +686,7 @@ fn civil(z: i64) -> (i64, i64, i64) {
 }
 
 #[cfg(not(any(windows, unix)))]
-fn trash_one(_path: &Path) -> Result<(), String> {
+fn trash_one(_path: &Path) -> Result<Trashed, String> {
     Err("Deleting to the trash is not available on this system.".into())
 }
 
@@ -494,6 +703,67 @@ mod tests {
 
     fn noop(_: Progress) -> bool {
         true
+    }
+
+    /// A Recycle Bin record as the shell writes one, in either format.
+    #[cfg(windows)]
+    fn record(version: u64, path: &str, deleted: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&version.to_le_bytes());
+        out.extend_from_slice(&7u64.to_le_bytes()); // size
+        out.extend_from_slice(&deleted.to_le_bytes());
+        let units: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        if version == 1 {
+            let mut raw = vec![0u8; 520];
+            for (i, unit) in units.iter().take(260).enumerate() {
+                raw[i * 2..i * 2 + 2].copy_from_slice(&unit.to_le_bytes());
+            }
+            out.extend_from_slice(&raw);
+        } else {
+            let bytes: Vec<u8> = units.iter().flat_map(|unit| unit.to_le_bytes()).collect();
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(&bytes);
+        }
+        out
+    }
+
+    /// Both record formats name the path that was deleted, which is how the item
+    /// we deleted is found again.
+    #[cfg(windows)]
+    #[test]
+    fn a_recycle_bin_record_names_where_the_item_came_from() {
+        for version in [1u64, 2] {
+            let bytes = record(version, r"C:\Users\someone\gone.txt", 133_000_000_000_000_000);
+            let (path, deleted) = parse_i(&bytes).expect("the record reads");
+            assert_eq!(path, PathBuf::from(r"C:\Users\someone\gone.txt"));
+            assert_eq!(deleted, 133_000_000_000_000_000);
+        }
+        // Something that is not a record says so rather than guessing.
+        assert!(parse_i(&[0u8; 4]).is_none());
+        assert!(parse_i(&record(9, r"C:\x", 0)).is_none());
+    }
+
+    /// The reported wish: a delete can be taken back. This goes through the real
+    /// bin of this machine.
+    #[test]
+    fn a_delete_to_the_trash_can_be_taken_back() {
+        let dir = scratch("trash");
+        let file = dir.join("gone.txt");
+        fs::write(&file, b"content").unwrap();
+        let cancel = AtomicBool::new(false);
+        let Ok(deleted) = delete(DeleteMode::Trash, std::slice::from_ref(&file), &cancel, noop) else {
+            // A machine with the bin turned off cannot delete this way at all.
+            let _ = fs::remove_dir_all(&dir);
+            return;
+        };
+        assert_eq!(deleted.count, 1);
+        assert!(!file.exists(), "it went to the trash");
+        assert_eq!(deleted.trashed.len(), 1, "and the trash recorded where it came from");
+
+        restore(&deleted.trashed).expect("it can be taken back out");
+        assert!(file.exists(), "and it is back where it was");
+        assert_eq!(fs::read_to_string(&file).unwrap(), "content");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// A folder holding a link back to a folder above it is endless if a copy

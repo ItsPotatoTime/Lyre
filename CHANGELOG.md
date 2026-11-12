@@ -15,6 +15,10 @@ release notes rather than a second copy of them.
   have been redone, as an editor does. Deleting is not undoable: restoring from
   the bin is the shell's job, not this window's. Both commands are in the More
   menu, dimmed when there is nothing to take back.
+  A delete to the trash is taken back too, by bringing the item out of the bin:
+  on Windows the bin's own record of where the item came from is what finds it
+  again, and on Linux and macOS the trash note that Lyre wrote is. A permanent
+  delete is not undoable, which is what makes it permanent.
 
 ### Changed
 

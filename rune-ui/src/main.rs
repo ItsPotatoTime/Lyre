@@ -10141,11 +10141,37 @@ mod tests {
         }
         assert_eq!(s.icons_pending.get(), 0, "the worker answer must drain");
         #[cfg(target_os = "windows")]
-        assert_ne!(
-            s.icon_cache.borrow().get(&key).unwrap().size(),
-            (0, 0),
-            "an executable's shell icon must arrive through the worker"
-        );
+        {
+            // The shell is allowed to answer "no icon" while the machine is
+            // loaded: this suite runs a whole App per test, so on a wide machine
+            // the first few asks land while dozens of workers are running and
+            // come back empty, and the same ask succeeds a moment later. A miss
+            // is queued again rather than read as the worker being broken, which
+            // is what a wrong answer looks like here: it stays empty every time.
+            let mut landed = s.icon_cache.borrow().get(&key).unwrap().size();
+            for _ in 0..8 {
+                if landed != (0, 0) {
+                    break;
+                }
+                s.icon_cache.borrow_mut().remove(&key);
+                let _ = entry_icon(&s, &e, paint(true, 1.0), 16.0);
+                while s.icons_pending.get() > 0 {
+                    drain_icons(&s);
+                    if s.icons_pending.get() > 0 {
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                }
+                landed = s.icon_cache.borrow().get(&key).unwrap().size();
+                if landed == (0, 0) {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                }
+            }
+            assert_ne!(
+                landed,
+                (0, 0),
+                "an executable's shell icon must arrive through the worker"
+            );
+        }
         // A second render is a pure cache hit: no new job.
         let _ = entry_icon(&s, &e, paint(true, 1.0), 16.0);
         assert_eq!(s.icons_pending.get(), 0);

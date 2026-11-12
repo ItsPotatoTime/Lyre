@@ -53,6 +53,17 @@ pub fn take_side_button() -> Option<u8> {
     imp::take_side_button()
 }
 
+/// The middle button pressed since the last call, as a window point.
+#[cfg(target_os = "windows")]
+pub fn take_middle_press() -> Option<(f32, f32)> {
+    imp::take_middle_press()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn take_middle_press() -> Option<(f32, f32)> {
+    None
+}
+
 #[cfg(not(target_os = "windows"))]
 pub fn take_side_button() -> Option<u8> {
     None
@@ -75,12 +86,16 @@ mod imp {
     use rune::WindowHandle;
     use rune::raw_window_handle::RawWindowHandle;
     use std::sync::OnceLock;
-    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
     static HWND: OnceLock<isize> = OnceLock::new();
     /// The last side button pressed, for `poll` to take: 1 is back, 2 forward.
     static SIDE_BUTTON: AtomicU8 = AtomicU8::new(0);
     const WM_XBUTTONUP: u32 = 0x020C;
+    /// The middle button released since the last call, as a window point packed
+    /// into one word: 0 is none, otherwise x in the low half and y in the high.
+    static MIDDLE_PRESS: AtomicU64 = AtomicU64::new(0);
+    const WM_MBUTTONUP: u32 = 0x0208;
     /// A browser Back or Forward key, or a mouse that reports its side buttons
     /// this way rather than as an X button.
     const WM_APPCOMMAND: u32 = 0x0319;
@@ -211,6 +226,18 @@ mod imp {
                 return 1;
             }
             // Not every device reports the browser buttons as an X button:
+            // A middle press is a browser's "close this tab", and Rune has no
+            // handler for the middle button at all, so the window takes it and
+            // `poll` closes whatever tab it landed on.
+            if msg == WM_MBUTTONUP {
+                let x = (lparam as u16) as i16 as i64;
+                let y = ((lparam >> 16) as u16) as i16 as i64;
+                let packed = ((x + 0x8000) | ((y + 0x8000) << 16)) as u64;
+                MIDDLE_PRESS.store(packed, Ordering::Relaxed);
+                RedrawWindow(hwnd, std::ptr::null(), std::ptr::null_mut(), RDW_INTERNALPAINT);
+                return 1;
+            }
+            // Not every device reports the browser buttons as an X button:
             // keyboards with Back/Forward keys, and some mice, send them as an
             // app command instead. Both land on the same history step.
             if msg == WM_APPCOMMAND {
@@ -241,6 +268,17 @@ mod imp {
             0 => None,
             which => Some(which),
         }
+    }
+
+    /// The middle press since the last call, in client pixels.
+    pub fn take_middle_press() -> Option<(f32, f32)> {
+        let packed = MIDDLE_PRESS.swap(0, Ordering::Relaxed);
+        if packed == 0 {
+            return None;
+        }
+        let x = ((packed & 0xFFFF) as i64 - 0x8000) as f32;
+        let y = (((packed >> 16) & 0xFFFF) as i64 - 0x8000) as f32;
+        Some((x, y))
     }
 
     /// The client area, which is what the layout sees and what a saved size has

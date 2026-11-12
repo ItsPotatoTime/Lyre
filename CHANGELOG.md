@@ -6,6 +6,14 @@ release notes rather than a second copy of them.
 
 ## [Unreleased]
 
+### Added
+
+- **A tab closes with Alt+click or the middle mouse button.** Both are what a
+  browser does, and both close the tab under the pointer, its close button
+  included. The middle button is not one the toolkit reports, so the window
+  catches the press itself and closes the tab it landed on; a press anywhere but
+  the strip closes nothing.
+
 ### Fixed
 
 - **A failed delete says why it failed.** Every finished operation reloads the

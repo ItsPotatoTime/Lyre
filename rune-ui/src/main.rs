@@ -1897,6 +1897,21 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
         Some(2) => go_forward(s),
         _ => false,
     };
+    // A middle press closes the tab under it, as in a browser. Rune has no
+    // handler for the middle button, so the window catches the press and this
+    // finds what it landed on.
+    let mut tab_closed = false;
+    if let Some((x, y)) = frame::take_middle_press() {
+        let (x, y) = (x / s.scale.get(), y / s.scale.get());
+        let closed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let closed_by_press = closed.clone();
+        tx.element_at(x, y, move |s: &mut App, picked, _tx: &mut Tx| {
+            if let Some(path) = picked.map(|p| p.path().to_string()) {
+                closed_by_press.set(close_tab_at_path(s, &path));
+            }
+        });
+        tab_closed = closed.get();
+    }
     // Remember the window's size, but only once a resize has stopped. Rune has no
     // resize event, so it is sampled here; writing the settings on every frame of
     // a drag would be wasteful, and nothing else would wake the window after the
@@ -1941,7 +1956,7 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
     }
     // A step taken from the side buttons is a change the view reads, and a step
     // back to a page starts no scan whose answer would mark the frame otherwise.
-    let mut changed = drain_op(s) || stepped;
+    let mut changed = drain_op(s) || stepped || tab_closed;
     // Keep frames coming while a transfer runs so its progress drains promptly.
     if s.transfer.is_some() {
         tx.wake_after(std::time::Duration::from_millis(60));
@@ -3991,7 +4006,29 @@ fn tab_button(s: &App, p: Paint, index: usize, tab: &Tab) -> El {
                 .help("Close tab")
                 .on_press(move |s: &mut App| close_tab_at(s, index)),
         );
-    b.on_press(move |s: &mut App| switch_tab(s, index))
+    // Alt+click closes, as it does in a browser; a plain click switches.
+    b.on_press_tx(move |s: &mut App, tx: &mut Tx| tab_pressed(s, index, tx.mods().alt))
+}
+
+/// A press on a tab: Alt closes it, anything else switches to it.
+fn tab_pressed(s: &mut App, index: usize, alt: bool) {
+    if alt {
+        close_tab_at(s, index);
+    } else {
+        switch_tab(s, index);
+    }
+}
+
+/// Close the tab a press landed on, from the key path of the element under it.
+/// True when a tab was there to close.
+fn close_tab_at_path(s: &mut App, path: &str) -> bool {
+    match parse_drop_target(s, path).1 {
+        Some(DropTarget::Tab(index)) => {
+            close_tab_at(s, index);
+            true
+        }
+        _ => false,
+    }
 }
 
 fn tab_strip(s: &App, p: Paint) -> El {
@@ -10754,6 +10791,20 @@ mod tests {
 mod click_tests {
     use super::*;
 
+    /// A press on a tab still switches to it now that the tab also answers an
+    /// Alt+click, and a press on its close button still closes it.
+    #[test]
+    fn a_press_on_a_tab_switches_to_it() {
+        let mut rt = runtime();
+        new_tab(&mut rt.state);
+        rt.frame(0.0);
+        assert_eq!(rt.state.active_tab, 1, "the new tab is the showing one");
+        let tab = rect_of(&rt, "tab-0");
+        click_at(&mut rt, tab[0] + 60.0, tab[1] + tab[3] * 0.5);
+        assert_eq!(rt.state.active_tab, 0, "the press switched to the first tab");
+        assert_eq!(rt.state.tabs.len(), 2, "and did not close anything");
+    }
+
     fn runtime() -> rune::Runtime<App> {
         let mut rt = rune::Runtime::new(init(), view, (1076.0, 600.0), rune::Env::new(true, 1.0));
         rt.frame(0.0);
@@ -10859,6 +10910,47 @@ mod click_tests {
             rt.state.view == View::ThisPc,
             "the Back button must return to This PC"
         );
+    }
+}
+
+#[cfg(test)]
+mod tab_close_tests {
+    use super::*;
+
+    fn three_tabs() -> App {
+        let mut s = init();
+        new_tab(&mut s);
+        new_tab(&mut s);
+        s.active_tab = 0;
+        s
+    }
+
+    /// Alt+click closes the tab it lands on, as it does in a browser; a plain
+    /// click still only switches.
+    #[test]
+    fn alt_click_closes_the_tab_it_lands_on() {
+        let mut s = three_tabs();
+        assert_eq!(s.tabs.len(), 3);
+        tab_pressed(&mut s, 1, true);
+        assert_eq!(s.tabs.len(), 2, "Alt and a press closes the tab");
+        tab_pressed(&mut s, 1, false);
+        assert_eq!(s.tabs.len(), 2, "a plain press does not close it");
+        assert_eq!(s.active_tab, 1, "it switches to that tab instead");
+    }
+
+    /// A middle press closes whatever tab it landed on, and nothing when it
+    /// landed anywhere else.
+    #[test]
+    fn a_middle_press_closes_the_tab_under_it() {
+        let mut s = three_tabs();
+        assert!(close_tab_at_path(&mut s, "main/tabs/tab-1/tab-close-1"));
+        assert_eq!(s.tabs.len(), 2, "the tab under the press is gone");
+        // The close button is the same target as the tab around it.
+        assert!(close_tab_at_path(&mut s, "main/tabs/tab-0/tab-close-0"));
+        assert_eq!(s.tabs.len(), 1);
+        // Anywhere else is not a tab, so the press does nothing.
+        assert!(!close_tab_at_path(&mut s, "main/tabs/rail-0"));
+        assert_eq!(s.tabs.len(), 1, "a press off the strip closes nothing");
     }
 }
 

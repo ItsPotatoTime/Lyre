@@ -4,21 +4,32 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
-## [Unreleased]
+## [0.3.4]
+
+A release for what the window was keeping from you: a page that overwrote your
+sort, a minimise that shrank the window for good, a listing that ran off the
+edge, a rubber band that could only start on one side, and a crash that said
+nothing. Undo and redo arrive with it, including taking a delete back out of the
+bin.
 
 ### Added
 
 - **Undo and redo.** `Ctrl+Z` takes back the last thing done to a file, and
-  `Ctrl+Y` or `Ctrl+Shift+Z` does it again: a rename, a new folder, a copy, or a
-  move. A copy is taken back by deleting what it made, and a move by putting each
-  item back where it came from. Doing something new drops the steps that could
-  have been redone, as an editor does. Deleting is not undoable: restoring from
-  the bin is the shell's job, not this window's. Both commands are in the More
+  `Ctrl+Y` or `Ctrl+Shift+Z` does it again: a rename, a new folder, a copy, a
+  move, or a delete to the trash. A copy is taken back by deleting what it made,
+  and a move by putting each item back where it came from, recreating a folder
+  that has gone since. A delete comes back out of the bin itself: on Windows the
+  bin's own record of where the item came from is what finds it again, and on
+  Linux and macOS the trash note Lyre wrote is. Doing something new drops the
+  steps that could have been redone, as an editor does, and a permanent delete is
+  not undoable, which is what makes it permanent. Both commands are in the More
   menu, dimmed when there is nothing to take back.
-  A delete to the trash is taken back too, by bringing the item out of the bin:
-  on Windows the bin's own record of where the item came from is what finds it
-  again, and on Linux and macOS the trash note that Lyre wrote is. A permanent
-  delete is not undoable, which is what makes it permanent.
+
+- **A crash leaves a note.** A release build is a window, not a console program,
+  so a panic closed the window and left nothing to read. The reason and the line
+  it happened on now go to `lyre-crash.log` beside the settings, which is
+  `%APPDATA%\Lyre` on Windows, so the next "it just closed" can be answered
+  instead of guessed at.
 
 ### Changed
 
@@ -64,21 +75,9 @@ release notes rather than a second copy of them.
   a line whatever the width, so the third one hung off a narrow window, and a
   long file name was drawn over the date beside it because its column had no room
   to truncate in. The tiles now wrap to however many fit and take a share of the
-  page, and the name, date and type cells truncate inside their own column.
-- **The file list asked for the whole window's width, not the room left.** Its
-  column said `w_full` beside the rail, which asked for the window rather than
-  what the rail left, and pushed a narrow window's rows past the edge.
-
-### Added
-
-- **A crash leaves a note.** A release build is a window, not a console program,
-  so a panic closed the window and left nothing to read. The reason and the line
-  it happened on now go to `lyre-crash.log` beside the settings, which is
-  `%APPDATA%\Lyre` on Windows, so the next "it just closed" can be answered
-  instead of guessed at.
-
-### Fixed
-
+  page, and the name, date and type cells truncate inside their own column. The
+  file list was asking for the whole window's width beside the rail rather than
+  what the rail left, which is why a narrow window's rows ended past the edge.
 - **Cut and paste no longer dies on a folder that links back up.** Copying walked
   through links as though they were the folders they name, so a folder holding a
   junction to one of its own parents was copied deeper and deeper until something

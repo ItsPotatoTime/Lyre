@@ -6,6 +6,27 @@ release notes rather than a second copy of them.
 
 ## [Unreleased]
 
+### Changed
+
+- **The window goes much smaller, and the layout holds.** The floor was 760 by
+  480; it is now 400 by 280. Below about 700 points of width the command bar
+  keeps its icons and drops their words, below 560 the file-operation buttons
+  step aside for the context menu, the rail gives up its width down to 45% of the
+  window, the details pane steps aside when there is no room for it beside the
+  list, and the Details columns take the shortfall out of all four rather than
+  pushing the last two past the edge.
+
+### Fixed
+
+- **Nothing is drawn past the right edge.** The Quick Access tiles were three to
+  a line whatever the width, so the third one hung off a narrow window, and a
+  long file name was drawn over the date beside it because its column had no room
+  to truncate in. The tiles now wrap to however many fit and take a share of the
+  page, and the name, date and type cells truncate inside their own column.
+- **The file list asked for the whole window's width, not the room left.** Its
+  column said `w_full` beside the rail, which asked for the window rather than
+  what the rail left, and pushed a narrow window's rows past the edge.
+
 ### Added
 
 - **A crash leaves a note.** A release build is a window, not a console program,

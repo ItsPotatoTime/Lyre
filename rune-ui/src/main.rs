@@ -54,6 +54,11 @@ mod watch;
 // three distinct bands, not one surface: a near-black tab strip, a Mica-tinted
 // address row, and a command bar that shares the work area's neutral charcoal.
 const TAB_H: f32 = 38.0;
+/// The smallest the window can be dragged to. Everything in the chrome is
+/// fixed height, so this leaves the body its last usable band; the rail narrows
+/// itself and the command bar drops its words well before here.
+const MIN_W: f32 = 400.0;
+const MIN_H: f32 = 280.0;
 const TAB_ITEM_H: f32 = 30.0;
 const ADDRESS_H: f32 = 46.0;
 const COMMAND_H: f32 = 44.0;
@@ -4261,7 +4266,9 @@ fn address_row(s: &App, p: Paint) -> El {
         let mut bar = row()
             .key("breadcrumb")
             .grow(1.0)
-            .min_w(120.0)
+            // The trail gives way first in a narrow window: the search field and
+            // the navigation buttons have to stay reachable.
+            .min_w(if narrow(s) { 80.0 } else { 120.0 })
             .h(FIELD_H)
             .radius(4.0)
             .fill(p.field)
@@ -4322,7 +4329,10 @@ fn address_row(s: &App, p: Paint) -> El {
             }
         }
         bar = bar.child(ico(p, Ico::ChevronRight, 10.0, p.tertiary));
-        if matches!(s.view, View::Files | View::Gallery) {
+        // The subfolder arrow is the first thing to go in a narrow window: a
+        // trail that runs out of room would otherwise end past the field it is
+        // drawn in.
+        if matches!(s.view, View::Files | View::Gallery) && !narrow(s) {
             bar = bar.child(
                 el().key("crumb-tail")
                     .size(22.0, 22.0)
@@ -4373,7 +4383,10 @@ fn address_row(s: &App, p: Paint) -> El {
         .child(
             row()
                 .key("search")
-                .w(260.0)
+                // The field takes a share of a narrow window rather than its
+                // full width, which used to push it and everything after it
+                // past the edge.
+                .w(search_width(s))
                 .h(FIELD_H)
                 .radius(4.0)
                 .fill(p.field)
@@ -4395,6 +4408,13 @@ fn address_row(s: &App, p: Paint) -> El {
         )
 }
 
+/// How wide the search field is: what it always was, or a share of a window too
+/// narrow to give it that.
+fn search_width(s: &App) -> f32 {
+    let body = body_width(s);
+    260.0_f32.min(body * 0.45).max(96.0)
+}
+
 fn icon_button(p: Paint, which: Ico, dim: bool, tip: &str) -> El {
     let ink = if dim { p.disabled } else { p.secondary };
     el().size(32.0, 32.0)
@@ -4407,6 +4427,16 @@ fn icon_button(p: Paint, which: Ico, dim: bool, tip: &str) -> El {
 }
 
 fn text_button(p: Paint, which: Ico, label: &str, chevron: bool, dim: bool) -> El {
+    text_button_parts(p, which, Some(label), chevron, dim)
+}
+
+/// The same button without its word, for a window too narrow to hold a row of
+/// them: the icon keeps the press and the tooltip keeps the name.
+fn text_button_bare(p: Paint, which: Ico, chevron: bool, dim: bool) -> El {
+    text_button_parts(p, which, None, chevron, dim)
+}
+
+fn text_button_parts(p: Paint, which: Ico, label: Option<&str>, chevron: bool, dim: bool) -> El {
     let ink = if dim { p.disabled } else { p.secondary };
     let mut b = row()
         .h(32.0)
@@ -4416,12 +4446,10 @@ fn text_button(p: Paint, which: Ico, label: &str, chevron: bool, dim: bool) -> E
         .hover(p.hover)
         .press(p.press)
         .items_center()
-        .child(ico(p, which, 16.0, ink))
-        .child(
-            text(label)
-                .font(UI_TEXT)
-                .color(if dim { p.disabled } else { p.text }),
-        );
+        .child(ico(p, which, 16.0, ink));
+    if let Some(label) = label {
+        b = b.child(text(label).font(UI_TEXT).color(if dim { p.disabled } else { p.text }));
+    }
     if chevron {
         b = b.child(ico(p, Ico::ChevronDown, 10.0, ink));
     }
@@ -4443,6 +4471,17 @@ fn accent_button(p: Paint, which: Ico, label: &str) -> El {
 
 fn command_bar(s: &App, p: Paint) -> El {
     let has_sel = !s.selected.is_empty();
+    // A narrow window keeps the icons and drops the words: seven labelled
+    // buttons and a Details toggle do not fit under about 560 points of body,
+    // and overflowing them past the edge is what went out of bounds.
+    let words = !narrow(s);
+    let label_button = |which: Ico, label: &str, chevron: bool| {
+        if words {
+            text_button(p, which, label, chevron, false)
+        } else {
+            text_button_bare(p, which, chevron, false).help(label)
+        }
+    };
     let mut bar = row()
         .key("command")
         .w_full()
@@ -4452,7 +4491,7 @@ fn command_bar(s: &App, p: Paint) -> El {
         .gap(2.0)
         .items_center()
         .child(
-            text_button(p, Ico::New, "New", true, false)
+            label_button(Ico::New, "New", true)
                 .key("cmd-new")
                 .drawn_rect_into(&s.rect_new)
                 .help("New item")
@@ -4462,30 +4501,34 @@ fn command_bar(s: &App, p: Paint) -> El {
                 }),
         )
         .child(el().w(p.hair).h(20.0).fill(p.line).mx(6.0));
-    for (which, label) in [
-        (Ico::Cut, "Cut"),
-        (Ico::Copy, "Copy"),
-        (Ico::Paste, "Paste"),
-        (Ico::Rename, "Rename"),
-        (Ico::Share, "Share"),
-        (Ico::Delete, "Delete"),
-    ] {
-        let dim = !has_sel && !matches!(which, Ico::Paste);
-        bar = bar.child(icon_button(p, which, dim, label).on_press(move |s: &mut App| {
-            match which {
-                Ico::Cut => cut_selection(s),
-                Ico::Copy => copy_selection(s),
-                Ico::Paste => begin_paste(s),
-                Ico::Rename => begin_rename(s),
-                Ico::Delete => begin_delete(s, false),
-                _ => s.notice = "Sharing arrives with the share sheet".into(),
-            }
-        }));
+    // The file-operation buttons are the first to go when the row will not fit:
+    // the context menu and the keyboard still have every one of them.
+    if !tight(s) {
+        for (which, label) in [
+            (Ico::Cut, "Cut"),
+            (Ico::Copy, "Copy"),
+            (Ico::Paste, "Paste"),
+            (Ico::Rename, "Rename"),
+            (Ico::Share, "Share"),
+            (Ico::Delete, "Delete"),
+        ] {
+            let dim = !has_sel && !matches!(which, Ico::Paste);
+            bar = bar.child(icon_button(p, which, dim, label).on_press(move |s: &mut App| {
+                match which {
+                    Ico::Cut => cut_selection(s),
+                    Ico::Copy => copy_selection(s),
+                    Ico::Paste => begin_paste(s),
+                    Ico::Rename => begin_rename(s),
+                    Ico::Delete => begin_delete(s, false),
+                    _ => s.notice = "Sharing arrives with the share sheet".into(),
+                }
+            }));
+        }
     }
     bar = bar
         .child(el().w(p.hair).h(20.0).fill(p.line).mx(6.0))
         .child(
-            text_button(p, Ico::Sort, "Sort", true, false)
+            label_button(Ico::Sort, "Sort", true)
                 .key("cmd-sort")
                 .drawn_rect_into(&s.rect_sort)
                 .help("Sort")
@@ -4495,7 +4538,7 @@ fn command_bar(s: &App, p: Paint) -> El {
                 }),
         )
         .child(
-            text_button(p, Ico::View, "View", true, false)
+            label_button(Ico::View, "View", true)
                 .key("cmd-view")
                 .drawn_rect_into(&s.rect_view)
                 .help("View")
@@ -4505,7 +4548,7 @@ fn command_bar(s: &App, p: Paint) -> El {
                 }),
         );
     bar = bar.child(
-        text_button(p, Ico::Filter, "Filter", true, false)
+        label_button(Ico::Filter, "Filter", true)
             .key("cmd-filter")
             .drawn_rect_into(&s.rect_filter)
             .help("Filter by type")
@@ -4547,12 +4590,14 @@ fn command_bar(s: &App, p: Paint) -> El {
                 }),
         )
         .child(el().grow(1.0));
-    let details = text_button(p, Ico::Details, "Details", false, false)
+    let details = label_button(Ico::Details, "Details", false)
         .help("Toggle the details pane")
         .on_press(|s: &mut App| {
             s.preview = !s.preview;
         });
-    bar.child(if s.preview {
+    // Lit only when the pane is actually on screen: a window too narrow for it
+    // leaves the button unlit rather than claiming a pane nobody can see.
+    bar.child(if preview_shown(s) {
         details.fill(p.rail_sel)
     } else {
         details
@@ -6611,7 +6656,7 @@ fn nav_rail(s: &App, p: Paint) -> El {
     };
     let mut rail = col()
         .key("rail")
-        .w(s.rail_w)
+        .w(rail_width(s))
         .h_full()
         .fill(p.content)
         .px(4.0)
@@ -6673,6 +6718,28 @@ fn nav_rail(s: &App, p: Paint) -> El {
         )
 }
 
+/// The Details columns as drawn.
+///
+/// The person's widths are honoured while they fit; a window too narrow to hold
+/// them takes the difference out of all four in proportion, with a floor so a
+/// column stays readable, rather than pushing the last two past its edge.
+fn column_widths(s: &App) -> [f32; 4] {
+    let room = (content_width(s) - COL_SEP_W * 4.0).max(120.0);
+    let total: f32 = s.col_w.iter().sum();
+    if total <= room {
+        return s.col_w;
+    }
+    let share = room / total;
+    let mut out = s.col_w.map(|w| (w * share).max(40.0));
+    // Rounding up to the floors can still overshoot; take it back from the name,
+    // which has the most to give.
+    let sum: f32 = out.iter().sum();
+    if sum > room {
+        out[0] = (out[0] - (sum - room)).max(40.0);
+    }
+    out
+}
+
 fn column_header(p: Paint, cols: &[(&str, f32)], right_last: bool, separators: bool) -> El {
     let mut h = row().key("header").w_full().h(HEADER_H).items_center();
     for (i, (label, w)) in cols.iter().enumerate() {
@@ -6700,13 +6767,14 @@ fn column_header(p: Paint, cols: &[(&str, f32)], right_last: bool, separators: b
 /// its own right-edge divider, as in Explorer, so all four columns resize.
 fn details_header(s: &App, p: Paint) -> El {
     let labels = ["Name", "Date modified", "Type", "Size"];
+    let widths = column_widths(s);
     let mut h = row().key("header").w_full().h(HEADER_H).items_center();
     for (i, label) in labels.iter().enumerate() {
         if i > 0 {
             h = h.child(column_divider(p, i - 1));
         }
         let t = text(*label).font(CAPTION).color(p.secondary);
-        h = h.child(col().w(s.col_w[i]).pl(12.0).pr(8.0).child(if i == 3 {
+        h = h.child(col().w(widths[i]).pl(12.0).pr(8.0).child(if i == 3 {
             t.w_full().align(Align::End)
         } else {
             t
@@ -6737,7 +6805,7 @@ fn column_divider(p: Paint, idx: usize) -> El {
 /// the Size column's right edge. Everything to its right is list background,
 /// which is what a rubber-band drag needs to start on.
 fn row_width(s: &App) -> f32 {
-    s.col_w.iter().sum::<f32>() + COL_SEP_W * 4.0
+    column_widths(s).iter().sum::<f32>() + COL_SEP_W * 4.0
 }
 
 fn group_header(p: Paint, label: &str) -> El {
@@ -8364,6 +8432,7 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
     let (ei, e) = display_entry(s, i);
     let selected = is_selected(s, ei);
     let focused = s.focused == Some(ei);
+    let widths = column_widths(s);
     let mut line = row()
         .key(format!("row-{i}"))
         .w(row_width(s))
@@ -8380,7 +8449,8 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
     let line = line
         .child(
             row()
-                .w(s.col_w[0])
+                .w(widths[0])
+                .min_w(0.0)
                 .pl(12.0)
                 .pr(8.0)
                 .gap(8.0)
@@ -8396,13 +8466,20 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
         .child(el().w(COL_SEP_W).h(16.0).center().child(el().w(p.hair).h(16.0).fill(p.soft_line)))
         .child(
             col()
-                .w(s.col_w[1])
+                .w(widths[1])
+                .min_w(0.0)
                 .pl(12.0)
-                .child(text(e.modified.as_str()).font(ROW_TEXT).color(p.secondary)),
+                .child(
+                    text(e.modified.as_str())
+                        .font(ROW_TEXT)
+                        .color(p.secondary)
+                        .min_w(0.0)
+                        .truncate(),
+                ),
         )
         .child(el().w(COL_SEP_W).h(16.0).center().child(el().w(p.hair).h(16.0).fill(p.soft_line)))
         .child(
-            col().w(s.col_w[2]).pl(12.0).pr(8.0).child(
+            col().w(widths[2]).min_w(0.0).pl(12.0).pr(8.0).child(
                 text(e.type_label.as_str())
                     .font(ROW_TEXT)
                     .color(p.secondary)
@@ -8412,7 +8489,7 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
         )
         .child(el().w(COL_SEP_W).h(16.0).center().child(el().w(p.hair).h(16.0).fill(p.soft_line)))
         .child(
-            col().w(s.col_w[3]).pl(8.0).pr(12.0).child(
+            col().w(widths[3]).min_w(0.0).pl(8.0).pr(12.0).child(
                 text(e.size_label())
                     .font(ROW_TEXT)
                     .color(p.secondary)
@@ -8720,13 +8797,16 @@ fn tiles_rows(s: &App, p: Paint) -> El {
 }
 
 fn quick_tile(s: &App, p: Paint, label: &str, mark: Ico, top: &str, bottom: &str, back: &str, nav: usize) -> El {
+    // A tile is as wide as its room allows: a fixed one was wider than a narrow
+    // window's page, so the last tile in every line hung past the edge.
+    let width = 272.0_f32.min((content_width(s) - 24.0).max(150.0));
     row()
         .key(format!("drop-place-{nav}"))
         .on_drop_files(move |s: &mut App, files, tx: &mut Tx| {
             take_drop(s, place_path(nav).map(DropTarget::Folder), files, tx);
         })
         .fill(if drop_hot(s, &format!("drop-place-{nav}")) { p.hover } else { Color::TRANSPARENT })
-        .w(272.0)
+        .w(width)
         .h(60.0)
         .radius(4.0)
         .hover(p.hover)
@@ -8736,15 +8816,60 @@ fn quick_tile(s: &App, p: Paint, label: &str, mark: Ico, top: &str, bottom: &str
         .child(folder(40.0, top, bottom, back, Some(mark), p))
         .child(
             col()
+                .grow(1.0)
+                .min_w(0.0)
                 .gap(1.0)
-                .child(text(label).font(TILE_TEXT).color(p.text))
-                .child(text("Stored locally").font(CAPTION).color(p.tertiary))
+                .child(text(label).font(TILE_TEXT).color(p.text).min_w(0.0).truncate())
+                .child(
+                    text("Stored locally")
+                        .font(CAPTION)
+                        .color(p.tertiary)
+                        .min_w(0.0)
+                        .truncate(),
+                )
                 .child(ico(p, Ico::Pin, 9.0, p.tertiary)),
         )
         .on_press_tx(move |s: &mut App, tx: &mut Tx| {
             navigate(s, nav);
             tx.instant();
         })
+}
+
+/// The window's width in points, measured on the last frame, or the size a
+/// window opens at before the first frame has measured anything.
+fn window_width(s: &App) -> f32 {
+    let window = s.rect_window.get()[2];
+    if window <= 0.0 { 1076.0 } else { window }
+}
+
+/// How wide the rail is for the window as it is.
+///
+/// A narrow window gives the room to the list instead: a rail that keeps its
+/// width when there is no width to spare leaves the folder it lists unusable.
+fn rail_width(s: &App) -> f32 {
+    let window = window_width(s);
+    s.rail_w.min((window * 0.45).max(96.0))
+}
+
+/// The room the body has, in points. Before the first frame has measured the
+/// window this answers the size a window opens at, so the first frame is laid
+/// out for something rather than for nothing.
+fn body_width(s: &App) -> f32 {
+    // The rail's own padding comes off with its width, or a page laid out to
+    // exactly this would end a few points past the edge.
+    (window_width(s) - rail_width(s) - 8.0).max(160.0)
+}
+
+/// Whether the window is narrow enough that the command bar's words will not
+/// fit: the row of labelled buttons needs about 700 points.
+fn narrow(s: &App) -> bool {
+    window_width(s) < 700.0
+}
+
+/// Whether it is narrow enough that the file-operation buttons will not fit
+/// either, and have to make do with the context menu and the keyboard.
+fn tight(s: &App) -> bool {
+    window_width(s) < 560.0
 }
 
 fn quick_access_content(s: &App, p: Paint) -> El {
@@ -8756,20 +8881,22 @@ fn quick_access_content(s: &App, p: Paint) -> El {
         ("Music", Ico::Music, "#f2a06b", "#e06a3c", "#b8542e", 7),
         ("Videos", Ico::Videos, "#a86fe8", "#7b3fd0", "#6230a8", 8),
     ];
-    let mut grid = col().w_full().pt(10.0).gap(6.0);
-    for chunk in tiles.chunks(3) {
-        let mut line = row().w_full().justify_center().gap(12.0);
-        for (label, mark, top, bottom, back, nav) in chunk {
-            line = line.child(quick_tile(s, p, label, *mark, top, bottom, back, *nav));
-        }
-        grid = grid.child(line);
+    // The tiles wrap to however many fit, rather than three to a line: a narrow
+    // window used to push the third one past the edge of the window.
+    let mut line = row().w_full().flex_wrap().justify_center().gap(12.0);
+    for (label, mark, top, bottom, back, nav) in tiles {
+        line = line.child(quick_tile(s, p, label, mark, top, bottom, back, nav));
     }
+    let grid = col().w_full().pt(10.0).gap(6.0).child(line);
     let recent_on = s.quick_access_tab == 0;
     let pills = row()
         .w_full()
         .pt(14.0)
         .px(16.0)
         .gap(8.0)
+        // One line where there is room, two where there is not: a row that
+        // could not wrap held the whole page wider than a narrow window.
+        .flex_wrap()
         .items_center()
         .child(ico(p, Ico::ChevronDown, 10.0, p.secondary))
         .child(
@@ -8800,9 +8927,20 @@ fn quick_access_content(s: &App, p: Paint) -> El {
         );
     let mut table = col().w_full().pt(14.0);
     if recent_on {
+        // The name takes whatever the other two leave, and the two after it give
+        // room first: a long name used to be drawn past its own column, over the
+        // date beside it.
+        let room = content_width(s);
+        let date_w = if narrow(s) { 120.0 } else { 240.0 };
+        let activity_w = if room > 780.0 { 160.0 } else { 0.0 };
+        let name_w = (room - date_w - activity_w - 32.0).max(60.0);
+        let mut columns = vec![("Name", name_w), ("Date modified", date_w)];
+        if activity_w > 0.0 {
+            columns.push(("Activity", activity_w));
+        }
         table = table.child(column_header(
             p,
-            &[("Name", 440.0), ("Date modified", 240.0), ("Activity", 160.0)],
+            &columns,
             false,
             false,
         ));
@@ -8827,18 +8965,22 @@ fn quick_access_content(s: &App, p: Paint) -> El {
                 .hover(p.hover)
                 .child(
                     row()
-                        .w(440.0)
+                        .w(name_w)
+                        .min_w(0.0)
                         .pl(16.0)
                         .gap(10.0)
                         .items_center()
                         .child(entry_icon(s, e, p, 24.0))
                         .child(
                             col()
+                                .grow(1.0)
+                                .min_w(0.0)
                                 .gap(1.0)
                                 .child(
                                     text(e.name.as_str())
                                         .font(ROW_TEXT)
                                         .color(p.text)
+                                        .min_w(0.0)
                                         .truncate(),
                                 )
                                 .child(text(e.type_label.as_str()).font(CAPTION).color(p.tertiary)),
@@ -8846,11 +8988,18 @@ fn quick_access_content(s: &App, p: Paint) -> El {
                 )
                 .child(
                     col()
-                        .w(240.0)
+                        .w(date_w)
+                        .min_w(0.0)
                         .pl(12.0)
-                        .child(text(e.modified.as_str()).font(ROW_TEXT).color(p.secondary)),
+                        .child(
+                            text(e.modified.as_str())
+                                .font(ROW_TEXT)
+                                .color(p.secondary)
+                                .min_w(0.0)
+                                .truncate(),
+                        ),
                 )
-                .child(col().w(160.0));
+                .child(col().w(activity_w));
             row = row
                 .on_press_tx(move |st: &mut App, tx: &mut Tx| click_select(st, ei, tx.mods()))
                 .on_drag(move |st: &mut App, d: &mut rune::Drag, tx: &mut Tx| row_drag(st, ei, ei, d, tx))
@@ -8983,7 +9132,9 @@ fn this_pc_content(s: &App, p: Paint) -> El {
                 let t = s.volumes.get(vi).map(|v| DropTarget::Folder(v.path.clone()));
                 take_drop(s, t, files, tx);
             })
-            .w(300.0)
+            // A share of a narrow page, as the Quick Access tiles take: a fixed
+            // card was wider than the page it sat on.
+            .w(300.0_f32.min((content_width(s) - 48.0).max(180.0)))
             .h(64.0)
             .radius(4.0)
             .px(8.0)
@@ -8997,7 +9148,13 @@ fn this_pc_content(s: &App, p: Paint) -> El {
                     .grow(1.0)
                     .min_w(0.0)
                     .gap(4.0)
-                    .child(text(title.as_str()).font(ROW_TEXT).color(p.text))
+                    .child(
+                        text(title.as_str())
+                            .font(ROW_TEXT)
+                            .color(p.text)
+                            .min_w(0.0)
+                            .truncate(),
+                    )
                     .child(
                         el().w_full()
                             .h(10.0)
@@ -9431,7 +9588,7 @@ fn preview_pane(s: &App, p: Paint) -> El {
     };
     row()
         .key("preview")
-        .w(PREVIEW_W)
+        .w(preview_width(s))
         .h_full()
         .fill(p.content)
         .child(el().w(p.hair).h_full().fill(p.line))
@@ -9443,7 +9600,9 @@ fn files_list(s: &App, p: Paint) -> El {
         .key("content")
         .grow(1.0)
         .min_h(0.0)
-        .w_full()
+        // Not `w_full`: beside the rail, that asks for the whole window's width
+        // and pushes the list past the right edge.
+        .min_w(0.0)
         .fill(p.content)
         .on_secondary_press(|s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
             s.menu = Some(Menu::Context { scope: CtxScope::Background, target: 0, x: at.x, y: at.y });
@@ -9484,7 +9643,7 @@ fn content(s: &App, p: Paint) -> El {
         body = body.child(if inert { rail.inert() } else { rail });
     }
     body = body.child(if inert { main.inert() } else { main });
-    if s.preview {
+    if preview_shown(s) {
         let pane = preview_pane(s, p);
         body = body.child(if inert { pane.inert() } else { pane });
     }
@@ -9506,6 +9665,28 @@ fn content(s: &App, p: Paint) -> El {
         );
     }
     body
+}
+
+/// How wide the preview pane is, which is its own width unless the window is too
+/// narrow to give it that.
+fn preview_width(s: &App) -> f32 {
+    PREVIEW_W.min(body_width(s) * 0.45).max(150.0)
+}
+
+/// Whether the details pane is drawn at all: a window too narrow to hold both
+/// the list and the pane shows the list, as there is nowhere to put the pane.
+fn preview_shown(s: &App) -> bool {
+    // The pane needs its own width and the page beside it needs a usable one; a
+    // window that cannot give both shows the page, which is what the person is
+    // reading, and the pane comes back when there is room for it again.
+    s.preview && body_width(s) >= 700.0
+}
+
+/// The room the page on screen has beside the rail and, when it is drawn, the
+/// details pane.
+fn content_width(s: &App) -> f32 {
+    let pane = if preview_shown(s) { preview_width(s) } else { 0.0 };
+    (body_width(s) - pane).max(80.0)
 }
 
 fn body(s: &App, p: Paint) -> El {
@@ -9666,16 +9847,11 @@ fn fit_to_screen(saved: (u32, u32), screen: (u32, u32), scale: f32) -> Option<(u
         return None;
     }
     let scale = scale.max(0.5);
-    let min_w = ((760.0 * scale).round() as u32).min(screen.0);
-    let min_h = ((480.0 * scale).round() as u32).min(screen.1);
+    let min_w = ((MIN_W * scale).round() as u32).min(screen.0);
+    let min_h = ((MIN_H * scale).round() as u32).min(screen.1);
     Some((saved.0.clamp(min_w, screen.0), saved.1.clamp(min_h, screen.1)))
 }
 
-/// Write a panic to a file beside the settings before the window closes.
-///
-/// A release build is a window, not a console program, so a panic takes the
-/// window away and leaves nothing to read: "it just closed" is all anyone can
-/// report. The hook keeps the file the next report can name.
 /// Where a panic is written: `lyre-crash.log` beside the settings, or the
 /// temporary folder when the settings have no folder of their own.
 fn crash_log_path() -> PathBuf {
@@ -9685,6 +9861,11 @@ fn crash_log_path() -> PathBuf {
         .unwrap_or_else(|| std::env::temp_dir().join("lyre-crash.log"))
 }
 
+/// Write a panic to a file beside the settings before the window closes.
+///
+/// A release build is a window, not a console program, so a panic takes the
+/// window away and leaves nothing to read: "it just closed" is all anyone can
+/// report. The hook keeps the file the next report can name.
 fn record_panics() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -9955,7 +10136,7 @@ fn main() {
             WindowOptions {
                 borderless: true,
                 resizable: true,
-                min_size: Some((760.0, 480.0)),
+                min_size: Some((MIN_W, MIN_H)),
                 physical_size: physical,
                 transparent: cfg!(target_os = "macos"),
                 ..Default::default()
@@ -10254,10 +10435,16 @@ mod window_tests {
 
     #[test]
     fn a_size_below_the_minimum_is_raised_to_it() {
-        // 760x480 is the window's floor at this scale.
-        assert_eq!(fit_to_screen((300, 200), (1920, 1080), 1.0), Some((760, 480)));
+        // The window's own floor at this scale.
+        assert_eq!(
+            fit_to_screen((300, 200), (1920, 1080), 1.0),
+            Some((MIN_W as u32, MIN_H as u32))
+        );
         // At 2x the floor is twice as many physical pixels.
-        assert_eq!(fit_to_screen((300, 200), (3840, 2160), 2.0), Some((1520, 960)));
+        assert_eq!(
+            fit_to_screen((300, 200), (3840, 2160), 2.0),
+            Some(((MIN_W * 2.0) as u32, (MIN_H * 2.0) as u32))
+        );
     }
 
     #[test]
@@ -11054,6 +11241,50 @@ mod tests {
 #[cfg(test)]
 mod click_tests {
     use super::*;
+
+    /// What hangs past the right edge of a window this size.
+    fn past_the_edge(width: f32, height: f32, prepare: impl Fn(&mut App)) -> Vec<(String, [f32; 4])> {
+        let mut rt = rune::Runtime::new(init(), view, (width, height), rune::Env::new(true, 1.0));
+        // The harness draws no paint pass, so the window's own measurement never
+        // lands in the cell the layout reads; a real window fills it on its first
+        // frame. Prime it so this measures the narrow case and not the fallback.
+        rt.state.rect_window.set([0.0, 0.0, width, height]);
+        rt.update(|s, _tx| {
+            prepare(s);
+            s.rect_window.set([0.0, 0.0, width, height]);
+        });
+        // The first frame measures the window; the second lays out for it.
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+        rt.elements()
+            .into_iter()
+            .filter_map(|e| {
+                let key = e.key?;
+                // A scroll view lays its contents out past the edge on purpose;
+                // everything else belongs inside the window.
+                (e.rect[0] + e.rect[2] > width + 0.5 && !key.contains("viewport"))
+                    .then_some((key, e.rect))
+            })
+            .collect()
+    }
+
+    /// The reported bug: at a narrow window the Quick Access tiles ran off the
+    /// right edge, and a long file name was drawn over the date beside it.
+    #[test]
+    fn nothing_hangs_past_the_edge_of_a_narrow_window() {
+        for width in [MIN_W, 420.0, 520.0, 620.0, 700.0, 760.0] {
+            for page in 0..3 {
+                let past = past_the_edge(width, 300.0, |s| match page {
+                    0 => load(s, Fixture::QuickAccess),
+                    1 => load(s, Fixture::Downloads),
+                    _ => {
+                        navigate(s, 9);
+                    }
+                });
+                assert!(past.is_empty(), "page {page} hangs past {width}: {past:?}");
+            }
+        }
+    }
 
     /// The dialog draws one button per entry of the list the keyboard walks, so
     /// the two can never offer different things.

@@ -761,8 +761,8 @@ struct App {
     selection_detail: String,
     notice: String,
     search_edit: TextEdit,
-    history: Vec<PathBuf>,
-    forward: Vec<PathBuf>,
+    history: Vec<Spot>,
+    forward: Vec<Spot>,
     sort: u8,
     sort_desc: bool,
     group_by_date: bool,
@@ -952,8 +952,8 @@ struct App {
 #[derive(Clone)]
 struct Tab {
     root: PathBuf,
-    history: Vec<PathBuf>,
-    forward: Vec<PathBuf>,
+    history: Vec<Spot>,
+    forward: Vec<Spot>,
     view: View,
     mode: Mode,
     name: String,
@@ -2158,6 +2158,56 @@ fn drain_scan(s: &mut App) -> bool {
     true
 }
 
+/// Where a window can be, as one step of its history: a folder, or one of the
+/// pages that is drawn from state rather than read from disk.
+///
+/// This PC, Quick Access and the Gallery have no path of their own. They keep
+/// the last real folder behind them only so a return to it still reloads, and
+/// that folder was all history used to record: it is why Back out of a folder
+/// skipped the page and landed on whatever the page had been opened from.
+#[derive(Clone)]
+struct Spot {
+    view: View,
+    root: PathBuf,
+}
+
+/// Where the window is now, as history records it.
+fn spot_of(s: &App) -> Spot {
+    Spot { view: s.view, root: s.root.clone() }
+}
+
+/// Put the window back on a recorded step.
+///
+/// Each arm is what the rail's press for that page does, so going back to a
+/// page and pressing its row cannot draw it two different ways.
+fn restore(s: &mut App, spot: Spot) {
+    match spot.view {
+        // A folder can be gone by the time the step is walked back over: a
+        // deleted directory, an unplugged drive. Explorer says the location is
+        // not available and stays where it is, rather than drawing an empty
+        // folder that is not empty.
+        View::Files => {
+            let path = link_target_to_read(&spot.root).unwrap_or(spot.root);
+            if path.is_dir() {
+                set_location(s, path);
+            } else {
+                s.notice = format!("{} is not available here", path.display());
+            }
+        }
+        View::QuickAccess => load(s, Fixture::QuickAccess),
+        View::ThisPc => {
+            load(s, Fixture::ThisPc);
+            refresh_volumes(s);
+        }
+        // Pictures can be removed between the step being taken and walked back
+        // to; there is then no Gallery to draw and the window stays put.
+        View::Gallery => match gallery_folder() {
+            Some(pictures) => show_gallery(s, pictures),
+            None => s.notice = "Pictures is not available here".into(),
+        },
+    }
+}
+
 /// Navigate to a folder and start reading it.
 fn set_location(s: &mut App, path: PathBuf) {
     clear_search(s);
@@ -2217,26 +2267,53 @@ fn go(s: &mut App, path: PathBuf) {
     // The folder as it is meant: a link the shell will not read through opens
     // the folder it names instead of an empty page.
     let path = link_target_to_read(&path).unwrap_or(path);
-    s.history.push(s.root.clone());
+    s.history.push(spot_of(s));
     s.forward.clear();
     set_location(s, path);
 }
 
+/// Open Quick Access. A re-press is a no-op, as with the other pages.
+fn open_quick_access(s: &mut App) {
+    s.menu = None;
+    if s.view == View::QuickAccess {
+        return;
+    }
+    s.history.push(spot_of(s));
+    s.forward.clear();
+    load(s, Fixture::QuickAccess);
+}
+
+/// Open This PC. A re-press only re-reads the drives, which is what its row is
+/// for, rather than adding a step that Back would have to walk out of.
+fn open_this_pc(s: &mut App) {
+    s.menu = None;
+    if s.view == View::ThisPc {
+        refresh_volumes(s);
+        return;
+    }
+    s.history.push(spot_of(s));
+    s.forward.clear();
+    load(s, Fixture::ThisPc);
+    refresh_volumes(s);
+}
+
 fn go_back(s: &mut App) {
-    if let Some(previous) = s.history.pop() {
-        s.forward.push(s.root.clone());
-        set_location(s, previous);
-    } else {
-        s.notice = "Nothing to go back to".into();
+    match s.history.pop() {
+        Some(previous) => {
+            s.forward.push(spot_of(s));
+            restore(s, previous);
+        }
+        None => s.notice = "Nothing to go back to".into(),
     }
 }
 
 fn go_forward(s: &mut App) {
-    if let Some(next) = s.forward.pop() {
-        s.history.push(s.root.clone());
-        set_location(s, next);
-    } else {
-        s.notice = "Nothing to go forward to".into();
+    match s.forward.pop() {
+        Some(next) => {
+            s.history.push(spot_of(s));
+            restore(s, next);
+        }
+        None => s.notice = "Nothing to go forward to".into(),
     }
 }
 
@@ -2264,11 +2341,8 @@ fn navigate(s: &mut App, index: usize) {
     s.menu = None;
     match index {
         0 => open_home(s),
-        2 => load(s, Fixture::QuickAccess),
-        9 => {
-            load(s, Fixture::ThisPc);
-            refresh_volumes(s);
-        }
+        2 => open_quick_access(s),
+        9 => open_this_pc(s),
         10 => s.notice = "Network browsing is not implemented in this slice".into(),
         1 => go_gallery(s),
         i => {
@@ -4028,7 +4102,7 @@ fn crumb_segments(s: &App) -> Vec<(String, PathBuf)> {
 /// the prefix path it names.
 fn open_crumb(s: &mut App, path: PathBuf) {
     match s.view {
-        View::QuickAccess => load(s, Fixture::QuickAccess),
+        View::QuickAccess => open_quick_access(s),
         View::ThisPc => navigate(s, 9),
         View::Gallery => go_gallery(s),
         View::Files => go(s, path),
@@ -4066,7 +4140,7 @@ fn commit_address(s: &mut App) {
     }
     match draft.to_ascii_lowercase().as_str() {
         "home" => return open_home(s),
-        "quick access" | "quickaccess" => return load(s, Fixture::QuickAccess),
+        "quick access" | "quickaccess" => return open_quick_access(s),
         "this pc" | "thispc" => return navigate(s, 9),
         "gallery" => return go_gallery(s),
         _ => {}
@@ -8796,10 +8870,16 @@ fn sweep_images(root: &Path, limit: usize, max_depth: usize) -> Vec<Entry> {
     out
 }
 
+/// The Pictures library the Gallery is drawn from: wherever this machine keeps
+/// it, since a redirected or moved Pictures is still the Gallery's.
+fn gallery_folder() -> Option<PathBuf> {
+    let home = home_dir()?;
+    known::folder(&home, "Pictures")
+}
+
 /// Re-read the Pictures library into the Gallery's entries.
 fn refresh_gallery(s: &mut App) {
-    let Some(home) = home_dir() else { return };
-    let Some(pictures) = known::folder(&home, "Pictures") else { return };
+    let Some(pictures) = gallery_folder() else { return };
     s.entries = sweep_images(&pictures, 4000, 8);
     s.visible = (0..s.entries.len()).collect();
     s.count = s.entries.len();
@@ -8815,18 +8895,20 @@ fn go_gallery(s: &mut App) {
     if s.view == View::Gallery {
         return;
     }
-    let Some(home) = home_dir() else {
-        s.notice = "Pictures is not available here".into();
-        return;
-    };
     // Pictures is wherever this machine keeps it: a redirected or moved
     // Pictures library is still the Gallery's.
-    let Some(pictures) = known::folder(&home, "Pictures") else {
+    let Some(pictures) = gallery_folder() else {
         s.notice = "Pictures is not available here".into();
         return;
     };
-    s.history.push(s.root.clone());
+    s.history.push(spot_of(s));
     s.forward.clear();
+    show_gallery(s, pictures);
+}
+
+/// Draw the Gallery from `pictures`, which opening it and a step back to it
+/// share.
+fn show_gallery(s: &mut App, pictures: PathBuf) {
     s.root = pictures;
     s.view = View::Gallery;
     s.tab = "Gallery".into();
@@ -8838,6 +8920,7 @@ fn go_gallery(s: &mut App) {
     clear_selection(s);
     s.notice.clear();
     s.search_edit.text.clear();
+    s.menu = None;
     s.keep_order = false;
     s.count_override = None;
     refresh_gallery(s);
@@ -10734,6 +10817,187 @@ mod click_tests {
             tab_label(&rt, 0),
             "Home",
             "the strip must name the folder on screen, not the tab it was opened at"
+        );
+    }
+    /// The reported bug, through the control the person actually presses: This
+    /// PC, then a folder, then Back left the window on whatever folder This PC
+    /// had been opened from rather than returning to This PC.
+    #[test]
+    fn the_back_button_returns_to_this_pc() {
+        let mut rt = runtime();
+        let pc = rect_of(&rt, "rail-9");
+        click_at(&mut rt, pc[0] + pc[2] * 0.5, pc[1] + pc[3] * 0.5);
+        assert!(rt.state.view == View::ThisPc, "the press opened This PC");
+        // Home is a folder on every platform, unlike Desktop.
+        let home = rect_of(&rt, "rail-0");
+        click_at(&mut rt, home[0] + home[2] * 0.5, home[1] + home[3] * 0.5);
+        assert!(rt.state.view == View::Files, "the second press opened Home");
+        let back = rect_of(&rt, "back");
+        click_at(&mut rt, back[0] + back[2] * 0.5, back[1] + back[3] * 0.5);
+        assert!(
+            rt.state.view == View::ThisPc,
+            "the Back button must return to This PC"
+        );
+    }
+}
+
+#[cfg(test)]
+mod history_tests {
+    use super::*;
+
+    /// A folder on disk that is not one of the rail's places.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lyre-history-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The reported bug: This PC, then a folder, then Back did not return to
+    /// This PC. History kept bare paths, and This PC has none of its own: it
+    /// stood on the last real folder, that folder was what got recorded, and
+    /// Back walked out of the page instead of going back to it.
+    #[test]
+    fn back_from_a_folder_returns_to_this_pc() {
+        let mut s = init();
+        navigate(&mut s, 9);
+        assert!(s.view == View::ThisPc, "the rail press opened This PC");
+        let folder = scratch("thispc");
+        go(&mut s, folder.clone());
+        assert!(s.view == View::Files, "the folder opened");
+        go_back(&mut s);
+        assert!(
+            s.view == View::ThisPc,
+            "Back must return to This PC, not to the folder This PC was opened from"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// The same for the landing page, which has no path either.
+    #[test]
+    fn back_returns_to_quick_access() {
+        let mut s = init();
+        let folder = scratch("quick");
+        go(&mut s, folder.clone());
+        navigate(&mut s, 2);
+        assert!(s.view == View::QuickAccess, "the rail press opened Quick Access");
+        let inner = folder.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        go(&mut s, inner);
+        go_back(&mut s);
+        assert!(s.view == View::QuickAccess, "Back must return to Quick Access");
+        go_back(&mut s);
+        assert!(s.view == View::Files, "and once more to the folder before it");
+        assert!(same_path(&s.root, &folder), "which is the folder it was");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// Forward walks the same steps the other way.
+    #[test]
+    fn forward_returns_to_the_folder_back_left() {
+        let mut s = init();
+        let first = scratch("fwd-a");
+        let second = scratch("fwd-b");
+        go(&mut s, first.clone());
+        go(&mut s, second.clone());
+        go_back(&mut s);
+        assert!(same_path(&s.root, &first), "Back returned to the first folder");
+        go_forward(&mut s);
+        assert!(same_path(&s.root, &second), "Forward returned to the second");
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&second);
+    }
+
+    /// Forward has to come back to a page too, not only to a folder.
+    #[test]
+    fn forward_returns_to_this_pc() {
+        let mut s = init();
+        navigate(&mut s, 9);
+        let folder = scratch("fwd-pc");
+        go(&mut s, folder.clone());
+        go_back(&mut s);
+        assert!(s.view == View::ThisPc);
+        go_forward(&mut s);
+        assert!(
+            s.view == View::Files && same_path(&s.root, &folder),
+            "Forward must return to the folder Back left"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// Pressing the page already on screen is not a step: two presses of This PC
+    /// must not need two presses of Back to leave it.
+    #[test]
+    fn pressing_the_page_you_are_on_does_not_stack_a_step() {
+        let mut s = init();
+        navigate(&mut s, 9);
+        let depth = s.history.len();
+        navigate(&mut s, 9);
+        assert_eq!(s.history.len(), depth, "a re-press is not another step");
+    }
+
+    /// A window closed over a page and opened again on it still has its steps.
+    #[test]
+    fn the_gallery_keeps_its_place_in_history() {
+        if gallery_folder().is_none() {
+            // A machine without Pictures has no Gallery to enter.
+            return;
+        }
+        let mut s = init();
+        let folder = scratch("gallery");
+        go(&mut s, folder.clone());
+        navigate(&mut s, 1);
+        assert!(s.view == View::Gallery, "the rail press opened the Gallery");
+        let inner = folder.join("inner");
+        std::fs::create_dir_all(&inner).unwrap();
+        go(&mut s, inner);
+        go_back(&mut s);
+        assert!(s.view == View::Gallery, "Back must return to the Gallery");
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// Each tab carries its own steps, pages included: a tab sitting on This PC
+    /// behind a folder still steps back to This PC after another tab is used.
+    #[test]
+    fn a_tab_keeps_its_own_steps_back_to_a_page() {
+        let mut s = init();
+        navigate(&mut s, 9);
+        let folder = scratch("tabs");
+        go(&mut s, folder.clone());
+        // A second tab on Quick Access, then back to the first.
+        new_tab(&mut s);
+        switch_tab(&mut s, 0);
+        assert!(
+            s.view == View::Files && same_path(&s.root, &folder),
+            "the first tab came back where it was"
+        );
+        go_back(&mut s);
+        assert!(
+            s.view == View::ThisPc,
+            "the tab's own step back is the page it was on"
+        );
+        let _ = std::fs::remove_dir_all(&folder);
+    }
+
+    /// A step back over a folder that has since gone says so and stays put,
+    /// rather than drawing a folder that is not there.
+    #[test]
+    fn back_to_a_folder_that_is_gone_says_so() {
+        let mut s = init();
+        let folder = scratch("gone");
+        let elsewhere = std::env::temp_dir();
+        go(&mut s, folder.clone());
+        go(&mut s, elsewhere.clone());
+        std::fs::remove_dir_all(&folder).unwrap();
+        go_back(&mut s);
+        assert!(
+            s.notice.contains("is not available here"),
+            "the window should say the folder is gone, got {:?}",
+            s.notice
+        );
+        assert!(
+            same_path(&s.root, &elsewhere),
+            "and stay where it is instead of showing nothing"
         );
     }
 }

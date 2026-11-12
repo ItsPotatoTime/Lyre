@@ -4,6 +4,21 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
+## [Unreleased]
+
+### Fixed
+
+- **Back returns to the page you came from.** History recorded folders, and
+  This PC, Quick Access and the Gallery are not folders: each keeps the last real
+  folder behind it, and that folder was the whole of what a step recorded. Opening
+  This PC and then a folder inside it, Back went to whatever This PC itself had
+  been opened from instead of returning to the drive list. A step now names the
+  page as well as the folder, so Back, Forward, `Alt+Left`/`Right` and the mouse's
+  side buttons all land on the page that was left, and pressing a page you are
+  already on is not a step of its own. A folder deleted since, or a drive
+  unplugged since, says it is not available there and leaves the window where it
+  is rather than drawing an empty folder.
+
 ## [0.3.2]
 
 A patch release for the rail: its places are found where the system keeps them,

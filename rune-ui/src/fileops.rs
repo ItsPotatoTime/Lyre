@@ -67,15 +67,32 @@ pub fn free_path(dst: &Path) -> PathBuf {
     dst.to_path_buf()
 }
 
+/// How deep a walk follows folders. A link that points back at a folder above
+/// it makes the tree endless, and following it to the end overflows the stack,
+/// which takes the whole application down rather than failing the operation.
+const MAX_DEPTH: usize = 512;
+
 /// Recursive size in bytes, for the progress bar's total.
 fn item_size(path: &Path) -> u64 {
-    match fs::metadata(path) {
-        Ok(meta) if meta.is_dir() => fs::read_dir(path)
-            .map(|rd| rd.flatten().map(|e| item_size(&e.path())).sum())
-            .unwrap_or(0),
-        Ok(meta) => meta.len(),
-        Err(_) => 0,
+    size_of(path, 0)
+}
+
+fn size_of(path: &Path, depth: usize) -> u64 {
+    if depth > MAX_DEPTH {
+        return 0;
     }
+    let Ok(meta) = fs::symlink_metadata(path) else { return 0 };
+    // A link is not the folder it names: walking through it is how a tree with
+    // one link back upstairs becomes endless.
+    if meta.file_type().is_symlink() {
+        return 0;
+    }
+    if !meta.is_dir() {
+        return meta.len();
+    }
+    fs::read_dir(path)
+        .map(|rd| rd.flatten().map(|e| size_of(&e.path(), depth + 1)).sum())
+        .unwrap_or(0)
 }
 
 fn copy_item(
@@ -84,8 +101,21 @@ fn copy_item(
     cancel: &AtomicBool,
     report: &mut dyn FnMut(u64),
 ) -> Result<(), String> {
+    copy_at(src, dst, 0, cancel, report)
+}
+
+fn copy_at(
+    src: &Path,
+    dst: &Path,
+    depth: usize,
+    cancel: &AtomicBool,
+    report: &mut dyn FnMut(u64),
+) -> Result<(), String> {
     if cancel.load(Ordering::Relaxed) {
         return Err("Cancelled".into());
+    }
+    if depth > MAX_DEPTH {
+        return Err(format!("{}: the folders nest too deeply to copy", src.display()));
     }
     let meta = fs::metadata(src).map_err(|e| format!("{}: {e}", src.display()))?;
     if meta.is_dir() {
@@ -94,7 +124,17 @@ fn copy_item(
         for entry in entries.flatten() {
             let from = entry.path();
             let to = dst.join(entry.file_name());
-            copy_item(&from, &to, cancel, report)?;
+            // A link is copied as what it is rather than walked through: a
+            // junction back up the tree would otherwise copy forever.
+            if entry
+                .file_type()
+                .map(|kind| kind.is_symlink())
+                .unwrap_or(false)
+            {
+                copy_link(&from, &to)?;
+                continue;
+            }
+            copy_at(&from, &to, depth + 1, cancel, report)?;
         }
         Ok(())
     } else {
@@ -105,6 +145,41 @@ fn copy_item(
         report(copied);
         Ok(())
     }
+}
+
+/// Make a link at `dst` that points where `src` points.
+///
+/// A link is never walked through while copying: a junction that points back up
+/// the tree would copy until the stack ran out, which takes the whole window
+/// down rather than failing one operation.
+#[cfg(windows)]
+fn copy_link(src: &Path, dst: &Path) -> Result<(), String> {
+    let target = fs::read_link(src).map_err(|e| format!("{}: {e}", src.display()))?;
+    if target.is_dir() {
+        // A junction needs no privilege, where a real symlink does.
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(dst)
+            .arg(&target)
+            .status();
+        if made.is_ok_and(|status| status.success()) {
+            return Ok(());
+        }
+    }
+    // A file link, or a junction this account may not make: the link is left
+    // out of the copy rather than failing the rest of it.
+    Ok(())
+}
+
+#[cfg(unix)]
+fn copy_link(src: &Path, dst: &Path) -> Result<(), String> {
+    let target = fs::read_link(src).map_err(|e| format!("{}: {e}", src.display()))?;
+    std::os::unix::fs::symlink(target, dst).map_err(|e| format!("{}: {e}", dst.display()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn copy_link(_src: &Path, _dst: &Path) -> Result<(), String> {
+    Ok(())
 }
 
 fn remove_item(path: &Path) -> Result<(), String> {
@@ -401,6 +476,49 @@ mod tests {
 
     fn noop(_: Progress) -> bool {
         true
+    }
+
+    /// A folder holding a link back to a folder above it is endless if a copy
+    /// walks through links: the walk ran until the stack gave out, which ends
+    /// the whole application rather than failing one operation.
+    #[cfg(windows)]
+    #[test]
+    fn copying_a_folder_that_links_back_up_finishes() {
+        let base = scratch("loop");
+        let folder = base.join("folder");
+        fs::create_dir_all(folder.join("inner")).unwrap();
+        fs::write(folder.join("inner/kept.txt"), b"x").unwrap();
+        // A junction from inside the folder back to the folder itself.
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(folder.join("inner").join("back"))
+            .arg(&folder)
+            .output()
+            .expect("cmd runs");
+        assert!(
+            output.status.success(),
+            "the test needs a junction to make: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            folder.join("inner/back").is_dir(),
+            "the junction points at the folder"
+        );
+
+        // The size walk the progress bar uses has to come back too.
+        let _ = item_size(&folder);
+
+        let dest = base.join("copy");
+        fs::create_dir_all(&dest).unwrap();
+        let cancel = AtomicBool::new(false);
+        if let Err(error) = paste(Mode::Copy, Conflict::Rename, &[folder.clone()], &dest, &cancel, noop) {
+            panic!("the copy must finish, it said: {error}");
+        }
+        assert!(
+            dest.join("folder/inner/kept.txt").exists(),
+            "the files inside are copied"
+        );
+        let _ = fs::remove_dir_all(&base);
     }
 
     /// A folder copy must report bytes while it runs, not only at the end:

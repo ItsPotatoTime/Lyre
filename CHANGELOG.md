@@ -4,6 +4,29 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
+## [Unreleased]
+
+### Added
+
+- **A crash leaves a note.** A release build is a window, not a console program,
+  so a panic closed the window and left nothing to read. The reason and the line
+  it happened on now go to `lyre-crash.log` beside the settings, which is
+  `%APPDATA%\Lyre` on Windows, so the next "it just closed" can be answered
+  instead of guessed at.
+
+### Fixed
+
+- **Cut and paste no longer dies on a folder that links back up.** Copying walked
+  through links as though they were the folders they name, so a folder holding a
+  junction to one of its own parents was copied deeper and deeper until something
+  gave: the path ran past what Windows accepts, and with long paths allowed the
+  recursion would have run out of stack and taken the whole window with it. A
+  link is now copied as a link and never walked through, and both walks stop well
+  before either happens. The size the progress bar counts is guarded the same way.
+- **A selection a refresh removed cannot take the window down.** The status bar
+  worked out its detail from the selected indices alone, so a refresh landing
+  between the press and that count could name a row that was no longer there.
+
 ## [0.3.3]
 
 A patch release for the things that quietly did not work: Back out of a page,

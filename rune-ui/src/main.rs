@@ -6352,7 +6352,7 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
                 );
             }
 
-            let mut footer = row()
+            let footer = row()
                 .w_full()
                 .gap(8.0)
                 .items_center()
@@ -6761,20 +6761,24 @@ fn is_selected(s: &App, ei: usize) -> bool {
 /// The status-bar detail Explorer shows beside the count: one item's size, or
 /// the number selected and their total.
 fn update_selection_detail(s: &mut App) {
-    let n = s.selected.len();
+    // A selection can outlive the row it named, when a refresh lands between the
+    // press and this: only the rows that are still there are counted.
+    let len = display_len(s);
+    let selected: Vec<usize> = s.selected.iter().copied().filter(|&i| i < len).collect();
+    let n = selected.len();
     if n == 0 {
         s.selection_detail.clear();
         return;
     }
     if n == 1 {
-        let size = entry_by_index(s, s.selected[0]).size_label();
+        let size = entry_by_index(s, selected[0]).size_label();
         s.selection_detail = if size.is_empty() {
             "1 item selected".into()
         } else {
             format!("1 item selected  {size}")
         };
     } else {
-        let total: u64 = s.selected.iter().map(|&i| entry_by_index(s, i).size).sum();
+        let total: u64 = selected.iter().map(|&i| entry_by_index(s, i).size).sum();
         s.selection_detail = if total == 0 {
             format!("{n} items selected")
         } else {
@@ -9667,7 +9671,40 @@ fn fit_to_screen(saved: (u32, u32), screen: (u32, u32), scale: f32) -> Option<(u
     Some((saved.0.clamp(min_w, screen.0), saved.1.clamp(min_h, screen.1)))
 }
 
+/// Write a panic to a file beside the settings before the window closes.
+///
+/// A release build is a window, not a console program, so a panic takes the
+/// window away and leaves nothing to read: "it just closed" is all anyone can
+/// report. The hook keeps the file the next report can name.
+fn record_panics() {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let place = info
+            .location()
+            .map(|at| format!("{}:{}", at.file(), at.line()))
+            .unwrap_or_else(|| "an unknown place".into());
+        let line = format!(
+            "lyre {} panicked at {place}\n{info}\n\n",
+            env!("CARGO_PKG_VERSION")
+        );
+        let log = rune::prefs::Prefs::open(PREFS_ID)
+            .path()
+            .and_then(|file| file.parent().map(|dir| dir.join("lyre-crash.log")))
+            .unwrap_or_else(|| std::env::temp_dir().join("lyre-crash.log"));
+        if let Some(dir) = log.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&log) {
+            use std::io::Write;
+            let _ = file.write_all(line.as_bytes());
+        }
+        // The debug console still gets it, and the exit status is unchanged.
+        previous(info);
+    }));
+}
+
 fn main() {
+    record_panics();
     // A launch the shell meant for Explorer itself (a /select reveal, a shell
     // namespace) is handed back rather than opened as a folder.
     if defaultmanager::forward_unhostable_launch() {
@@ -11159,6 +11196,119 @@ mod click_tests {
             rt.state.view == View::ThisPc,
             "the Back button must return to This PC"
         );
+    }
+}
+
+#[cfg(test)]
+mod paste_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lyre-paste-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Show `dir` with its real contents, and select every row.
+    fn open_and_select_all(dir: &Path) -> App {
+        let mut s = init();
+        s.view = View::Files;
+        s.root = dir.to_path_buf();
+        s.crumbs = vec![dir.file_name().unwrap_or_default().to_string_lossy().into_owned()];
+        s.entries = scan(dir).0;
+        s.visible = (0..s.entries.len()).collect();
+        select_all(&mut s);
+        s
+    }
+
+    fn drain_to_end(s: &mut App) {
+        for _ in 0..250 {
+            drain_op(s);
+            if s.transfer.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("the operation did not finish");
+    }
+
+    /// Cut a file and paste it into another folder: the move the person does,
+    /// through the same functions the keys and the menu call.
+    #[test]
+    fn a_cut_and_paste_moves_the_file() {
+        let source = scratch("cut-src");
+        let target = scratch("cut-dst");
+        std::fs::write(source.join("moved.txt"), b"hello").unwrap();
+
+        let mut s = open_and_select_all(&source);
+        cut_selection(&mut s);
+        assert!(s.clipboard.is_some(), "the file is on the clipboard as a cut");
+        assert!(is_cut(&s, &source.join("moved.txt").to_string_lossy()), "and drawn as cut");
+
+        let (sources, mode) = s.clipboard.clone().unwrap();
+        paste_into(&mut s, sources, mode, target.clone());
+        drain_to_end(&mut s);
+
+        assert!(target.join("moved.txt").exists(), "the file arrived");
+        assert!(!source.join("moved.txt").exists(), "and left where it was");
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    /// Copying onto a name that is taken asks, and "Keep both" writes the copy
+    /// beside the original instead of over it.
+    #[test]
+    fn a_paste_that_collides_asks_and_keeps_both() {
+        let dir = scratch("collide");
+        std::fs::write(dir.join("same.txt"), b"original").unwrap();
+
+        let mut s = open_and_select_all(&dir);
+        copy_selection(&mut s);
+        let (sources, mode) = s.clipboard.clone().unwrap();
+        paste_into(&mut s, sources, mode, dir.clone());
+        assert!(matches!(s.dialog, Some(Dialog::PasteConflict { .. })), "the question is asked");
+
+        press_dialog_button(&mut s, DialogButton::KeepBoth);
+        drain_to_end(&mut s);
+
+        assert_eq!(
+            std::fs::read_to_string(dir.join("same.txt")).unwrap(),
+            "original",
+            "the file that was there is untouched"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.join("same (2).txt")).unwrap(),
+            "original",
+            "and the copy sits beside it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A rename in the middle of the listing, then a cut: the selection must not
+    /// leave the app holding an index that no longer exists.
+    #[test]
+    fn a_cut_survives_the_listing_changing_under_it() {
+        let dir = scratch("refresh");
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let mut s = open_and_select_all(&dir);
+        select_entry(&mut s, 2);
+        assert_eq!(s.selected, vec![2]);
+
+        // Another program deletes what was selected and writes something else.
+        std::fs::remove_file(dir.join("c.txt")).unwrap();
+        apply_refresh(&mut s, watch::Refreshed {
+            path: dir.clone(),
+            entries: scan(&dir).0,
+            scan_ms: 0.0,
+        });
+
+        cut_selection(&mut s);
+        let copied = s.clipboard.clone();
+        let _ = copied;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

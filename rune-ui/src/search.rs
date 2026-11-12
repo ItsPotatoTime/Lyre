@@ -24,6 +24,31 @@ const MAX_SCANNED: usize = 5_000_000;
 const MAX_DEPTH: usize = 32;
 const BATCH_ITEMS: usize = 24;
 const BATCH_MS: u64 = 40;
+/// Names held for reuse by the next query. Roughly 40 bytes each with the
+/// directory path shared, so this is about 80 MB at the ceiling; past it the
+/// cache is abandoned rather than truncated, because a short index would answer
+/// later queries with missing results instead of slow ones.
+const MAX_CACHED: usize = 2_000_000;
+
+/// The names one walk found, so the next query in the same search session can be
+/// answered from memory instead of reading the tree again.
+///
+/// Only names are kept: the metadata a row needs is still read per match, which
+/// keeps a cached answer exactly as fresh as a walked one. It is dropped when the
+/// search box is cleared or the folder changes, so its staleness is bounded by
+/// one typing session rather than by the life of the window.
+pub struct NameCache {
+    /// Directory paths, shared by every name inside them.
+    dirs: Vec<std::sync::Arc<str>>,
+    /// Directory index, name, and whether it is a folder.
+    names: Vec<(u32, Box<str>, bool)>,
+}
+
+impl NameCache {
+    pub fn len(&self) -> usize {
+        self.names.len()
+    }
+}
 
 pub struct Request {
     /// The folder on screen; the walk starts here.
@@ -34,6 +59,9 @@ pub struct Request {
     pub recursive: bool,
     pub show_hidden: bool,
     pub show_protected: bool,
+    /// The names a previous walk gathered, when it finished and covered this
+    /// folder. Supplying it answers the query without touching the disk.
+    pub cache: Option<std::sync::Arc<NameCache>>,
 }
 
 #[derive(Clone)]
@@ -49,6 +77,8 @@ pub enum Event {
     Local { items: Vec<Hit>, matched: usize, elapsed_ms: u64 },
     /// Results found deeper in the tree, as they arrive.
     Batch { items: Vec<Hit>, scanned: usize },
+    /// The names this walk gathered, for the next query to answer from memory.
+    Index(std::sync::Arc<NameCache>),
     Done { matched: usize, scanned: usize, elapsed_ms: u64, truncated: bool },
 }
 
@@ -184,6 +214,26 @@ pub fn search<F: FnMut(Event) -> bool>(req: &Request, cancel: &AtomicBool, mut e
         return;
     }
 
+    // A walk earlier in this session already read the tree; match against what it
+    // found instead of reading the disk again. Metadata is still read for the
+    // matches, so the answer is as fresh as a walked one.
+    if req.recursive
+        && needle.chars().count() >= 2
+        && let Some(cache) = &req.cache
+    {
+        let (hits, matched) = filter_cache(cache, &pattern, &needle_bytes, req.show_hidden);
+        if !hits.is_empty() && !emit(Event::Batch { items: hits, scanned: cache.len() }) {
+            return;
+        }
+        let _ = emit(Event::Done {
+            matched,
+            scanned: cache.len(),
+            elapsed_ms: started.elapsed().as_millis() as u64,
+            truncated: matched > LIMIT,
+        });
+        return;
+    }
+
     // A single character matches almost everything; walking a tree for it costs
     // far more than the answer is worth.
     if !req.recursive || needle.chars().count() < 2 || matched_local >= LIMIT || req.path.is_empty() {
@@ -297,6 +347,12 @@ struct Walk {
     accepted: std::sync::atomic::AtomicUsize,
     /// Something stopped the walk early: a limit, or the caller leaving.
     cut: AtomicBool,
+    /// Directory paths, interned so each name in one costs only its own text.
+    dirs: std::sync::Mutex<Vec<std::sync::Arc<str>>>,
+    /// Everything read so far, for the next query.
+    names: std::sync::Mutex<Vec<(u32, Box<str>, bool)>>,
+    /// The cap was passed, so this walk's names cannot be used as an index.
+    overflow: AtomicBool,
 }
 
 /// One worker's private matching state, so no lock is needed to score a name.
@@ -308,6 +364,8 @@ struct Scratch {
     folded: String,
     batch: Vec<Hit>,
     last_flush: Instant,
+    /// Names read since the last flush into the shared index.
+    cached: Vec<(u32, Box<str>, bool)>,
 }
 
 impl Scratch {
@@ -320,8 +378,21 @@ impl Scratch {
             folded: String::new(),
             batch: Vec::new(),
             last_flush: Instant::now(),
+            cached: Vec::new(),
         }
     }
+}
+
+/// Move a worker's buffered names into the shared index, one lock per chunk
+/// rather than one per name. Past the cap the index is abandoned, not truncated.
+fn flush_cached(shared: &Walk, buffered: &mut Vec<(u32, Box<str>, bool)>) {
+    let mut names = shared.names.lock().unwrap_or_else(|e| e.into_inner());
+    if names.len() + buffered.len() > MAX_CACHED {
+        shared.overflow.store(true, Ordering::Relaxed);
+        buffered.clear();
+        return;
+    }
+    names.append(buffered);
 }
 
 /// One less than the cores, so the window keeps a core of its own, and never so
@@ -367,6 +438,9 @@ fn walk<F: FnMut(Event) -> bool>(
         matched: AtomicUsize::new(matched_so_far),
         accepted: AtomicUsize::new(0),
         cut: AtomicBool::new(false),
+        dirs: std::sync::Mutex::new(Vec::new()),
+        names: std::sync::Mutex::new(Vec::new()),
+        overflow: AtomicBool::new(false),
     });
 
     let (tx, rx) = mpsc::channel::<Vec<Hit>>();
@@ -402,6 +476,15 @@ fn walk<F: FnMut(Event) -> bool>(
     }
     for handle in handles {
         let _ = handle.join();
+    }
+    // Keep the names for the next query, unless this walk stopped short: a short
+    // index would answer later queries with missing results rather than slow ones.
+    if !shared.overflow.load(Ordering::Relaxed) && !shared.cancel.load(Ordering::Relaxed) {
+        let dirs = std::mem::take(&mut *shared.dirs.lock().unwrap_or_else(|e| e.into_inner()));
+        let names = std::mem::take(&mut *shared.names.lock().unwrap_or_else(|e| e.into_inner()));
+        if !names.is_empty() {
+            let _ = emit(Event::Index(std::sync::Arc::new(NameCache { dirs, names })));
+        }
     }
     let scanned = shared.scanned.load(Ordering::Relaxed);
     let matched = shared.matched.load(Ordering::Relaxed);
@@ -445,6 +528,12 @@ fn work(
             shared.pending.fetch_sub(1, Ordering::Relaxed);
             continue;
         };
+        let dir_index = {
+            let mut dirs = shared.dirs.lock().unwrap_or_else(|e| e.into_inner());
+            let index = dirs.len() as u32;
+            dirs.push(std::sync::Arc::from(dir.to_string_lossy().as_ref()));
+            index
+        };
         let mut subdirs: Vec<(PathBuf, usize)> = Vec::new();
         for item in read.flatten() {
             if shared.cancel.load(Ordering::Relaxed) {
@@ -464,6 +553,12 @@ fn work(
             // Follow real folders only (a link can point at its own parent).
             if is_dir && !is_symlink && depth < MAX_DEPTH {
                 subdirs.push((item.path(), depth + 1));
+            }
+            if !shared.overflow.load(Ordering::Relaxed) {
+                scratch.cached.push((dir_index, Box::from(&*name), is_dir));
+                if scratch.cached.len() >= 512 {
+                    flush_cached(shared, &mut scratch.cached);
+                }
             }
             let Some(score) = score_name(
                 &scratch.pattern,
@@ -532,6 +627,53 @@ fn work(
     if !scratch.batch.is_empty() {
         let _ = tx.send(scratch.batch);
     }
+    if !scratch.cached.is_empty() {
+        flush_cached(shared, &mut scratch.cached);
+    }
+}
+
+/// Answer a query from names already gathered, reading metadata only for what
+/// ends up shown. This is the walk's match path with the directory reads removed.
+fn filter_cache(
+    cache: &NameCache,
+    pattern: &Pattern,
+    needle: &Needle,
+    show_hidden: bool,
+) -> (Vec<Hit>, usize) {
+    let mut matcher = Matcher::new(Config::DEFAULT);
+    let mut buf = Vec::new();
+    let mut folded = String::new();
+    let mut hits = Vec::new();
+    let mut matched = 0usize;
+    for (dir, name, is_dir) in &cache.names {
+        if !show_hidden && name.starts_with('.') {
+            continue;
+        }
+        let Some(score) = score_name(pattern, needle, name, &mut folded, &mut buf, &mut matcher)
+        else {
+            continue;
+        };
+        matched += 1;
+        if hits.len() >= LIMIT {
+            continue;
+        }
+        let hay = if name.is_ascii() {
+            &**name
+        } else {
+            fold_into(name, &mut folded);
+            folded.as_str()
+        };
+        let mut indices = Vec::new();
+        pattern.indices(Utf32Str::new(hay, &mut buf), &mut matcher, &mut indices);
+        indices.sort_unstable();
+        indices.dedup();
+        let folder = cache.dirs.get(*dir as usize).map(|path| &**path).unwrap_or("");
+        let path = Path::new(folder).join(&**name);
+        if let Some(entry) = describe(name.to_string(), path, *is_dir) {
+            hits.push(Hit { entry, score, indices });
+        }
+    }
+    (hits, matched)
 }
 
 /// Build a display row for a match found in the walk; metadata is paid for only
@@ -667,6 +809,7 @@ mod speed_tests {
             recursive: false,
             show_hidden: false,
             show_protected: false,
+            cache: None,
         };
         let mut out = Vec::new();
         search(&req, &AtomicBool::new(false), |event| {
@@ -704,6 +847,71 @@ mod speed_tests {
         assert_eq!(local_order("read", entries), ["README.md"]);
     }
 
+    /// The whole point of the index is that it answers exactly what the walk
+    /// would have. If these ever differ, the cache is a lie.
+    #[test]
+    fn a_cached_answer_equals_a_walked_one() {
+        let dir = std::env::temp_dir().join(format!("lyre-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        for name in [
+            "report.docx",
+            "notes.txt",
+            "Résumé.pdf",
+            "unrelated.bin",
+            "sub/report-final.txt",
+            "sub/other.md",
+        ] {
+            std::fs::write(dir.join(name), b"x").unwrap();
+        }
+        let root = dir.to_string_lossy().into_owned();
+
+        let request = |cache| Request {
+            path: root.clone(),
+            local: Vec::new(),
+            query: "report".into(),
+            recursive: true,
+            show_hidden: false,
+            show_protected: false,
+            cache,
+        };
+
+        let mut walked = Vec::new();
+        let mut index = None;
+        search(&request(None), &AtomicBool::new(false), |event| {
+            match event {
+                Event::Batch { items, .. } => walked.extend(items),
+                Event::Index(built) => index = Some(built),
+                _ => {}
+            }
+            true
+        });
+        assert!(walked.len() >= 2, "the walk should find both reports");
+        let index = index.expect("a completed walk hands back its names");
+
+        let mut cached = Vec::new();
+        search(&request(Some(index)), &AtomicBool::new(false), |event| {
+            if let Event::Batch { items, .. } = event {
+                cached.extend(items);
+            }
+            true
+        });
+
+        // Compare what the interface would actually show: the path, the score and
+        // the highlight positions.
+        let shape = |hits: &[Hit]| {
+            let mut out: Vec<(String, u32, Vec<u32>)> = hits
+                .iter()
+                .map(|hit| (hit.entry.path.clone(), hit.score, hit.indices.clone()))
+                .collect();
+            out.sort();
+            out
+        };
+        assert_eq!(shape(&walked), shape(&cached), "cached and walked answers differ");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// Not a pass/fail check: point `LYRE_SEARCH_BENCH` at a real tree and read
     /// the throughput. Run with `--ignored --nocapture`.
     #[test]
@@ -720,6 +928,7 @@ mod speed_tests {
                 recursive: true,
                 show_hidden: false,
                 show_protected: false,
+                cache: None,
             };
             let started = Instant::now();
             let mut matched = 0;
@@ -727,6 +936,7 @@ mod speed_tests {
             search(&req, &AtomicBool::new(false), |event| {
                 match event {
                     Event::Batch { items, .. } => matched += items.len(),
+                    Event::Index(_) => {}
                     Event::Done { matched: m, scanned: s, .. } => {
                         matched = m;
                         scanned = s;
@@ -776,7 +986,7 @@ mod tests {
     #[test]
     fn fuzzy_matches_subsequence_and_scores_contiguous_higher() {
         let entries = vec![entry("report.txt", false), entry("r_e_p_o_r_t.txt", false), entry("unrelated.md", false)];
-        let req = Request { path: "/folder".into(), local: entries, query: "report".into(), recursive: false, show_hidden: false, show_protected: false };
+        let req = Request { path: "/folder".into(), local: entries, query: "report".into(), recursive: false, show_hidden: false, show_protected: false, cache: None };
         let events = collect_events(&req);
         let items = match &events[0] { Event::Local { items, .. } => items, _ => panic!() };
         assert_eq!(items.len(), 2);
@@ -787,7 +997,7 @@ mod tests {
     #[test]
     fn folders_rank_before_files() {
         let entries = vec![entry("report.txt", false), entry("reports", true)];
-        let req = Request { path: "/folder".into(), local: entries, query: "report".into(), recursive: false, show_hidden: false, show_protected: false };
+        let req = Request { path: "/folder".into(), local: entries, query: "report".into(), recursive: false, show_hidden: false, show_protected: false, cache: None };
         let events = collect_events(&req);
         let items = match &events[0] { Event::Local { items, .. } => items, _ => panic!() };
         assert!(items[0].entry.is_dir, "folders lead even when a file scores similarly");
@@ -796,7 +1006,7 @@ mod tests {
     #[test]
     fn accent_folding_matches_base_letters() {
         let entries = vec![entry("Țări.txt", false), entry("soseaua.doc", false)];
-        let req = Request { path: "/folder".into(), local: entries, query: "tari".into(), recursive: false, show_hidden: false, show_protected: false };
+        let req = Request { path: "/folder".into(), local: entries, query: "tari".into(), recursive: false, show_hidden: false, show_protected: false, cache: None };
         let events = collect_events(&req);
         let items = match &events[0] { Event::Local { items, .. } => items, _ => panic!() };
         assert!(items.iter().any(|h| h.entry.name == "Țări.txt"), "accent-folded match");
@@ -805,7 +1015,7 @@ mod tests {
     #[test]
     fn hidden_files_are_skipped_unless_shown() {
         let entries = vec![entry(".hidden.txt", false), entry("visible.txt", false)];
-        let req = Request { path: "/folder".into(), local: entries, query: "txt".into(), recursive: false, show_hidden: false, show_protected: false };
+        let req = Request { path: "/folder".into(), local: entries, query: "txt".into(), recursive: false, show_hidden: false, show_protected: false, cache: None };
         let events = collect_events(&req);
         let items = match &events[0] { Event::Local { items, .. } => items, _ => panic!() };
         assert_eq!(items.len(), 1);
@@ -815,7 +1025,7 @@ mod tests {
     #[test]
     fn single_character_does_not_walk() {
         let entries = vec![entry("a.txt", false)];
-        let req = Request { path: "/folder".into(), local: entries, query: "a".into(), recursive: true, show_hidden: false, show_protected: false };
+        let req = Request { path: "/folder".into(), local: entries, query: "a".into(), recursive: true, show_hidden: false, show_protected: false, cache: None };
         let events = collect_events(&req);
         // Local then Done, no Batch (no recursive walk for one character).
         assert!(matches!(events.last(), Some(Event::Done { .. })));

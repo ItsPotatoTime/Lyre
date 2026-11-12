@@ -778,6 +778,10 @@ struct App {
     #[cfg(target_os = "windows")]
     pending_os_drag: Option<(Vec<PathBuf>, Option<osdrag::DragPreview>)>,
     /// The window scale, for turning OS drop pixels into window points.
+    /// Names gathered by the last full walk, answering the rest of this search
+    /// session without touching the disk. Dropped when the box is cleared or the
+    /// folder changes, so it cannot outlive what it describes.
+    search_cache: Option<std::sync::Arc<search::NameCache>>,
     /// A query typed but not yet walked, and when it becomes worth walking.
     search_pending: Option<(String, Instant)>,
     /// The letters typed so far, for jumping to a name by typing it.
@@ -2377,6 +2381,7 @@ fn init() -> App {
         type_ahead: String::new(),
         type_ahead_at: Instant::now(),
         search_pending: None,
+        search_cache: None,
         window_settled: (0, 0),
         window_pending: None,
         window_changed_at: Instant::now(),
@@ -6881,6 +6886,8 @@ fn start_search(s: &mut App, query: String) {
         recursive: true,
         show_hidden: s.show_hidden,
         show_protected: s.show_protected,
+        // A walk from earlier in this search session answers without disk reads.
+        cache: s.search_cache.clone(),
     };
     s.search_rx = Some(rx);
     s.search_cancel = Some(cancel);
@@ -6914,6 +6921,11 @@ fn drain_search(s: &mut App) -> bool {
                     s.search_hits.extend(items);
                     s.search_scanned = scanned;
                     changed = true;
+                }
+                search::Event::Index(cache) => {
+                    // Keep it for the rest of this search session: the next
+                    // keystroke is answered from memory.
+                    s.search_cache = Some(cache);
                 }
                 search::Event::Done { matched, scanned, elapsed_ms, truncated } => {
                     s.search_matched = matched;
@@ -6954,6 +6966,9 @@ fn clear_search(s: &mut App) {
     s.search_query.clear();
     s.search_busy = false;
     s.search_pending = None;
+    // The names describe the folder that was being searched; they do not outlive
+    // the search box, so nothing can be answered from a stale index.
+    s.search_cache = None;
     clear_selection(s);
 }
 

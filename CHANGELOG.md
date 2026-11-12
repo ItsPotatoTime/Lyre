@@ -17,6 +17,15 @@ release notes rather than a second copy of them.
 
 ### Fixed
 
+- **Desktop, Documents, Pictures and the rest are found where the system keeps
+  them.** The rail, the Quick Access tiles and the Gallery joined the English
+  name onto the home folder, but that is only where these folders start: a person
+  can move any of them, and OneDrive's folder backup moves Desktop, Documents and
+  Pictures without asking. On a machine set up that way the row for Desktop and
+  the Gallery both answered "not available here". Each one is now resolved from
+  the same place Explorer reads (`User Shell Folders`), from `user-dirs.dirs` on
+  Linux, and from the home folder on macOS, and a folder that is not there is not
+  offered rather than drawn as a dead row.
 - **A press on a rail row opens it wherever it lands.** The press was on the
   row's inner content, so its padding, the spacer beside the label and the place's
   own icon took the press and did nothing: the row looked clickable and part of it

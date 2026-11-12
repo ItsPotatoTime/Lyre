@@ -37,6 +37,7 @@ mod fileops;
 mod frame;
 mod handlers;
 mod imagery;
+mod known;
 mod legacy;
 mod metadata;
 mod openwith;
@@ -1311,8 +1312,10 @@ fn place_of(view: View, root: &Path) -> Place {
             if same_path(root, &home) {
                 return Place::Home;
             }
-            for (place, sub) in PLACE_FOLDERS {
-                if same_path(root, &home.join(sub)) {
+            // The place claims the folder the platform says it is, not the one
+            // with its English name: a Desktop moved to OneDrive is still Desktop.
+            for (place, name) in PLACE_FOLDERS {
+                if known::folder(&home, name).is_some_and(|path| same_path(root, &path)) {
                     return place;
                 }
             }
@@ -1326,10 +1329,8 @@ fn place_path(index: usize) -> Option<PathBuf> {
     if index == Place::Home.index() {
         return Some(home);
     }
-    PLACE_FOLDERS
-        .iter()
-        .find(|(place, _)| place.index() == index)
-        .map(|(_, sub)| home.join(sub))
+    let (_, name) = PLACE_FOLDERS.iter().find(|(place, _)| place.index() == index)?;
+    known::folder(&home, name)
 }
 
 /// Details/List row height: Compact view tightens the rows Explorer-style.
@@ -6264,6 +6265,8 @@ fn pinned_item(s: &App, p: Paint, owner: Option<usize>, pi: usize, path: &str) -
 }
 
 fn nav_rail(s: &App, p: Paint) -> El {
+    // Resolved once for the six rows below, which all ask it.
+    let home = home_dir();
     // Where the window actually is, which is the only input to the rail's
     // selection: one place, at most one lit row.
     let current = place_of(s.view, &s.root);
@@ -6290,7 +6293,11 @@ fn nav_rail(s: &App, p: Paint) -> El {
         .child(rail_item(s, p, current, Place::Gallery.index(), "Gallery", false, false))
         .child(el().w_full().h(p.hair).fill(p.soft_line).my(5.0).key("rail-sep-1"));
     for (place, label) in PLACE_FOLDERS {
-        if !s.hidden_places.contains(&place.index()) {
+        // A folder that is not on this machine is not offered, as the 0.2 rail
+        // did not offer it: a row that can only answer "not available here" is
+        // worse than no row.
+        let offered = home.as_deref().is_some_and(|home| known::folder(home, label).is_some());
+        if offered && !s.hidden_places.contains(&place.index()) {
             rail = rail.child(rail_item(s, p, current, place.index(), label, false, true));
         }
     }
@@ -8705,7 +8712,8 @@ fn sweep_images(root: &Path, limit: usize, max_depth: usize) -> Vec<Entry> {
 /// Re-read the Pictures library into the Gallery's entries.
 fn refresh_gallery(s: &mut App) {
     let Some(home) = home_dir() else { return };
-    s.entries = sweep_images(&home.join("Pictures"), 4000, 8);
+    let Some(pictures) = known::folder(&home, "Pictures") else { return };
+    s.entries = sweep_images(&pictures, 4000, 8);
     s.visible = (0..s.entries.len()).collect();
     s.count = s.entries.len();
     s.count_override = Some(s.count);
@@ -8724,11 +8732,12 @@ fn go_gallery(s: &mut App) {
         s.notice = "Pictures is not available here".into();
         return;
     };
-    let pictures = home.join("Pictures");
-    if !pictures.is_dir() {
+    // Pictures is wherever this machine keeps it: a redirected or moved
+    // Pictures library is still the Gallery's.
+    let Some(pictures) = known::folder(&home, "Pictures") else {
         s.notice = "Pictures is not available here".into();
         return;
-    }
+    };
     s.history.push(s.root.clone());
     s.forward.clear();
     s.root = pictures;

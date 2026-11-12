@@ -17,7 +17,7 @@ Lyre registers as the handler for `inode/directory`: a `.desktop` entry in
 `~/.local/share/applications` declaring that type, set with `xdg-mime default`.
 Folders then open here whether they come from the desktop or from another
 application. The entry uses `%U`, so the folder arrives as an argument and the
-first tab opens it rather than Home.
+first tab opens it rather than Quick Access.
 
 The window offers this once at startup. "Never show this again" is stored as a
 preference, and the More menu can turn the offer back on or act on it directly.

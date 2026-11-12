@@ -6,8 +6,36 @@ release notes rather than a second copy of them.
 
 ## [Unreleased]
 
+### Changed
+
+- **Quick Access is the landing page, and Home is the home folder.** The page
+  with recent files and favourites was called Home, which left the real home
+  directory with no row of its own. The page is now Quick Access, and Home is the
+  home directory — `/home/<name>`, `C:\Users\<name>` — with its own rail row, its
+  own breadcrumbs, and Up to the folder that holds it. A window still opens on
+  Quick Access.
+
 ### Fixed
 
+- **Only the place on screen is selected.** The rail lit whichever row was last
+  pressed, so opening a pinned folder left This PC selected beside it, and two
+  pins of the same folder could both look selected. Selection comes from the
+  folder the window is actually in, so exactly one row can be lit, and a pin
+  saved twice (with a trailing separator, or in another case) is folded into one.
+- **Up no longer leaves a place.** Quick Access and This PC are places rather
+  than folders, but Up read the parent of the folder they had replaced and
+  offered `C:\Users\<name>` from This PC. Up is disabled where there is nothing
+  above, and closes with a notice if it is pressed anyway.
+- **A tab no longer carries its search or its drag into the next one.** Switching
+  tabs kept the leaving tab's search running, so the arriving tab drew the other
+  folder's results, and a drag in progress survived the switch.
+- **The Gallery survives being switched away from and back.** Restoring a
+  Gallery tab, or a write anywhere under Pictures while it was open, replaced the
+  date-grouped photo grid with a flat listing of the folder's top level.
+- **Favorites and pins come over from 0.2.** They were not lost by a broken save:
+  0.2 kept them in the webview's local storage and 0.3 keeps its settings in
+  `prefs.json`, so the first 0.3 launch found nothing to read. The old lists are
+  now imported once, at the first launch of this build.
 - **The update signature is no longer encoded twice.** The release script encoded
   each signature one level deeper than the manifest carries, so a client refused
   it with "Invalid encoding in minisign data". New releases store the signature

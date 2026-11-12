@@ -37,6 +37,7 @@ mod fileops;
 mod frame;
 mod handlers;
 mod imagery;
+mod legacy;
 mod metadata;
 mod openwith;
 mod osdrag;
@@ -304,12 +305,70 @@ pub(crate) struct Entry {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
-    Home,
+    /// The landing page: recent files and favorites. A place rather than a
+    /// folder, so it has no parent and nothing on disk to scan.
+    QuickAccess,
     Files,
     ThisPc,
     /// The Pictures library as a date-grouped photo grid.
     Gallery,
 }
+
+/// Which place a window is showing.
+///
+/// The rail lights a row from this and nothing else, so exactly one row can be
+/// selected: the one whose place the window is actually in. Remembering the
+/// pressed row in a field instead is what let a stale row stay lit beside the
+/// new one, and left This PC selected while a pinned folder was on screen.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Place {
+    Home,
+    Gallery,
+    QuickAccess,
+    Desktop,
+    Downloads,
+    Documents,
+    Pictures,
+    Music,
+    Videos,
+    ThisPc,
+    Network,
+    /// A folder that is none of the built-in places: a pinned folder, or any
+    /// folder reached through one.
+    Folder,
+}
+
+impl Place {
+    /// The rail index, shared with `place_path` and the rail element keys.
+    fn index(self) -> usize {
+        match self {
+            Place::Home => 0,
+            Place::Gallery => 1,
+            Place::QuickAccess => 2,
+            Place::Desktop => 3,
+            Place::Downloads => 4,
+            Place::Documents => 5,
+            Place::Pictures => 6,
+            Place::Music => 7,
+            Place::Videos => 8,
+            Place::ThisPc => 9,
+            Place::Network => 10,
+            Place::Folder => usize::MAX,
+        }
+    }
+}
+
+/// The folders the built-in places stand for, apart from Home, which is the
+/// home directory itself. One table, so the rail, the drop targets and the
+/// place lookup cannot drift apart.
+const PLACE_FOLDERS: [(Place, &str); 6] = [
+    (Place::Desktop, "Desktop"),
+    (Place::Downloads, "Downloads"),
+    (Place::Documents, "Documents"),
+    (Place::Pictures, "Pictures"),
+    (Place::Music, "Music"),
+    (Place::Videos, "Videos"),
+];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
@@ -392,7 +451,7 @@ enum Menu {
 
 #[derive(Clone, Copy)]
 enum Fixture {
-    Home,
+    QuickAccess,
     Downloads,
     Screenshots,
     ThisPc,
@@ -696,7 +755,6 @@ struct App {
     /// Details column widths (Name, Date, Type, Size) and the nav rail width.
     col_w: [f32; 4],
     rail_w: f32,
-    nav: usize,
     count: usize,
     selection_detail: String,
     notice: String,
@@ -862,7 +920,7 @@ struct App {
     zoom: bool,
     scan_ms: f64,
     /// Home's Recent/Favorites pill pair.
-    home_tab: u8,
+    quick_access_tab: u8,
     /// The drawn scrollbar rides Live bindings so a scroll never re-runs the
     /// view: the viewport reports its offset, the thumb follows in-frame.
     scroll_track: Live<[f32; 4]>,
@@ -909,14 +967,13 @@ struct Tab {
     reveal: Option<usize>,
     reveal_at: Option<Instant>,
     marquee: Option<Marquee>,
-    nav: usize,
     count: usize,
     selection_detail: String,
     count_override: Option<usize>,
     keep_order: bool,
     contextual: bool,
     preview: bool,
-    home_tab: u8,
+    quick_access_tab: u8,
     volumes_selected: Option<usize>,
 }
 
@@ -941,14 +998,13 @@ fn capture_tab(s: &App) -> Tab {
         reveal: s.reveal,
         reveal_at: s.reveal_at,
         marquee: s.marquee.clone(),
-        nav: s.nav,
         count: s.count,
         selection_detail: s.selection_detail.clone(),
         count_override: s.count_override,
         keep_order: s.keep_order,
         contextual: s.contextual,
         preview: s.preview,
-        home_tab: s.home_tab,
+        quick_access_tab: s.quick_access_tab,
         volumes_selected: s.volumes_selected,
     }
 }
@@ -973,14 +1029,13 @@ fn restore_tab(s: &mut App, tab: &Tab) {
     s.reveal = tab.reveal;
     s.reveal_at = tab.reveal_at;
     s.marquee = tab.marquee.clone();
-    s.nav = tab.nav;
     s.count = tab.count;
     s.selection_detail = tab.selection_detail.clone();
     s.count_override = tab.count_override;
     s.keep_order = tab.keep_order;
     s.contextual = tab.contextual;
     s.preview = tab.preview;
-    s.home_tab = tab.home_tab;
+    s.quick_access_tab = tab.quick_access_tab;
     s.volumes_selected = tab.volumes_selected;
 }
 
@@ -993,21 +1048,28 @@ fn switch_tab(s: &mut App, index: usize) {
     s.active_tab = index;
     let tab = s.tabs[index].clone();
     restore_tab(s, &tab);
+    // A search belongs to the tab that started it: its hits are that folder's
+    // names, and drawing them under the arriving tab would show the wrong list.
+    clear_search(s);
     s.menu = None;
     s.marquee = None;
     s.address_edit = None;
+    // A gesture in flight was aimed at the tab being left, so it cannot carry
+    // over: a drag released after the switch would paste into the new folder.
+    s.drag = None;
+    s.drag_press = None;
+    s.os_hover = None;
     rescan_restored(s);
 }
 
-/// Reset the showing tab's fields to a fresh Home, closing its history. The
-/// caller saves or replaces the tab's slot afterwards.
-fn reset_tab_home(s: &mut App) {
-    s.view = View::Home;
+/// Reset the showing tab's fields to a fresh Quick Access, closing its history.
+/// The caller saves or replaces the tab's slot afterwards.
+fn reset_tab_quick_access(s: &mut App) {
+    s.view = View::QuickAccess;
     s.mode = Mode::Details;
-    s.tab = "Home".into();
-    s.crumbs = vec!["Home".into()];
-    s.search = "Search Home".into();
-    s.nav = 0;
+    s.tab = "Quick Access".into();
+    s.crumbs = vec!["Quick Access".into()];
+    s.search = "Search Quick Access".into();
     s.preview = false;
     s.contextual = false;
     s.groups.clear();
@@ -1022,21 +1084,22 @@ fn reset_tab_home(s: &mut App) {
     refresh_recent(s);
 }
 
-/// Open a new tab on Home.
+/// Open a new tab on Quick Access.
 fn new_tab(s: &mut App) {
     s.tabs[s.active_tab] = capture_tab(s);
-    reset_tab_home(s);
+    reset_tab_quick_access(s);
     s.tabs.push(capture_tab(s));
     s.active_tab = s.tabs.len() - 1;
 }
 
-/// Close a tab. The last one is reset to Home rather than closing the window.
+/// Close a tab. The last one is reset to Quick Access rather than closing the
+/// window.
 fn close_tab_at(s: &mut App, index: usize) {
     if index >= s.tabs.len() {
         return;
     }
     if s.tabs.len() <= 1 {
-        reset_tab_home(s);
+        reset_tab_quick_access(s);
         s.tabs[0] = capture_tab(s);
         return;
     }
@@ -1204,18 +1267,69 @@ fn home_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Whether two paths name the same folder as far as a place is concerned.
+///
+/// A trailing separator, and on Windows letter case, do not make a second
+/// place. Only the components are compared, so this is a string test and never
+/// touches the disk: the rail runs it for every row it draws.
+fn same_path(a: &Path, b: &Path) -> bool {
+    let mut left = a.components();
+    let mut right = b.components();
+    loop {
+        match (left.next(), right.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) => {
+                let (x, y) = (x.as_os_str(), y.as_os_str());
+                let equal = if cfg!(windows) {
+                    x.to_string_lossy().eq_ignore_ascii_case(&y.to_string_lossy())
+                } else {
+                    x == y
+                };
+                if !equal {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// The same test for paths held as strings, as the favorites and pins are.
+fn same_text_path(a: &str, b: &str) -> bool {
+    same_path(Path::new(a), Path::new(b))
+}
+
+/// The place a view and root are showing. This is the only thing that decides
+/// which rail row is selected.
+fn place_of(view: View, root: &Path) -> Place {
+    match view {
+        View::QuickAccess => Place::QuickAccess,
+        View::ThisPc => Place::ThisPc,
+        View::Gallery => Place::Gallery,
+        View::Files => {
+            let Some(home) = home_dir() else { return Place::Folder };
+            if same_path(root, &home) {
+                return Place::Home;
+            }
+            for (place, sub) in PLACE_FOLDERS {
+                if same_path(root, &home.join(sub)) {
+                    return place;
+                }
+            }
+            Place::Folder
+        }
+    }
+}
+
 fn place_path(index: usize) -> Option<PathBuf> {
     let home = home_dir()?;
-    let sub = match index {
-        1 | 6 => "Pictures",
-        3 => "Desktop",
-        4 => "Downloads",
-        5 => "Documents",
-        7 => "Music",
-        8 => "Videos",
-        _ => return None,
-    };
-    Some(home.join(sub))
+    if index == Place::Home.index() {
+        return Some(home);
+    }
+    PLACE_FOLDERS
+        .iter()
+        .find(|(place, _)| place.index() == index)
+        .map(|(_, sub)| home.join(sub))
 }
 
 /// Details/List row height: Compact view tightens the rows Explorer-style.
@@ -1283,6 +1397,51 @@ fn load_prefs(s: &mut App) {
     load_prefs_from(s, PREFS_ID);
 }
 
+/// Carry over the favorites and pins the 0.2 application saved.
+///
+/// An update from 0.2 replaced the webview with a native window, and the
+/// settings store with it: 0.2's lists lived in the webview's local storage and
+/// this build's live in `prefs.json`, so the first launch after the update found
+/// nothing, started empty, and saved that over the lists the person had. This
+/// reads the old store once, at launch, and writes what it finds into the new
+/// one before any window opens.
+///
+/// Lists this build already has are never touched, so someone who went on to
+/// rebuild them after the update does not have a stale set merged in, and the
+/// store is marked as read either way so it is never read twice.
+fn import_legacy_library() {
+    let mut prefs = rune::prefs::Prefs::open(PREFS_ID);
+    if prefs.get::<bool>("legacy_import").unwrap_or(false) {
+        return;
+    }
+    let _ = prefs.set("legacy_import", &true);
+    let has_paths =
+        |key: &str| prefs.get::<Vec<String>>(key).is_some_and(|list| !list.is_empty());
+    let has_hidden = prefs
+        .get::<Vec<usize>>("hidden_places")
+        .is_some_and(|places| !places.is_empty());
+    if has_paths("favorites") || has_paths("pinned") || has_hidden {
+        return;
+    }
+    let Some(library) = legacy::read() else { return };
+    let _ = prefs.set("favorites", &unique_paths(library.favorites));
+    let _ = prefs.set("pinned", &unique_paths(library.pins));
+    // The old store named the built-in rows by path; this build names them by
+    // rail index, which is what a hidden row is remembered as. A path that is
+    // not one of the built-in places is not a rail row at all, so it is dropped.
+    let hidden: Vec<usize> = library
+        .hidden
+        .iter()
+        .filter_map(|path| {
+            let place = place_of(View::Files, Path::new(path));
+            PLACE_FOLDERS.iter().any(|(known, _)| *known == place).then(|| place.index())
+        })
+        .collect();
+    if !hidden.is_empty() {
+        let _ = prefs.set("hidden_places", &hidden);
+    }
+}
+
 /// The same restore against a named store, so a test can round-trip without
 /// touching the settings a person actually uses.
 fn load_prefs_from(s: &mut App, id: &str) {
@@ -1321,13 +1480,13 @@ fn load_prefs_from(s: &mut App, id: &str) {
         }
     }
     if let Some(f) = prefs.get::<Vec<String>>("favorites") {
-        s.favorites = f;
+        s.favorites = unique_paths(f);
     }
     if let Some(r) = prefs.get::<Vec<String>>("recent") {
-        s.recent = r;
+        s.recent = unique_paths(r);
     }
     if let Some(p) = prefs.get::<Vec<String>>("pinned") {
-        s.pinned = p;
+        s.pinned = unique_paths(p);
     }
     if let Some(m) = prefs.get::<Vec<String>>("menu_hidden") {
         s.menu_hidden = m;
@@ -1438,15 +1597,15 @@ fn prefs_signature(s: &App) -> String {
 }
 
 fn is_favorite(s: &App, path: &str) -> bool {
-    s.favorites.iter().any(|p| p == path)
+    s.favorites.iter().any(|p| same_text_path(p, path))
 }
 
 fn is_pinned(s: &App, path: &str) -> bool {
-    s.pinned.iter().any(|p| p == path)
+    s.pinned.iter().any(|p| same_text_path(p, path))
 }
 
 fn toggle_favorite(s: &mut App, path: &str) {
-    if let Some(i) = s.favorites.iter().position(|p| p == path) {
+    if let Some(i) = s.favorites.iter().position(|p| same_text_path(p, path)) {
         s.favorites.remove(i);
     } else if !path.is_empty() {
         s.favorites.push(path.to_string());
@@ -1504,11 +1663,25 @@ fn refresh_recent(s: &mut App) {
 }
 
 fn toggle_pin(s: &mut App, path: &str) {
-    if let Some(i) = s.pinned.iter().position(|p| p == path) {
+    if let Some(i) = s.pinned.iter().position(|p| same_text_path(p, path)) {
         s.pinned.remove(i);
     } else if !path.is_empty() {
         s.pinned.push(path.to_string());
     }
+}
+
+/// Drop repeats of the same folder from a restored list, keeping the first.
+///
+/// A pin saved twice, once with a trailing separator or in another case, would
+/// otherwise draw two rows for one folder that both look selected.
+fn unique_paths(paths: Vec<String>) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+    for path in paths {
+        if !path.is_empty() && !kept.iter().any(|other| same_text_path(other, &path)) {
+            kept.push(path);
+        }
+    }
+    kept
 }
 
 /// Whether a context-menu item survives the person's customize choices. Lyre's
@@ -1929,7 +2102,13 @@ fn set_location(s: &mut App, path: PathBuf) {
         .map(|part| part.as_os_str().to_string_lossy().into_owned())
         .filter(|part| part != "\\" && part != "/")
         .collect();
-    let tab = crumbs.last().cloned().unwrap_or_else(|| "Lyre".into());
+    // The home folder is named "Home" rather than after the account, so the word
+    // means the same thing in a tab as it does in the rail.
+    let tab = if place_of(View::Files, &path) == Place::Home {
+        "Home".to_string()
+    } else {
+        crumbs.last().cloned().unwrap_or_else(|| "Lyre".into())
+    };
     s.root = path;
     // The list fills in when the worker answers; until then the status bar says
     // the folder is being read.
@@ -1953,9 +2132,9 @@ fn set_location(s: &mut App, path: PathBuf) {
 
 fn go(s: &mut App, path: PathBuf) {
     s.menu = None;
-    // Home and This PC are fixture overlays that keep the last real root, so a
-    // return to that same folder must still reload; only a no-op while already
-    // showing it as a file list.
+    // Quick Access and This PC keep the last real root behind them, so a return
+    // to that same folder must still reload; only a no-op while already showing
+    // it as a file list.
     if path == s.root && s.view == View::Files {
         return;
     }
@@ -1982,18 +2161,31 @@ fn go_forward(s: &mut App) {
     }
 }
 
+/// Whether Up has somewhere to go.
+///
+/// A folder does, and so does the Gallery, whose root is the Pictures library
+/// it is drawn from. Quick Access and This PC do not: they are places that keep
+/// the last real root behind them only so a return to it still reloads, so
+/// reading the parent off that root walked out of a page that is not in a folder
+/// at all. This PC offered Up to `C:\Users\<name>` because it was sitting on
+/// the home folder it had replaced.
+fn can_go_up(s: &App) -> bool {
+    matches!(s.view, View::Files | View::Gallery) && s.root.parent().is_some()
+}
+
 fn go_up(s: &mut App) {
-    if let Some(parent) = s.root.parent().map(Path::to_path_buf) {
-        go(s, parent);
-    } else {
-        s.notice = "Already at the root".into();
+    let parent = can_go_up(s).then(|| s.root.parent()).flatten().map(Path::to_path_buf);
+    match parent {
+        Some(parent) => go(s, parent),
+        None => s.notice = "Already at the root".into(),
     }
 }
 
 fn navigate(s: &mut App, index: usize) {
     s.menu = None;
     match index {
-        0 => load(s, Fixture::Home),
+        0 => open_home(s),
+        2 => load(s, Fixture::QuickAccess),
         9 => {
             load(s, Fixture::ThisPc);
             refresh_volumes(s);
@@ -2001,13 +2193,23 @@ fn navigate(s: &mut App, index: usize) {
         10 => s.notice = "Network browsing is not implemented in this slice".into(),
         1 => go_gallery(s),
         i => {
-            s.nav = i;
             match place_path(i) {
                 Some(path) if path.is_dir() => go(s, path),
                 Some(path) => s.notice = format!("{} is not available here", path.display()),
                 None => s.notice = "This place is not available here".into(),
             }
         }
+    }
+}
+
+/// Open the home folder. Unlike Quick Access, This PC and Gallery, this is a
+/// folder that exists, so it navigates like any other: its breadcrumbs are the
+/// real ones and Up goes to the folder that holds it.
+fn open_home(s: &mut App) {
+    match home_dir() {
+        Some(home) if home.is_dir() => go(s, home),
+        Some(home) => s.notice = format!("{} is not available here", home.display()),
+        None => s.notice = "Home is not available here".into(),
     }
 }
 
@@ -2037,12 +2239,11 @@ fn load(s: &mut App, f: Fixture) {
     s.notice.clear();
     s.search_edit.text.clear();
     match f {
-        Fixture::Home => {
-            s.view = View::Home;
-            s.tab = "Home".into();
-            s.crumbs = vec!["Home".into()];
-            s.search = "Search Home".into();
-            s.nav = 0;
+        Fixture::QuickAccess => {
+            s.view = View::QuickAccess;
+            s.tab = "Quick Access".into();
+            s.crumbs = vec!["Quick Access".into()];
+            s.search = "Search Quick Access".into();
             s.count = 0;
             s.selection_detail.clear();
             refresh_recent(s);
@@ -2052,7 +2253,6 @@ fn load(s: &mut App, f: Fixture) {
             s.tab = "Downloads".into();
             s.crumbs = vec!["Downloads".into()];
             s.search = "Search Downloads".into();
-            s.nav = 4;
             s.count = 16;
             s.selection_detail.clear();
             let today = "11/6/2026  9:47 AM";
@@ -2181,7 +2381,6 @@ fn load(s: &mut App, f: Fixture) {
             s.tab = "Screenshots".into();
             s.crumbs = vec!["Pictures".into(), "Screenshots".into()];
             s.search = "Search Screenshots".into();
-            s.nav = 6;
             s.count = 5;
             s.selected = vec![1];
             s.focused = Some(1);
@@ -2231,7 +2430,6 @@ fn load(s: &mut App, f: Fixture) {
             s.tab = "This PC".into();
             s.crumbs = vec!["This PC".into()];
             s.search = "Search This PC".into();
-            s.nav = 9;
             s.count = 1;
             s.selection_detail.clear();
             s.entries.clear();
@@ -2244,18 +2442,18 @@ fn load(s: &mut App, f: Fixture) {
     refresh_visible(s);
 }
 
-/// Start on Home without discarding the view and sort the person chose.
+/// Start on Quick Access without discarding the view and sort the person chose.
 ///
 /// `load` lays a fixture out for the reference captures, so it resets the mode,
-/// the sort and the preview pane. Startup goes through Home now, which meant
+/// the sort and the preview pane. Startup goes through Quick Access, which meant
 /// those resets replaced the restored choices before the first frame and were
 /// then saved back as though they had been chosen.
-fn load_home_preserving_view(s: &mut App) {
+fn load_quick_access_preserving_view(s: &mut App) {
     let mode = s.mode;
     let sort = s.sort;
     let sort_desc = s.sort_desc;
     let preview = s.preview;
-    load(s, Fixture::Home);
+    load(s, Fixture::QuickAccess);
     s.mode = mode;
     s.sort = sort;
     s.sort_desc = sort_desc;
@@ -2265,13 +2463,13 @@ fn load_home_preserving_view(s: &mut App) {
 fn init() -> App {
     // Where to start. An explicit path is a request: the folder handler passing a
     // folder to open, or LYRE_RUNE_PATH for development. With neither, the window
-    // opens on Home rather than on whatever folder the process happened to start
-    // in, which for an installed copy is its own install folder.
+    // opens on Quick Access rather than on whatever folder the process happened
+    // to start in, which for an installed copy is its own install folder.
     let requested = std::env::var("LYRE_RUNE_PATH")
         .map(PathBuf::from)
         .ok()
         .or_else(|| defaultmanager::startup_path().map(PathBuf::from));
-    let start_home = requested.is_none();
+    let start_quick_access = requested.is_none();
     let root = requested.unwrap_or_else(|| {
         home_dir().unwrap_or_else(|| {
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
@@ -2328,7 +2526,6 @@ fn init() -> App {
         drag_press: None,
         col_w: [NAME_W, DATE_W, TYPE_W, SIZE_W],
         rail_w: RAIL_W,
-        nav: 9,
         count,
         selection_detail: String::new(),
         notice: String::new(),
@@ -2430,7 +2627,7 @@ fn init() -> App {
         count_override: None,
         zoom: false,
         scan_ms,
-        home_tab: 0,
+        quick_access_tab: 0,
         scroll_track: Live::new([0.0; 4]),
         scroll_thumb: Live::new([0.0; 4]),
         scroll_vis: Live::new(0.0),
@@ -2445,9 +2642,9 @@ fn init() -> App {
         active_tab: 0,
     };
     load_prefs(&mut app);
-    if start_home {
+    if start_quick_access {
         // Before the first tab is captured, so the tab strip agrees with the view.
-        load_home_preserving_view(&mut app);
+        load_quick_access_preserving_view(&mut app);
     }
     refresh_visible(&mut app);
     app.tabs = vec![capture_tab(&app)];
@@ -2461,6 +2658,17 @@ fn circle(cx: f32, cy: f32, r: f32) -> Vec<[f32; 2]> {
     (0..16)
         .map(|i| {
             let a = i as f32 / 16.0 * std::f32::consts::TAU;
+            [cx + r * a.cos(), cy + r * a.sin()]
+        })
+        .collect()
+}
+
+/// A filled five-point star: the mark Explorer gives Quick Access.
+fn star(cx: f32, cy: f32, outer: f32, inner: f32) -> Vec<[f32; 2]> {
+    (0..10)
+        .map(|i| {
+            let r = if i % 2 == 0 { outer } else { inner };
+            let a = -std::f32::consts::FRAC_PI_2 + i as f32 * std::f32::consts::PI / 5.0;
             [cx + r * a.cos(), cy + r * a.sin()]
         })
         .collect()
@@ -3281,7 +3489,8 @@ fn drain_icons(s: &App) -> bool {
 }
 
 /// Watch exactly the folder on screen. One watch per window: navigating,
-/// switching tabs or entering search replaces it; Home and This PC have none.
+/// switching tabs or entering search replaces it; Quick Access and This PC have
+/// no folder behind them, so nothing is watched there.
 fn sync_watch(s: &mut App) {
     let wanted = if s.searching {
         None
@@ -3307,6 +3516,13 @@ fn sync_watch(s: &mut App) {
 /// Swap a watched folder's new listing in without disturbing the person:
 /// selection, focus and anchor follow their paths, and the scroll stays put.
 fn apply_refresh(s: &mut App, msg: watch::Refreshed) {
+    // The Gallery shows a swept library under date headers, not the folder's own
+    // listing: a plain rescan of Pictures would swap that grid for the flat list
+    // it sits above, every time a photo anywhere under it appeared.
+    if s.view == View::Gallery {
+        refresh_gallery(s);
+        return;
+    }
     let path_of = |i: usize| s.entries.get(i).map(|e| e.path.clone());
     let selected: Vec<String> = s.selected.iter().filter_map(|&i| path_of(i)).collect();
     let focused = s.focused.and_then(path_of);
@@ -3326,7 +3542,12 @@ fn apply_refresh(s: &mut App, msg: watch::Refreshed) {
 /// that tab, another program's writes. Rescan off the UI thread and let the
 /// seamless apply swap the news in without moving the scroll or selection.
 fn rescan_restored(s: &mut App) {
-    if !matches!(s.view, View::Files | View::Gallery) {
+    if s.view == View::Gallery {
+        // Rebuilt rather than rescanned, for the reason `apply_refresh` gives.
+        refresh_gallery(s);
+        return;
+    }
+    if s.view != View::Files {
         return;
     }
     let path = s.root.clone();
@@ -3443,11 +3664,12 @@ fn place_glyph(index: usize, size: f32) -> El {
             .fill(vec![[2.0, 4.0], [22.0, 4.0], [22.0, 20.0], [2.0, 20.0]], c("#2fa8e0"))
             .fill(circle(8.0, 9.0, 1.8), Color::WHITE)
             .fill(vec![[4.0, 18.0], [10.0, 11.0], [14.0, 15.0], [17.0, 12.0], [21.0, 18.0]], Color::WHITE),
+        // Quick Access: the folder the landing page gathers, with the star its
+        // favorites are marked by.
         2 => Shape::new()
-            .fill(circle(8.0, 14.0, 5.0), c("#29a3ec"))
-            .fill(circle(14.0, 11.0, 6.0), c("#29a3ec"))
-            .fill(circle(18.0, 15.0, 4.0), c("#29a3ec"))
-            .fill(vec![[4.0, 15.0], [21.0, 15.0], [21.0, 19.0], [4.0, 19.0]], c("#1b86d8")),
+            .fill(vec![[2.0, 6.0], [9.0, 6.0], [11.0, 9.0], [22.0, 9.0], [22.0, 21.0], [2.0, 21.0]], c("#f5a623"))
+            .fill(vec![[2.0, 10.0], [22.0, 10.0], [22.0, 21.0], [2.0, 21.0]], c("#ffc861"))
+            .fill(star(12.0, 15.5, 5.4, 2.2), c("#2f6fd0")),
         3 | 9 => Shape::new()
             .fill(vec![[2.0, 3.0], [22.0, 3.0], [22.0, 16.0], [2.0, 16.0]], c("#3e9bdd"))
             .fill(vec![[3.0, 4.0], [21.0, 4.0], [21.0, 12.0], [3.0, 12.0]], c("#6cb8e8"))
@@ -3561,7 +3783,7 @@ fn scroll_thumb(s: &App, p: Paint) -> El {
 fn tab_button(s: &App, p: Paint, index: usize, tab: &Tab) -> El {
     let active = index == s.active_tab;
     let name = tab.name.clone();
-    let nav = tab.nav;
+    let glyph = place_of(tab.view, &tab.root).index();
     let b = row()
         .key(format!("tab-{index}"))
         .on_drop_files(move |s: &mut App, files, tx: &mut Tx| {
@@ -3576,7 +3798,7 @@ fn tab_button(s: &App, p: Paint, index: usize, tab: &Tab) -> El {
         .pr(6.0)
         .gap(8.0)
         .items_center()
-        .child(place_glyph(nav, 16.0))
+        .child(place_glyph(glyph, 16.0))
         .child(
             text(name.as_str())
                 .font(CAPTION)
@@ -3679,7 +3901,7 @@ fn nav_button(p: Paint, which: Ico, key: &str, action: usize, enabled: bool, tip
 /// component, drive prefix included, with the prefix path it stands for.
 fn crumb_segments(s: &App) -> Vec<(String, PathBuf)> {
     match s.view {
-        View::Home => return vec![("Home".into(), PathBuf::new())],
+        View::QuickAccess => return vec![("Quick Access".into(), PathBuf::new())],
         View::ThisPc => return vec![("This PC".into(), PathBuf::new())],
         View::Gallery => return vec![("Gallery".into(), s.root.clone())],
         View::Files => {}
@@ -3716,7 +3938,7 @@ fn crumb_segments(s: &App) -> Vec<(String, PathBuf)> {
 /// the prefix path it names.
 fn open_crumb(s: &mut App, path: PathBuf) {
     match s.view {
-        View::Home => load(s, Fixture::Home),
+        View::QuickAccess => load(s, Fixture::QuickAccess),
         View::ThisPc => navigate(s, 9),
         View::Gallery => go_gallery(s),
         View::Files => go(s, path),
@@ -3743,8 +3965,9 @@ fn begin_address_edit(s: &mut App) {
 }
 
 /// Enter in the address editor: open what was typed. Relative paths resolve
-/// against the folder on screen; the virtual places answer to their names; a
-/// path that is not a folder keeps the editor open with a notice.
+/// against the folder on screen; the places answer to their names, Home being
+/// the home folder itself; a path that is not a folder keeps the editor open
+/// with a notice.
 fn commit_address(s: &mut App) {
     let Some(edit) = s.address_edit.take() else { return };
     let draft = edit.text.trim().trim_matches('"').to_string();
@@ -3752,7 +3975,8 @@ fn commit_address(s: &mut App) {
         return;
     }
     match draft.to_ascii_lowercase().as_str() {
-        "home" => return load(s, Fixture::Home),
+        "home" => return open_home(s),
+        "quick access" | "quickaccess" => return load(s, Fixture::QuickAccess),
         "this pc" | "thispc" => return navigate(s, 9),
         "gallery" => return go_gallery(s),
         _ => {}
@@ -3828,10 +4052,11 @@ fn address_row(s: &App, p: Paint) -> El {
             .px(10.0)
             .gap(6.0)
             .items_center()
-            .child(if s.view == View::Home {
-                place_glyph(0, 15.0)
-            } else {
-                ico(p, Ico::ThisPc, 15.0, p.secondary)
+            // A place draws its own mark ahead of its single crumb; a real
+            // folder starts at the drive or the root, so it shows the machine.
+            .child(match s.view {
+                View::Files => ico(p, Ico::ThisPc, 15.0, p.secondary),
+                _ => place_glyph(place_of(s.view, &s.root).index(), 15.0),
             });
         for (i, segment) in folded.iter().enumerate() {
             bar = bar.child(ico(p, Ico::ChevronRight, 10.0, p.tertiary));
@@ -3923,7 +4148,7 @@ fn address_row(s: &App, p: Paint) -> El {
         .items_center()
         .child(nav_button(p, Ico::Back, "back", 0, !s.history.is_empty(), "Back"))
         .child(nav_button(p, Ico::Forward, "forward", 1, !s.forward.is_empty(), "Forward"))
-        .child(nav_button(p, Ico::Up, "up", 2, s.root.parent().is_some(), "Up"))
+        .child(nav_button(p, Ico::Up, "up", 2, can_go_up(s), "Up"))
         .child(nav_button(p, Ico::Refresh, "refresh", 3, true, "Refresh"))
         .child(el().w(6.0))
         .child(crumb)
@@ -5856,12 +6081,13 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
 fn rail_item(
     s: &App,
     p: Paint,
+    current: Place,
     index: usize,
     label: &str,
     chevron: bool,
     pin: bool,
 ) -> El {
-    let active = s.nav == index;
+    let active = current.index() == index;
     let ink = if active { p.text } else { p.secondary };
     let open = s.rail_open.contains(&index);
 
@@ -5986,8 +6212,13 @@ fn rail_leaf(p: Paint, label: &str, path: Option<&str>, volume: Option<usize>) -
 }
 
 /// A pinned folder in the rail: opens its path, right-click offers unpin.
-fn pinned_item(s: &App, p: Paint, pi: usize, path: &str) -> El {
-    let active = s.view == View::Files && s.root == Path::new(path);
+///
+/// `owner` is the one pinned row that names the folder on screen, decided by
+/// `nav_rail`. Passing it rather than testing each row is what stops two pins of
+/// the same folder, saved with and without a trailing separator or in another
+/// case, from lighting up together.
+fn pinned_item(s: &App, p: Paint, owner: Option<usize>, pi: usize, path: &str) -> El {
+    let active = owner == Some(pi);
     let ink = if active { p.text } else { p.secondary };
     let name = path_name(path);
     let open = path.to_string();
@@ -6023,6 +6254,17 @@ fn pinned_item(s: &App, p: Paint, pi: usize, path: &str) -> El {
 }
 
 fn nav_rail(s: &App, p: Paint) -> El {
+    // Where the window actually is, which is the only input to the rail's
+    // selection: one place, at most one lit row.
+    let current = place_of(s.view, &s.root);
+    // The one pinned row that names the folder on screen. Only a folder no
+    // built-in place claims can select a pin, so This PC or Quick Access can
+    // never sit lit beside one.
+    let pinned_at = if current == Place::Folder {
+        s.pinned.iter().position(|path| same_path(Path::new(path), &s.root))
+    } else {
+        None
+    };
     let mut rail = col()
         .key("rail")
         .w(s.rail_w)
@@ -6033,30 +6275,24 @@ fn nav_rail(s: &App, p: Paint) -> El {
         .gap(1.0)
         .motion(Spring::NONE)
         .instant_changes()
-        .child(rail_item(s, p, 0, "Home", false, false))
-        .child(rail_item(s, p, 1, "Gallery", false, false))
+        .child(rail_item(s, p, current, Place::QuickAccess.index(), "Quick Access", false, false))
+        .child(rail_item(s, p, current, Place::Home.index(), "Home", false, false))
+        .child(rail_item(s, p, current, Place::Gallery.index(), "Gallery", false, false))
         .child(el().w_full().h(p.hair).fill(p.soft_line).my(5.0).key("rail-sep-1"));
-    for (index, label) in [
-        (3, "Desktop"),
-        (4, "Downloads"),
-        (5, "Documents"),
-        (6, "Pictures"),
-        (7, "Music"),
-        (8, "Videos"),
-    ] {
-        if !s.hidden_places.contains(&index) {
-            rail = rail.child(rail_item(s, p, index, label, false, true));
+    for (place, label) in PLACE_FOLDERS {
+        if !s.hidden_places.contains(&place.index()) {
+            rail = rail.child(rail_item(s, p, current, place.index(), label, false, true));
         }
     }
     if !s.pinned.is_empty() {
         rail = rail.child(el().w_full().h(p.hair).fill(p.soft_line).my(5.0).key("rail-sep-pinned"));
         for (pi, path) in s.pinned.iter().enumerate() {
-            rail = rail.child(pinned_item(s, p, pi, path));
+            rail = rail.child(pinned_item(s, p, pinned_at, pi, path));
         }
     }
     let mut rail = rail
         .child(el().w_full().h(p.hair).fill(p.soft_line).my(5.0).key("rail-sep-2"))
-        .child(rail_item(s, p, 9, "This PC", true, false));
+        .child(rail_item(s, p, current, Place::ThisPc.index(), "This PC", true, false));
     if s.rail_open.contains(&9) {
         if s.volumes.is_empty() {
             rail = rail.child(rail_leaf(p, "No drives found", None, None));
@@ -6069,7 +6305,7 @@ fn nav_rail(s: &App, p: Paint) -> El {
             rail = rail.child(rail_leaf(p, &title, Some(&path), Some(index)));
         }
     }
-    rail = rail.child(rail_item(s, p, 10, "Network", true, false));
+    rail = rail.child(rail_item(s, p, current, Place::Network.index(), "Network", true, false));
     if s.rail_open.contains(&10) {
         rail = rail.child(rail_leaf(p, "Network browsing is not implemented", None, None));
     }
@@ -8098,7 +8334,7 @@ fn quick_tile(s: &App, p: Paint, label: &str, mark: Ico, top: &str, bottom: &str
         })
 }
 
-fn home_content(s: &App, p: Paint) -> El {
+fn quick_access_content(s: &App, p: Paint) -> El {
     let tiles = [
         ("Desktop", Ico::Desktop, "#2bbad8", "#046cbd", "#0a5a9e", 3usize),
         ("Downloads", Ico::Downloads, "#2bc79a", "#0e9f76", "#0b7a5a", 4),
@@ -8115,7 +8351,7 @@ fn home_content(s: &App, p: Paint) -> El {
         }
         grid = grid.child(line);
     }
-    let recent_on = s.home_tab == 0;
+    let recent_on = s.quick_access_tab == 0;
     let pills = row()
         .w_full()
         .pt(14.0)
@@ -8134,7 +8370,7 @@ fn home_content(s: &App, p: Paint) -> El {
                 .items_center()
                 .child(ico(p, Ico::Clock, 14.0, if recent_on { p.accent_ink } else { p.secondary }))
                 .child(text("Recent").font(UI_TEXT).color(if recent_on { p.accent_ink } else { p.text }))
-                .on_press(|s: &mut App| s.home_tab = 0),
+                .on_press(|s: &mut App| s.quick_access_tab = 0),
         )
         .child(
             row()
@@ -8147,7 +8383,7 @@ fn home_content(s: &App, p: Paint) -> El {
                 .items_center()
                 .child(ico(p, Ico::Star, 14.0, if recent_on { p.secondary } else { p.accent_ink }))
                 .child(text("Favorites").font(UI_TEXT).color(if recent_on { p.text } else { p.accent_ink }))
-                .on_press(|s: &mut App| s.home_tab = 1),
+                .on_press(|s: &mut App| s.quick_access_tab = 1),
         );
     let mut table = col().w_full().pt(14.0);
     if recent_on {
@@ -8490,7 +8726,6 @@ fn go_gallery(s: &mut App) {
     s.tab = "Gallery".into();
     s.crumbs = vec!["Gallery".into()];
     s.search = "Search Gallery".into();
-    s.nav = 1;
     s.preview = true;
     s.contextual = true;
     s.groups.clear();
@@ -8810,7 +9045,7 @@ fn content(s: &App, p: Paint) -> El {
         files_list(s, p)
     } else {
         match s.view {
-            View::Home => home_content(s, p),
+            View::QuickAccess => quick_access_content(s, p),
             View::ThisPc => this_pc_content(s, p),
             View::Gallery => gallery_content(s, p),
             View::Files => files_list(s, p),
@@ -9019,6 +9254,9 @@ fn main() {
     if defaultmanager::forward_unhostable_launch() {
         return;
     }
+    // Before any window opens, so the first frame already shows the favorites
+    // and pins the 0.2 application left behind.
+    import_legacy_library();
     let spec = AppSpec::<App> {
         scenes: &[
             ("dark", |s| {
@@ -9029,7 +9267,9 @@ fn main() {
                 s.dark = false;
                 load(s, Fixture::Downloads);
             }),
-            ("home", |s| load(s, Fixture::Home)),
+            ("quickaccess", |s| load(s, Fixture::QuickAccess)),
+            // The home folder itself, with its own listing and breadcrumbs.
+            ("home", |s| open_home(s)),
             ("downloads", |s| load(s, Fixture::Downloads)),
             ("pictures", |s| load(s, Fixture::Screenshots)),
             ("thispc", |s| navigate(s, 9)),
@@ -9082,8 +9322,8 @@ fn main() {
                 s.menu = Some(Menu::Drop { kind: DropMenu::Subfolders, x: 700.0, y: 100.0 });
             }),
             ("favorites", |s| {
-                load(s, Fixture::Home);
-                s.home_tab = 1;
+                load(s, Fixture::QuickAccess);
+                s.quick_access_tab = 1;
                 let root = s.root.to_string_lossy().into_owned();
                 s.favorites = vec![root.clone(), format!("{}\\src", root)];
                 s.pinned = vec![root];
@@ -9437,7 +9677,7 @@ mod start_tests {
     /// working directory opened Lyre in `%LOCALAPPDATA%\Programs\Lyre` instead of
     /// the quick start screen.
     #[test]
-    fn a_plain_launch_starts_on_home() {
+    fn a_plain_launch_starts_on_quick_access() {
         if std::env::var_os("LYRE_RUNE_PATH").is_some() {
             // A path in the environment is a request to open it; nothing to check.
             return;
@@ -9448,8 +9688,11 @@ mod start_tests {
             // harness never does; leave it rather than fail on a stray argument.
             return;
         }
-        assert!(matches!(s.view, View::Home), "a plain launch opens on Home");
-        assert_eq!(s.tab, "Home");
+        assert!(
+            matches!(s.view, View::QuickAccess),
+            "a plain launch opens on Quick Access"
+        );
+        assert_eq!(s.tab, "Quick Access");
     }
 }
 
@@ -9472,10 +9715,10 @@ mod view_pref_tests {
         plain.mode = Mode::List;
         plain.sort = 1;
         plain.preview = true;
-        load(&mut plain, Fixture::Home);
+        load(&mut plain, Fixture::QuickAccess);
         assert!(matches!(plain.mode, Mode::Details) && plain.sort == 0 && !plain.preview);
 
-        load_home_preserving_view(&mut s);
+        load_quick_access_preserving_view(&mut s);
         assert!(matches!(s.mode, Mode::List), "the view choice survives");
         assert_eq!(s.sort, 1, "so does the sort column");
         assert!(s.sort_desc, "and its direction");
@@ -9879,7 +10122,7 @@ mod tests {
         }
         assert!(landed, "the external write must appear without any manual refresh");
         // Leaving the folder retires the watch.
-        s.view = View::Home;
+        s.view = View::QuickAccess;
         sync_watch(&mut s);
         assert!(s.watch.is_none());
         let _ = std::fs::remove_dir_all(&dir);
@@ -9955,9 +10198,17 @@ mod tests {
         commit_address(&mut s);
         assert!(s.address_edit.is_some(), "a bad path keeps the editor for correction");
         assert!(!s.notice.is_empty());
-        s.address_edit = Some(TextEdit::new("Home"));
+        s.address_edit = Some(TextEdit::new("Quick Access"));
         commit_address(&mut s);
-        assert!(matches!(s.view, View::Home));
+        assert!(matches!(s.view, View::QuickAccess));
+        // "Home" is the home folder itself now, so it opens as a folder rather
+        // than as the landing page.
+        if let Some(home) = home_dir().filter(|home| home.is_dir()) {
+            s.address_edit = Some(TextEdit::new("Home"));
+            commit_address(&mut s);
+            assert!(matches!(s.view, View::Files));
+            assert!(same_path(&s.root, &home));
+        }
         s.address_edit = Some(TextEdit::new("This PC"));
         commit_address(&mut s);
         assert!(matches!(s.view, View::ThisPc));
@@ -9986,12 +10237,124 @@ mod tests {
             assert_eq!(segs[0].1, PathBuf::from("/"));
             assert_eq!(segs[2].1, PathBuf::from("/a/b"));
         }
-        s.view = View::Home;
-        assert_eq!(crumb_segments(&s)[0].0, "Home");
+        s.view = View::QuickAccess;
+        assert_eq!(crumb_segments(&s)[0].0, "Quick Access");
         s.view = View::ThisPc;
         assert_eq!(crumb_segments(&s)[0].0, "This PC");
         s.view = View::Gallery;
         assert_eq!(crumb_segments(&s)[0].0, "Gallery");
+    }
+
+    /// The reported bug: This PC was left selected beside the pinned folder
+    /// that had replaced it, because the rail lit whichever row was last
+    /// pressed and nothing cleared it. Selection now comes from the location,
+    /// so opening a folder takes the one lit row with it.
+    #[test]
+    fn one_place_at_a_time() {
+        let mut s = init();
+        let pinned = std::env::temp_dir().join("lyre-place-test");
+        s.pinned = vec![pinned.to_string_lossy().into_owned()];
+
+        navigate(&mut s, 9);
+        assert_eq!(place_of(s.view, &s.root), Place::ThisPc);
+
+        // What a press on the pinned row does, without a disk behind it.
+        s.view = View::Files;
+        s.root = pinned.clone();
+        assert_eq!(
+            place_of(s.view, &s.root),
+            Place::Folder,
+            "the pinned folder is not This PC, so This PC cannot stay selected"
+        );
+        // And the pin is only selected while the window is in that folder.
+        s.root = std::env::temp_dir();
+        assert!(
+            !same_path(&s.root, &pinned),
+            "a folder that is not the pin leaves it unselected"
+        );
+    }
+
+    /// A folder pinned twice, once with a trailing separator or in another
+    /// case, drew two rows that both looked selected. One folder answers to one
+    /// pin, and a restored list folds the repeats.
+    #[test]
+    fn a_folder_pinned_twice_selects_once() {
+        let folder = std::env::temp_dir().join("lyre-pin-test");
+        let spelled = folder.to_string_lossy().into_owned();
+        let again = format!("{spelled}{}", std::path::MAIN_SEPARATOR);
+        assert!(same_text_path(&spelled, &again), "a trailing separator is the same folder");
+        assert_eq!(unique_paths(vec![spelled.clone(), again]).len(), 1);
+        // The rail selects the first row whose path matches, and only one.
+        let pins = unique_paths(vec![spelled.clone(), spelled]);
+        let owner = pins
+            .iter()
+            .position(|path| same_path(Path::new(path), &folder));
+        assert_eq!(owner, Some(0));
+        assert_eq!(pins.len(), 1);
+    }
+
+    /// Up out of This PC went to `C:\Users\<name>`, which shows the folder the
+    /// place had replaced rather than anything above This PC. A place that is
+    /// not a folder has nowhere to go up to.
+    #[test]
+    fn up_does_not_leave_a_place() {
+        let mut s = init();
+        for fixture in [Fixture::ThisPc, Fixture::QuickAccess] {
+            load(&mut s, fixture);
+            let root = s.root.clone();
+            assert!(!can_go_up(&s), "a place is not in a folder");
+            go_up(&mut s);
+            assert!(s.root == root, "Up moved out of a place");
+            assert!(!s.notice.is_empty(), "Up said nothing");
+        }
+    }
+
+    /// Home is the home folder itself: a real place with its own breadcrumbs,
+    /// its own Up, and its own name in the tab.
+    #[test]
+    fn home_is_the_home_folder() {
+        let Some(home) = home_dir().filter(|home| home.is_dir()) else { return };
+        let mut s = init();
+        open_home(&mut s);
+        assert!(matches!(s.view, View::Files), "Home is a folder, not a page");
+        assert!(same_path(&s.root, &home));
+        assert_eq!(s.tab, "Home");
+        assert_eq!(place_of(s.view, &s.root), Place::Home);
+        let crumbs = crumb_segments(&s);
+        assert_eq!(
+            crumbs.last().map(|(name, _)| name.as_str()),
+            home.file_name().and_then(|name| name.to_str()),
+            "the crumbs are the real path, not a place label"
+        );
+    }
+
+    /// A tab carries the search it started, and only it: switching tabs put the
+    /// leaving tab's hits under the arriving one, and carried a drag across.
+    #[test]
+    fn a_tab_does_not_carry_its_search_or_its_drag_to_the_next() {
+        let mut s = init();
+        let base = std::env::temp_dir().join(format!("lyre-tab-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&base).unwrap();
+        new_tab(&mut s);
+        set_location(&mut s, base.clone());
+        s.searching = true;
+        s.search_hits = vec![search::Hit { entry: s.entries.first().cloned().unwrap_or_else(|| {
+            make_entry("hit.txt", "", "Text Document", "1 KB", Kind::Text)
+        }), score: 1, indices: vec![] }];
+        s.drag = Some(DragState {
+            paths: vec!["a.txt".into()],
+            at: (10.0, 10.0),
+            shift: false,
+            target: None,
+            target_key: String::new(),
+            mode: fileops::Mode::Copy,
+        });
+        switch_tab(&mut s, 0);
+        assert!(!s.searching, "the leaving tab's search is over");
+        assert!(s.search_hits.is_empty(), "and its hits are gone");
+        assert!(s.drag.is_none(), "a drag aimed at the leaving tab does not survive");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// One volume moves, across volumes copies, and Shift inverts whichever

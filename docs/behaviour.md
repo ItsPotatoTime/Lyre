@@ -95,8 +95,9 @@ still wants a real try on each platform.
 Drops *from* the operating system work and are always copies, since the source may
 be on another volume or another machine. A drop on a row goes into that folder;
 a drop anywhere else in the content area — including an empty folder, the column
-header or the preview pane — goes into the folder currently on screen. Home and
-This PC have no directory of their own, so their empty space is not a drop zone.
+header or the preview pane — goes into the folder currently on screen. Quick
+Access and This PC have no directory of their own, so their empty space is not a
+drop zone; Home is the home folder, so it takes a drop like any other folder.
 
 **Dragging out of an archive works.** 7-Zip and WinRAR do not hand over an archive:
 they extract the selected members into a folder such as `%TEMP%\7zE9A2F`, name
@@ -132,8 +133,9 @@ underneath.
 The folder on screen is watched too. A file saved, edited, renamed or deleted by
 another program is on screen without pressing F5. One folder is watched at a
 time — the one behind the current listing — and switching tabs or navigating
-moves the watcher with it. Home and This PC have no single folder behind them,
-so nothing is watched there; volumes have their own watcher above.
+moves the watcher with it. Quick Access and This PC have no folder behind them,
+so nothing is watched there; Home is a folder, so it is watched like any other;
+volumes have their own watcher above.
 
 A name, a size and a modified time decide whether anything changed, so editing a
 file in place counts even though the folder's own timestamp does not move.

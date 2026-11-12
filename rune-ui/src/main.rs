@@ -1076,11 +1076,11 @@ fn switch_tab(s: &mut App, index: usize) {
 /// The caller saves or replaces the tab's slot afterwards.
 fn reset_tab_quick_access(s: &mut App) {
     s.view = View::QuickAccess;
-    s.mode = Mode::Details;
+    // The view, the sort and the details pane are the person's, and a new tab
+    // opens the way the others look.
     s.tab = "Quick Access".into();
     s.crumbs = vec!["Quick Access".into()];
     s.search = "Search Quick Access".into();
-    s.preview = false;
     s.contextual = false;
     s.groups.clear();
     clear_selection(s);
@@ -2419,7 +2419,6 @@ fn load(s: &mut App, f: Fixture) {
     s.drag_press = None;
     s.os_hover = None;
     s.contextual = false;
-    s.mode = Mode::Details;
     clear_selection(s);
     s.notice.clear();
     s.search_edit.text.clear();
@@ -2622,26 +2621,7 @@ fn load(s: &mut App, f: Fixture) {
     let authored_count = s.count;
     s.keep_order = true;
     s.count_override = Some(authored_count);
-    s.sort = 0;
     refresh_visible(s);
-}
-
-/// Start on Quick Access without discarding the view and sort the person chose.
-///
-/// `load` lays a fixture out for the reference captures, so it resets the mode,
-/// the sort and the preview pane. Startup goes through Quick Access, which meant
-/// those resets replaced the restored choices before the first frame and were
-/// then saved back as though they had been chosen.
-fn load_quick_access_preserving_view(s: &mut App) {
-    let mode = s.mode;
-    let sort = s.sort;
-    let sort_desc = s.sort_desc;
-    let preview = s.preview;
-    load(s, Fixture::QuickAccess);
-    s.mode = mode;
-    s.sort = sort;
-    s.sort_desc = sort_desc;
-    s.preview = preview;
 }
 
 fn init() -> App {
@@ -2832,7 +2812,7 @@ fn init() -> App {
     load_prefs(&mut app);
     if start_quick_access {
         // Before the first tab is captured, so the tab strip agrees with the view.
-        load_quick_access_preserving_view(&mut app);
+        load(&mut app, Fixture::QuickAccess);
     }
     refresh_visible(&mut app);
     app.tabs = vec![capture_tab(&app)];
@@ -10349,36 +10329,36 @@ mod start_tests {
 mod view_pref_tests {
     use super::*;
 
-    /// The reported bug: a chosen sort and view came back as the default after a
-    /// restart, because starting on Home reset them and the reset was saved.
+    /// The reported bug: This PC turned a Date modified, descending sort into
+    /// Name, descending, because laying its page out put the column back to the
+    /// first one and left the direction behind. No page owns the view, the sort
+    /// or the details pane.
     #[test]
-    fn the_chosen_view_and_sort_survive_starting_on_home() {
+    fn no_page_overwrites_the_view_sort_or_details_pane() {
         let mut s = init();
         s.mode = Mode::List;
-        s.sort = 1;
+        s.sort = 1; // Date modified
         s.sort_desc = true;
         s.preview = true;
-
-        // What the fixture alone does, which is why this wrapper exists.
-        let mut plain = init();
-        plain.mode = Mode::List;
-        plain.sort = 1;
-        plain.preview = true;
-        load(&mut plain, Fixture::QuickAccess);
-        assert!(
-            matches!(plain.mode, Mode::Details) && plain.sort == 0,
-            "the fixture resets the view and the sort, which is why the wrapper exists"
-        );
-        assert!(
-            plain.preview,
-            "but not the details pane, which belongs to the person"
-        );
-
-        load_quick_access_preserving_view(&mut s);
-        assert!(matches!(s.mode, Mode::List), "the view choice survives");
-        assert_eq!(s.sort, 1, "so does the sort column");
-        assert!(s.sort_desc, "and its direction");
-        assert!(s.preview, "and the preview pane");
+        for page in 0..4 {
+            match page {
+                // Startup, This PC, the Gallery where this machine has one, and
+                // a new tab.
+                1 => navigate(&mut s, 9),
+                2 => {
+                    if gallery_folder().is_none() {
+                        continue;
+                    }
+                    navigate(&mut s, 1);
+                }
+                3 => new_tab(&mut s),
+                _ => load(&mut s, Fixture::QuickAccess),
+            }
+            assert!(matches!(s.mode, Mode::List), "page {page} changed the view");
+            assert_eq!(s.sort, 1, "page {page} changed the sort column");
+            assert!(s.sort_desc, "page {page} changed the sort direction");
+            assert!(s.preview, "page {page} changed the details pane");
+        }
     }
 
     /// The reported bug: opening This PC turned the details pane on, and the

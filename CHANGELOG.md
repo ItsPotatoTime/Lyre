@@ -18,6 +18,12 @@ release notes rather than a second copy of them.
 
 ### Fixed
 
+- **No page overwrites the view, the sort or the details pane.** Opening This PC
+  put the sort column back to Name and left the direction alone, so a Date
+  modified, descending sort came out as Name, descending, and that was saved. It
+  was the last of them: laying out a page no longer touches any of the three, and
+  a new tab opens the way the others look instead of resetting them.
+
 - **Nothing is drawn past the right edge.** The Quick Access tiles were three to
   a line whatever the width, so the third one hung off a narrow window, and a
   long file name was drawn over the date beside it because its column had no room

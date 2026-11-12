@@ -40,6 +40,13 @@ release notes rather than a second copy of them.
 
 ### Fixed
 
+- **A rubber band starts from anywhere in the empty list.** The band's handler
+  sat on the rows themselves, so in a folder with a short listing a drag could be
+  started to the right of the rows but not below them: that space belongs to the
+  scrolling area, which had no handler. It is on the scrolling area now, in all
+  four views, and a press on a row still drags the row because the row takes the
+  drag first.
+
 - **A minimised window no longer shrinks the window for good.** While minimised,
   the window reports the sliver it collapsed to, 160 by 28, and that was being
   saved as the size to open at. Every launch after a minimise-then-close came back

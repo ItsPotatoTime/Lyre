@@ -8719,6 +8719,11 @@ fn scrollable(s: &App, p: Paint, content: El) -> El {
         .min_w(0.0)
         .min_h(0.0)
         .h_full()
+        // The band starts here rather than on the rows: the empty space below a
+        // short listing belongs to this scrolling area, so a handler on the rows
+        // alone only answered to the right of them. A press on a row still
+        // belongs to the row, which takes the drag before this does.
+        .on_drag(|s: &mut App, d: &mut rune::Drag, tx: &mut Tx| marquee_drag(s, d, tx))
         .scroll(ScrollSpec {
             stick_bottom: false,
         })
@@ -8770,7 +8775,7 @@ fn details_rows(s: &App, p: Paint) -> El {
             }
             list = list.child(file_row(s, i, p));
         }
-        list.on_drag(|s: &mut App, d: &mut rune::Drag, tx: &mut Tx| marquee_drag(s, d, tx))
+        list
     } else {
         col()
             .key("rows")
@@ -8782,7 +8787,6 @@ fn details_rows(s: &App, p: Paint) -> El {
                 |s: &App, i| Cow::Borrowed(display_entry(s, i).1.path.as_str()),
                 move |s: &App, i| file_row(s, i, p),
             )
-            .on_drag(|s: &mut App, d: &mut rune::Drag, tx: &mut Tx| marquee_drag(s, d, tx))
     };
     scrollable(s, p, list)
 }
@@ -8851,7 +8855,7 @@ fn grid_rows(s: &App, p: Paint) -> El {
         .px(16.0)
         .gap(8.0)
         .children((0..display_len(s)).map(|i| grid_tile(s, i, p)))
-        .on_drag(|s: &mut App, d: &mut rune::Drag, tx: &mut Tx| marquee_drag(s, d, tx));
+        ;
     scrollable(s, p, tiles)
 }
 
@@ -8910,8 +8914,7 @@ fn list_rows(s: &App, p: Paint) -> El {
         .pt(8.0)
         .px(12.0)
         .gap(2.0)
-        .children((0..display_len(s)).map(|i| list_item(s, i, p)))
-        .on_drag(|s: &mut App, d: &mut rune::Drag, tx: &mut Tx| marquee_drag(s, d, tx));
+        .children((0..display_len(s)).map(|i| list_item(s, i, p)));
     scrollable(s, p, items)
 }
 
@@ -8978,8 +8981,7 @@ fn tiles_rows(s: &App, p: Paint) -> El {
         .pt(12.0)
         .px(16.0)
         .gap(8.0)
-        .children((0..display_len(s)).map(|i| tile_item(s, i, p)))
-        .on_drag(|s: &mut App, d: &mut rune::Drag, tx: &mut Tx| marquee_drag(s, d, tx));
+        .children((0..display_len(s)).map(|i| tile_item(s, i, p)));
     scrollable(s, p, tiles)
 }
 
@@ -9594,7 +9596,7 @@ fn gallery_content(s: &App, p: Paint) -> El {
     if !cells.is_empty() {
         out = out.child(row().w_full().flex_wrap().gap(4.0).px(16.0).pt(4.0).children(cells));
     }
-    scrollable(s, p, out.on_drag(|s: &mut App, d: &mut rune::Drag, tx: &mut Tx| marquee_drag(s, d, tx)))
+    scrollable(s, p, out)
 }
 
 /// Per-type facts for one item, memoised by path. Reading a file for its
@@ -11531,6 +11533,33 @@ mod click_tests {
             .find(|e| e.key.as_deref() == Some("dialog-button-0"))
             .expect("the first button");
         assert!(cancel.rect[2] > 0.0 && cancel.rect[3] > 0.0, "and has a size to press");
+    }
+
+    /// The reported bug: a rubber band could be started to the right of the
+    /// rows but not below them, because the handler sat on the rows themselves
+    /// and the empty space under them belonged to the scrolling area.
+    #[test]
+    fn a_rubber_band_starts_from_the_empty_space_below_the_rows() {
+        let mut rt = rune::Runtime::new(init(), view, (1000.0, 800.0), rune::Env::new(true, 1.0));
+        rt.state.rect_window.set([0.0, 0.0, 1000.0, 800.0]);
+        rt.update(|s, _tx| {
+            load(s, Fixture::Downloads);
+            s.mode = Mode::Details;
+            s.rect_window.set([0.0, 0.0, 1000.0, 800.0]);
+            clear_selection(s);
+        });
+        rt.frame(0.0);
+        rt.frame(1.0 / 60.0);
+        let rows = rect_of(&rt, "rows");
+        // Below the last row, left of the scrollbar: empty list background.
+        let (x, y) = (rows[0] + 40.0, rows[1] + rows[3] + 10.0);
+        assert!(y < 760.0, "the test needs empty space under the rows");
+        rt.pointer_down(x, y);
+        rt.pointer_move(x + 60.0, y + 20.0);
+        rt.frame(1.0 / 60.0);
+        let band = rt.state.marquee.is_some();
+        rt.pointer_up(x + 60.0, y + 20.0);
+        assert!(band, "a press at {x},{y} in the empty space started nothing");
     }
 
     /// A press on a tab still switches to it now that the tab also answers an

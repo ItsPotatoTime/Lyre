@@ -18,6 +18,12 @@ release notes rather than a second copy of them.
   already on is not a step of its own. A folder deleted since, or a drive
   unplugged since, says it is not available there and leaves the window where it
   is rather than drawing an empty folder.
+- **The mouse's side buttons act on the press.** The press was taken by the
+  window before the toolkit saw it, and a message taken that way wakes nothing:
+  an idle window never runs the step that reads it, so Back and Forward on the
+  mouse did nothing until the pointer happened to move over the window. The press
+  now asks for a paint, which is how the drag-out handoff already wakes the
+  window, so the step is taken on the press itself.
 
 ## [0.3.2]
 

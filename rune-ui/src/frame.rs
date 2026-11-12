@@ -193,6 +193,13 @@ mod imp {
                 let which = ((wparam >> 16) & 0xFFFF) as u8;
                 if which == 1 || which == 2 {
                     SIDE_BUTTON.store(which, Ordering::Relaxed);
+                    // A taken message does not wake the runtime, and an idle
+                    // window then never runs `poll`: the press sat unread until
+                    // the pointer happened to move over the window, which is why
+                    // the side buttons felt like they did nothing. Asking for a
+                    // paint is how this file already wakes the window from a
+                    // message it takes (see the drag-out handoff above).
+                    RedrawWindow(hwnd, std::ptr::null(), std::ptr::null_mut(), RDW_INTERNALPAINT);
                 }
                 // Handled: returning zero would let the default proc beep.
                 return 1;

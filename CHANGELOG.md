@@ -17,6 +17,18 @@ release notes rather than a second copy of them.
 
 ### Fixed
 
+- **Shortcuts to folders open as folders.** A folder reached through a link —
+  the `My Videos`, `My Music` and `My Pictures` junctions in Documents, or a
+  `.lnk` someone made — was described by the standard library as a file, so it
+  sorted with the files, drew a file's blank icon, and was handed to the shell to
+  open. The shell asked Lyre, because Lyre is what opens folders, and a second
+  window appeared on the folder instead. A link is now listed as the folder it
+  is, with the folder's icon, and opens in the window it was pressed in. A
+  shortcut to a file is still the shell's, so it keeps its arguments, its working
+  directory and its own icon, and one whose target has gone draws its type's mark
+  rather than nothing. Where Windows denies reading through a link, as it does
+  for those three junctions, the folder the link names is what opens rather than
+  an empty one.
 - **Desktop, Documents, Pictures and the rest are found where the system keeps
   them.** The rail, the Quick Access tiles and the Gallery joined the English
   name onto the home folder, but that is only where these folders start: a person

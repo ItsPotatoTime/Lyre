@@ -44,6 +44,7 @@ mod openwith;
 mod osdrag;
 mod search;
 mod shell;
+mod shortcut;
 mod theme;
 mod updates;
 mod volumes;
@@ -1164,6 +1165,71 @@ pub(crate) fn scan(path: &Path) -> (Vec<Entry>, f64) {
     scan_until(path, &std::sync::atomic::AtomicBool::new(false), |_| {})
 }
 
+/// A folder reached through a link is a folder here, which is what Explorer
+/// lists and what opening it must do.
+fn entry_is_dir(path: &Path, meta: &fs::Metadata) -> bool {
+    if meta.is_dir() {
+        return true;
+    }
+    if !meta.file_type().is_symlink() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        // Windows marks a folder link — a junction, or a symlink to a folder —
+        // as both a reparse point and a directory, and the directory bit is
+        // what Explorer draws and opens by. It is still set when the target has
+        // gone, which is how a link that leads nowhere is shown as the folder
+        // it was. The standard library leaves `is_dir()` false for it because
+        // it treats a reparse point as a link, so as a file it sorted with the
+        // files, drew a file's blank icon, and was handed to the shell, which
+        // started a second Lyre window on the folder instead of opening it.
+        use std::os::windows::fs::MetadataExt;
+        // The entry's own attributes answer, so its target is never asked.
+        let _ = path;
+        meta.file_attributes() & 0x10 != 0
+    }
+    #[cfg(not(windows))]
+    {
+        // A Unix symlink carries no such bit, so ask where it points. One whose
+        // target has gone is not a folder.
+        fs::metadata(path).is_ok_and(|target| target.is_dir())
+    }
+}
+
+/// What a link leads to, when the link itself cannot be listed.
+///
+/// Windows marks the legacy `Documents\My Videos`, `My Music` and `My Pictures`
+/// links with a deny on reading through them, so the link can be listed in the
+/// folder that holds it but its contents cannot be. What such a link means is
+/// the folder it names, which is read normally, so that is what opens. A link
+/// that can be read is opened where it is, and anything that is not a link is
+/// left alone.
+fn link_target_to_read(path: &Path) -> Option<PathBuf> {
+    let is_link = fs::symlink_metadata(path)
+        .is_ok_and(|meta| meta.file_type().is_symlink());
+    if !is_link {
+        return None;
+    }
+    let mut at = path.to_path_buf();
+    // A link to a link is followed to the end, bounded so a pair that point at
+    // each other cannot spin.
+    for _ in 0..8 {
+        if fs::read_dir(&at).is_ok() {
+            return (at != path).then_some(at);
+        }
+        let next = fs::read_link(&at).ok()?;
+        // A junction stores its target as a device path, `\??\C:\...`, which is
+        // not a path anything else here can use.
+        let text = next.to_string_lossy();
+        at = match text.strip_prefix(r"\??\") {
+            Some(rest) => PathBuf::from(rest),
+            None => next,
+        };
+    }
+    None
+}
+
 /// Scan a folder, giving up when `cancel` is set and reporting how many items
 /// have been read so far. A folder of many thousand entries takes long enough
 /// that the window must not sit and wait for it.
@@ -1184,8 +1250,9 @@ pub(crate) fn scan_until(
                 break;
             }
             let name = item.file_name().to_string_lossy().into_owned();
+            let path = item.path();
             let Ok(meta) = item.metadata() else { continue };
-            let is_dir = meta.is_dir();
+            let is_dir = entry_is_dir(&path, &meta);
             let modified_at = meta.modified().ok();
             let modified = modified_at
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
@@ -1206,7 +1273,7 @@ pub(crate) fn scan_until(
             };
             entries.push(Entry {
                 name: name.clone(),
-                path: item.path().to_string_lossy().into_owned(),
+                path: path.to_string_lossy().into_owned(),
                 is_dir,
                 size: if is_dir { 0 } else { meta.len() },
                 modified,
@@ -2139,6 +2206,17 @@ fn go(s: &mut App, path: PathBuf) {
     if path == s.root && s.view == View::Files {
         return;
     }
+    // A folder listed through a link can lead nowhere, and a folder can be
+    // deleted between the listing and the press. Explorer says the location is
+    // not available and stays where it is; so does this, rather than showing an
+    // empty folder that is not empty.
+    if !path.is_dir() {
+        s.notice = format!("{} is not available here", path.display());
+        return;
+    }
+    // The folder as it is meant: a link the shell will not read through opens
+    // the folder it names instead of an empty page.
+    let path = link_target_to_read(&path).unwrap_or(path);
     s.history.push(s.root.clone());
     s.forward.clear();
     set_location(s, path);
@@ -2471,11 +2549,14 @@ fn init() -> App {
         .ok()
         .or_else(|| defaultmanager::startup_path().map(PathBuf::from));
     let start_quick_access = requested.is_none();
-    let root = requested.unwrap_or_else(|| {
-        home_dir().unwrap_or_else(|| {
+    let root = match requested {
+        // A link the shell will not read through is shown as the folder it
+        // names, the same as pressing one opens it.
+        Some(path) => link_target_to_read(&path).unwrap_or(path),
+        None => home_dir().unwrap_or_else(|| {
             std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
-        })
-    });
+        }),
+    };
     let (entries, scan_ms) = scan(&root);
     let crumbs: Vec<String> = root
         .components()
@@ -7573,11 +7654,17 @@ fn open_selected(s: &mut App) {
 fn open_path(s: &mut App, path: &str, is_dir: bool) {
     if is_dir {
         go(s, PathBuf::from(path));
-    } else {
-        record_recent(s, path);
-        if let Err(err) = shell::open_default(path) {
-            s.notice = err;
-        }
+        return;
+    }
+    // A shortcut to a folder opens that folder here. Handing it to the shell
+    // asks whichever program opens folders to open it, and that is Lyre, so a
+    // second window appeared on the folder instead of this one showing it.
+    if let Some(folder) = shortcut::folder_target(path) {
+        return go(s, folder);
+    }
+    record_recent(s, path);
+    if let Err(err) = shell::open_default(path) {
+        s.notice = err;
     }
 }
 
@@ -10622,5 +10709,192 @@ mod click_tests {
             "Home",
             "the strip must name the folder on screen, not the tab it was opened at"
         );
+    }
+}
+
+#[cfg(test)]
+mod link_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lyre-link-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A real directory junction, which is what a folder "shortcut" on a
+    /// Windows machine usually is. `cmd` makes one without needing privilege.
+    #[cfg(windows)]
+    fn junction(link: &Path, target: &Path) -> bool {
+        std::process::Command::new("cmd")
+            .arg("/C")
+            .arg("mklink")
+            .arg("/J")
+            .arg(link)
+            .arg(target)
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
+
+    /// The reported bug. `Documents\My Videos` is a directory junction, and the
+    /// standard library reports `is_dir()` false for one because it treats a
+    /// reparse point as a link. It was listed as a file: sorted with the files,
+    /// drew a file's blank icon, and was handed to the shell, which opened the
+    /// folder it names by starting a second Lyre window.
+    #[cfg(windows)]
+    #[test]
+    fn a_directory_junction_is_a_folder_in_the_listing() {
+        let base = scratch("junction");
+        std::fs::create_dir_all(base.join("target")).unwrap();
+        std::fs::create_dir_all(base.join("shown")).unwrap();
+        let link = base.join("shown").join("My Videos");
+        if !junction(&link, &base.join("target")) {
+            // A machine that refuses junctions can say nothing about them.
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        let (entries, _) = scan(&base.join("shown"));
+        let entry = entries.iter().find(|e| e.name == "My Videos").expect("listed");
+        assert!(entry.is_dir, "a junction to a folder is a folder");
+        assert_eq!(entry.type_label, "File folder");
+        assert_eq!(
+            icon_key(entry),
+            "folder",
+            "it draws the folder's icon, not a blank file's"
+        );
+
+        // The target goes. Explorer still lists the folder, and opening it says
+        // the location is not available rather than showing an empty folder.
+        std::fs::remove_dir_all(base.join("target")).unwrap();
+        let (entries, _) = scan(&base.join("shown"));
+        let entry = entries.iter().find(|e| e.name == "My Videos").expect("listed");
+        assert!(entry.is_dir, "the link is still the folder it was");
+        let mut s = init();
+        let root = s.root.clone();
+        go(&mut s, PathBuf::from(&entry.path));
+        assert!(
+            same_path(&s.root, &root),
+            "a folder that leads nowhere is not opened"
+        );
+        assert!(
+            s.notice.contains("not available here"),
+            "and it says why: {}",
+            s.notice
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Windows marks the legacy `Documents\My Videos` links with a deny on
+    /// reading through them, so the link can be listed but never read. Only the
+    /// folder it names can be shown, and that is what pressing one opens.
+    #[cfg(windows)]
+    #[test]
+    fn a_link_that_cannot_be_listed_opens_the_folder_it_names() {
+        let base = scratch("deny");
+        std::fs::create_dir_all(base.join("Videos")).unwrap();
+        std::fs::write(base.join("Videos").join("clip.mp4"), b"x").unwrap();
+        std::fs::create_dir_all(base.join("shown")).unwrap();
+        let link = base.join("shown").join("My Videos");
+        if !junction(&link, &base.join("Videos")) {
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        // The deny Windows puts on them, by SID so it reads the same in every
+        // language: everyone may not read the folder's contents.
+        let denied = std::process::Command::new("icacls")
+            .arg(&link)
+            .arg("/deny")
+            .arg("*S-1-1-0:(RD)")
+            .output()
+            .is_ok_and(|out| out.status.success());
+        if !denied || fs::read_dir(&link).is_ok() {
+            // A machine that will not take the deny cannot show this case.
+            let _ = std::fs::remove_dir_all(&base);
+            return;
+        }
+        let mut s = init();
+        go(&mut s, link);
+        assert!(
+            same_path(&s.root, &base.join("Videos")),
+            "the folder the link names is what opens"
+        );
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while s.scan_rx.is_some() && Instant::now() < deadline {
+            drain_scan(&mut s);
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(
+            s.entries.iter().any(|e| e.name == "clip.mp4"),
+            "and it is read, not shown as an empty folder"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Away from Windows a link carries no directory bit, so where it points is
+    /// what decides — and a link to nothing is not a folder.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_is_a_folder_when_it_points_at_one() {
+        use std::os::unix::fs::symlink;
+        let base = scratch("symlink");
+        std::fs::create_dir_all(base.join("dir")).unwrap();
+        symlink(base.join("dir"), base.join("link")).unwrap();
+        let (entries, _) = scan(&base);
+        assert!(
+            entries.iter().find(|e| e.name == "link").expect("listed").is_dir,
+            "a link to a folder is a folder"
+        );
+        std::fs::remove_dir_all(base.join("dir")).unwrap();
+        let (entries, _) = scan(&base);
+        assert!(
+            !entries.iter().find(|e| e.name == "link").expect("listed").is_dir,
+            "a link to nothing is not a folder"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The same reported bug for a real shortcut: a `.lnk` to a folder was handed
+    /// to the shell, which asked Lyre to open the folder and started a second
+    /// window on it. The folder opens in this window instead.
+    #[test]
+    fn a_shortcut_to_a_folder_opens_in_this_window() {
+        let base = scratch("lnk");
+        std::fs::create_dir_all(base.join("Videos")).unwrap();
+        let shortcut_path = base.join("My Videos.lnk");
+        std::fs::write(
+            &shortcut_path,
+            shortcut::encoded(&base.join("Videos").to_string_lossy(), ""),
+        )
+        .unwrap();
+        let mut s = init();
+        open_path(&mut s, &shortcut_path.to_string_lossy(), false);
+        assert!(matches!(s.view, View::Files), "the folder opens here");
+        assert!(
+            same_path(&s.root, &base.join("Videos")),
+            "and shows the folder the shortcut names"
+        );
+        assert_eq!(s.tab, "Videos");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A shortcut to a file stays the shell's: it is what runs an application
+    /// with its arguments, its working directory and its window state.
+    #[test]
+    fn a_shortcut_to_a_file_is_left_to_the_shell() {
+        let base = scratch("lnk-file");
+        std::fs::write(base.join("notes.txt"), b"x").unwrap();
+        let shortcut_path = base.join("notes.lnk");
+        std::fs::write(
+            &shortcut_path,
+            shortcut::encoded(&base.join("notes.txt").to_string_lossy(), ""),
+        )
+        .unwrap();
+        assert_eq!(
+            shortcut::folder_target(&shortcut_path.to_string_lossy()),
+            None,
+            "a file's shortcut names no folder to open here"
+        );
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

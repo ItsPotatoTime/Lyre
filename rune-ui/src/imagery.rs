@@ -158,22 +158,33 @@ mod win {
     }
 
     /// The icon Explorer shows for a path. Folders and ordinary files are looked
-    /// up by attribute/extension (no disk read); executables and icon files are
-    /// read so their own embedded icon comes back.
+    /// up by attribute/extension (no disk read); executables, icon files and
+    /// shortcuts are read so their own icon comes back.
     pub fn shell_icon(path: &str, is_dir: bool, _px: u32) -> Option<(u32, u32, Vec<u8>)> {
-        let wide_path = wide(path);
-        if wide_path.len() > 260 {
-            return None;
-        }
-        let own = super::carries_own_icon(path);
         let attributes = if is_dir {
             FILE_ATTRIBUTE_DIRECTORY
         } else {
             FILE_ATTRIBUTE_NORMAL
         };
-        let mut flags = SHGFI_ICON | SHGFI_LARGEICON;
-        if !own {
-            flags |= SHGFI_USEFILEATTRIBUTES;
+        if super::carries_own_icon(path)
+            && let Some(picture) = query(path, attributes, SHGFI_ICON | SHGFI_LARGEICON)
+        {
+            return Some(picture);
+        }
+        // A shortcut whose target has gone has nothing to resolve, so it lands
+        // here and draws the mark of its type rather than nothing at all.
+        query(
+            path,
+            attributes,
+            SHGFI_ICON | SHGFI_LARGEICON | SHGFI_USEFILEATTRIBUTES,
+        )
+    }
+
+    /// One `SHGetFileInfoW` call, as RGBA.
+    fn query(path: &str, attributes: u32, flags: u32) -> Option<(u32, u32, Vec<u8>)> {
+        let wide_path = wide(path);
+        if wide_path.len() > 260 {
+            return None;
         }
         let mut info: ShFileInfoW = unsafe { std::mem::zeroed() };
         let result = unsafe {

@@ -2413,7 +2413,6 @@ fn load(s: &mut App, f: Fixture) {
     s.drag = None;
     s.drag_press = None;
     s.os_hover = None;
-    s.preview = false;
     s.contextual = false;
     s.mode = Mode::Details;
     clear_selection(s);
@@ -2607,7 +2606,6 @@ fn load(s: &mut App, f: Fixture) {
         }
         Fixture::ThisPc => {
             s.view = View::ThisPc;
-            s.preview = true;
             s.tab = "This PC".into();
             s.crumbs = vec!["This PC".into()];
             s.search = "Search This PC".into();
@@ -9694,7 +9692,13 @@ fn main() {
             ("home", |s| open_home(s)),
             ("downloads", |s| load(s, Fixture::Downloads)),
             ("pictures", |s| load(s, Fixture::Screenshots)),
-            ("thispc", |s| navigate(s, 9)),
+            ("thispc", |s| {
+                navigate(s, 9);
+                // The reference capture this scene reproduces has the details
+                // pane open. The page itself no longer forces it: that is the
+                // person's setting, and turning it on for them was the bug.
+                s.preview = true;
+            }),
             ("list", |s| {
                 load(s, Fixture::Downloads);
                 s.mode = Mode::List;
@@ -10138,13 +10142,42 @@ mod view_pref_tests {
         plain.sort = 1;
         plain.preview = true;
         load(&mut plain, Fixture::QuickAccess);
-        assert!(matches!(plain.mode, Mode::Details) && plain.sort == 0 && !plain.preview);
+        assert!(
+            matches!(plain.mode, Mode::Details) && plain.sort == 0,
+            "the fixture resets the view and the sort, which is why the wrapper exists"
+        );
+        assert!(
+            plain.preview,
+            "but not the details pane, which belongs to the person"
+        );
 
         load_quick_access_preserving_view(&mut s);
         assert!(matches!(s.mode, Mode::List), "the view choice survives");
         assert_eq!(s.sort, 1, "so does the sort column");
         assert!(s.sort_desc, "and its direction");
         assert!(s.preview, "and the preview pane");
+    }
+
+    /// The reported bug: opening This PC turned the details pane on, and the
+    /// choice was then saved, so it stayed on everywhere afterwards.
+    #[test]
+    fn opening_this_pc_keeps_the_details_pane_as_it_was() {
+        for preview in [false, true] {
+            for open in 0..2 {
+                let mut s = init();
+                s.preview = preview;
+                // Both the rail row and a step back onto the page.
+                if open == 0 {
+                    navigate(&mut s, 9);
+                } else {
+                    load(&mut s, Fixture::ThisPc);
+                }
+                assert_eq!(
+                    s.preview, preview,
+                    "This PC must not change the person's details pane"
+                );
+            }
+        }
     }
 }
 

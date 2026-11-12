@@ -879,6 +879,9 @@ struct App {
     scan_seen: usize,
     /// The open modal dialog (delete confirm, paste conflict, rename, new folder).
     dialog: Option<Dialog>,
+    /// Which of the dialog's buttons the keyboard is on, in drawing order.
+    /// Enter and Space press it, the arrows move it.
+    dialog_focus: usize,
     /// The "Open with" worker's answer: listing applications touches the disk
     /// and, on Linux, runs `xdg-mime`, so it never runs on the UI thread.
     openwith_rx: Option<std::sync::mpsc::Receiver<openwith::OpenWith>>,
@@ -1949,7 +1952,7 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
             if s.prompt_default_manager {
                 let ms = defaultmanager::state();
                 if !ms.is_default && ms.unsupported.is_none() {
-                    s.dialog = Some(Dialog::DefaultManager);
+                    open_dialog(s, Dialog::DefaultManager);
                 }
             }
         }
@@ -2778,6 +2781,7 @@ fn init() -> App {
         scan_cancel: None,
         scan_seen: 0,
         dialog: None,
+        dialog_focus: 0,
         openwith_rx: None,
         searching: false,
         search_hits: Vec::new(),
@@ -4968,7 +4972,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                         rows.push(
                             menu_item(p, "Open folders with Lyre…", Some(Ico::ThisPc), None, false)
                                 .on_press(|s: &mut App| {
-                                    s.dialog = Some(Dialog::DefaultManager);
+                                    open_dialog(s, Dialog::DefaultManager);
                                     s.menu = None;
                                 }),
                         );
@@ -5151,7 +5155,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                                         entry.is_dir,
                                         kind_label(entry.kind),
                                     );
-                                    s.dialog = Some(Dialog::Properties(Box::new(details)));
+                                    open_dialog(s, Dialog::Properties(Box::new(details)));
                                 }
                                 s.menu = None;
                             }),
@@ -5802,8 +5806,174 @@ fn customize_dialog(s: &App, p: Paint) -> El {
         )
 }
 
-fn dialog_button(p: Paint, label: &str, primary: bool) -> El {
-    row()
+/// One button a dialog can show. The view draws the dialog's buttons from
+/// `dialog_buttons` and the keyboard presses them by the same index, so neither
+/// can offer something the other does not have.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DialogButton {
+    Cancel,
+    /// The dialog's own verb: Delete, Create, OK.
+    Confirm,
+    KeepBoth,
+    Overwrite,
+    MakeDefault,
+    Install,
+    ChooseApp,
+    Open,
+    Close,
+}
+
+/// The buttons of `dialog`, in the order they are drawn and walked. A dialog's
+/// buttons depend only on the dialog itself, so the row and the keyboard agree.
+fn dialog_buttons(dialog: Option<&Dialog>) -> Vec<DialogButton> {
+    match dialog {
+        Some(Dialog::Delete { .. })
+        | Some(Dialog::Rename { .. })
+        | Some(Dialog::NewFolder { .. }) => vec![DialogButton::Cancel, DialogButton::Confirm],
+        Some(Dialog::PasteConflict { .. }) => {
+            vec![DialogButton::Cancel, DialogButton::KeepBoth, DialogButton::Overwrite]
+        }
+        Some(Dialog::DefaultManager) => vec![DialogButton::Cancel, DialogButton::MakeDefault],
+        Some(Dialog::Update) => vec![DialogButton::Cancel, DialogButton::Install],
+        Some(Dialog::OpenWith { data, .. }) => {
+            // The same two conditions the row is drawn under: the system's
+            // picker where the app cannot set a default, and Open only when
+            // there is an application to open with.
+            let mut buttons = vec![DialogButton::Cancel];
+            if data.as_ref().is_some_and(|d| d.default_via_picker) {
+                buttons.push(DialogButton::ChooseApp);
+            }
+            if data.as_ref().is_some_and(|d| !d.apps.is_empty()) {
+                buttons.push(DialogButton::Open);
+            }
+            buttons
+        }
+        Some(Dialog::Properties(_)) => vec![DialogButton::Close],
+        None => Vec::new(),
+    }
+}
+
+fn dialog_button_label(s: &App, button: DialogButton) -> String {
+    match button {
+        DialogButton::Cancel => "Cancel".into(),
+        DialogButton::Confirm => match s.dialog.as_ref() {
+            Some(Dialog::Delete { permanent: true, .. }) => "Delete permanently".into(),
+            Some(Dialog::Delete { .. }) => "Delete".into(),
+            Some(Dialog::NewFolder { .. }) => "Create".into(),
+            _ => "OK".into(),
+        },
+        DialogButton::KeepBoth => "Keep both".into(),
+        DialogButton::Overwrite => "Overwrite".into(),
+        DialogButton::MakeDefault => "Make default".into(),
+        DialogButton::Install => {
+            if s.update_installing { "Installing…".into() } else { "Install".into() }
+        }
+        DialogButton::ChooseApp => "Choose another app…".into(),
+        DialogButton::Open => "Open".into(),
+        DialogButton::Close => "Close".into(),
+    }
+}
+
+/// Whether the button carries the accent fill: one per dialog, the one Enter
+/// presses when the dialog opens.
+fn dialog_button_primary(button: DialogButton) -> bool {
+    !matches!(
+        button,
+        DialogButton::Cancel | DialogButton::KeepBoth | DialogButton::ChooseApp
+    )
+}
+
+/// Where the keyboard starts in a dialog: on its primary button, as Windows does.
+fn dialog_default_focus(buttons: &[DialogButton]) -> usize {
+    buttons
+        .iter()
+        .position(|button| dialog_button_primary(*button))
+        .unwrap_or(0)
+}
+
+/// The button the keyboard is on, clamped to a dialog whose buttons changed.
+fn dialog_focus_index(s: &App, len: usize) -> usize {
+    s.dialog_focus.min(len.saturating_sub(1))
+}
+
+/// Open a dialog with the keyboard on its primary button.
+fn open_dialog(s: &mut App, dialog: Dialog) {
+    let buttons = dialog_buttons(Some(&dialog));
+    s.dialog_focus = dialog_default_focus(&buttons);
+    s.dialog = Some(dialog);
+}
+
+/// Press one of the dialog's buttons. The press handlers and the keyboard call
+/// this, so a button does the same thing however it is pressed.
+fn press_dialog_button(s: &mut App, button: DialogButton) {
+    match button {
+        DialogButton::Cancel | DialogButton::Close => {
+            // The update dialog is not dismissable while it downloads: its
+            // progress is the only sign that anything is happening.
+            if matches!(s.dialog, Some(Dialog::Update)) && s.update_busy {
+                return;
+            }
+            s.dialog = None;
+        }
+        DialogButton::Confirm => match s.dialog.as_ref() {
+            Some(Dialog::Delete { .. }) => {
+                let Some(Dialog::Delete { permanent, paths }) = s.dialog.take() else { return };
+                start_delete(s, if permanent { fileops::DeleteMode::Permanent } else { fileops::DeleteMode::Trash }, paths);
+            }
+            Some(Dialog::Rename { .. }) => commit_rename(s),
+            Some(Dialog::NewFolder { .. }) => commit_new_folder(s),
+            _ => {}
+        },
+        DialogButton::KeepBoth | DialogButton::Overwrite => {
+            let Some(Dialog::PasteConflict { mode, sources, target }) = s.dialog.take() else {
+                return;
+            };
+            let conflict = if button == DialogButton::Overwrite {
+                fileops::Conflict::Overwrite
+            } else {
+                fileops::Conflict::Rename
+            };
+            start_paste(s, mode, conflict, sources, target);
+        }
+        DialogButton::MakeDefault => {
+            match defaultmanager::make_default() {
+                Ok(_) => s.notice = "Lyre now opens folders".into(),
+                Err(e) => s.notice = e,
+            }
+            s.dialog = None;
+        }
+        DialogButton::Install => {
+            if !s.update_busy {
+                start_update_install(s);
+            }
+        }
+        DialogButton::ChooseApp => {
+            let Some(Dialog::OpenWith { path, .. }) = s.dialog.as_ref() else { return };
+            let path = path.clone();
+            if let Err(e) = shell::open_with_picker(&path) {
+                s.notice = e;
+            }
+            s.dialog = None;
+        }
+        DialogButton::Open => {
+            let Some(Dialog::OpenWith { path, selected, remember, data, .. }) = s.dialog.as_ref()
+            else {
+                return;
+            };
+            let (path, selected) = (path.clone(), selected.clone());
+            // Windows cannot be told a new default, so the one-off open is all
+            // that is left to honour there.
+            let commit = *remember && !data.as_ref().is_some_and(|d| d.default_via_picker);
+            if let Some(id) = selected {
+                s.dialog = None;
+                apply_open_with(s, &path, &id, commit);
+            }
+        }
+    }
+}
+
+fn dialog_button(p: Paint, label: &str, primary: bool, focused: bool) -> El {
+    let b = row()
         .h(32.0)
         .px(16.0)
         .radius(4.0)
@@ -5811,7 +5981,30 @@ fn dialog_button(p: Paint, label: &str, primary: bool) -> El {
         .border(p.hair, if primary { p.accent_fill } else { p.field_line })
         .hover(p.hover)
         .center()
-        .child(text(label).font(UI_TEXT).color(if primary { Color::WHITE } else { p.text }))
+        .child(text(label).font(UI_TEXT).color(if primary { Color::WHITE } else { p.text }));
+    // The keyboard sits on one button; the ring says which, so Enter is never a
+    // guess. It is drawn a little clear of the fill so both remain visible.
+    if focused {
+        b.border(p.hair * 2.0, if primary { Color::WHITE } else { p.accent })
+    } else {
+        b
+    }
+}
+
+/// The dialog's buttons as one row, each pressing what the keyboard would.
+fn dialog_buttons_el(s: &App, p: Paint) -> El {
+    let buttons = dialog_buttons(s.dialog.as_ref());
+    let focused = dialog_focus_index(s, buttons.len());
+    let mut row_el = row().key("dialog-buttons").gap(8.0).items_center();
+    for (index, button) in buttons.iter().copied().enumerate() {
+        let label = dialog_button_label(s, button);
+        row_el = row_el.child(
+            dialog_button(p, &label, dialog_button_primary(button), index == focused)
+                .key(format!("dialog-button-{index}"))
+                .on_press(move |s: &mut App| press_dialog_button(s, button)),
+        );
+    }
+    row_el
 }
 
 /// The radio mark an "Open with" row carries: a ring, filled in when chosen.
@@ -5888,41 +6081,21 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
             } else {
                 ("Move to trash?", format!("Move {n} item{plural} to the trash? You can restore it later."))
             };
-            let paths = paths.clone();
-            let mode = if *permanent { fileops::DeleteMode::Permanent } else { fileops::DeleteMode::Trash };
-            let confirm_label = if *permanent { "Delete permanently" } else { "Delete" };
             base()
                 .child(text(title).font(TILE_TEXT).color(p.text))
                 .child(text(msg.as_str()).font(UI_TEXT).color(p.secondary))
                 .child(
                     row().w_full().gap(8.0).child(el().grow(1.0))
-                        .child(dialog_button(p, "Cancel", false).on_press(|s: &mut App| s.dialog = None))
-                        .child(dialog_button(p, confirm_label, true).on_press(move |s: &mut App| {
-                            s.dialog = None;
-                            start_delete(s, mode, paths.clone());
-                        })),
+                        .child(dialog_buttons_el(s, p)),
                 )
         }
-        Dialog::PasteConflict { mode, sources, target } => {
-            let mode = *mode;
-            let rename_sources = sources.clone();
-            let rename_target = target.clone();
-            let over_sources = sources.clone();
-            let over_target = target.clone();
+        Dialog::PasteConflict { .. } => {
             base()
                 .child(text("Replace or keep both?").font(TILE_TEXT).color(p.text))
                 .child(text("An item with the same name already exists in this folder.").font(UI_TEXT).color(p.secondary))
                 .child(
                     row().w_full().gap(8.0).child(el().grow(1.0))
-                        .child(dialog_button(p, "Cancel", false).on_press(|s: &mut App| s.dialog = None))
-                        .child(dialog_button(p, "Keep both", false).on_press(move |s: &mut App| {
-                            s.dialog = None;
-                            start_paste(s, mode, fileops::Conflict::Rename, rename_sources.clone(), rename_target.clone());
-                        }))
-                        .child(dialog_button(p, "Overwrite", true).on_press(move |s: &mut App| {
-                            s.dialog = None;
-                            start_paste(s, mode, fileops::Conflict::Overwrite, over_sources.clone(), over_target.clone());
-                        })),
+                        .child(dialog_buttons_el(s, p)),
                 )
         }
         Dialog::Rename { edit, .. } => {
@@ -5953,8 +6126,7 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
                 )
                 .child(
                     row().w_full().gap(8.0).child(el().grow(1.0))
-                        .child(dialog_button(p, "Cancel", false).on_press(|s: &mut App| s.dialog = None))
-                        .child(dialog_button(p, "OK", true).on_press(|s: &mut App| commit_rename(s))),
+                        .child(dialog_buttons_el(s, p)),
                 )
         }
         Dialog::NewFolder { edit, .. } => {
@@ -5985,8 +6157,7 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
                 )
                 .child(
                     row().w_full().gap(8.0).child(el().grow(1.0))
-                        .child(dialog_button(p, "Cancel", false).on_press(|s: &mut App| s.dialog = None))
-                        .child(dialog_button(p, "Create", true).on_press(|s: &mut App| commit_new_folder(s))),
+                        .child(dialog_buttons_el(s, p)),
                 )
         }
         Dialog::DefaultManager => {
@@ -6011,14 +6182,7 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
                                 }),
                         )
                         .child(el().grow(1.0))
-                        .child(dialog_button(p, "Cancel", false).on_press(|s: &mut App| s.dialog = None))
-                        .child(dialog_button(p, "Make default", true).on_press(|s: &mut App| {
-                            match defaultmanager::make_default() {
-                                Ok(_) => s.notice = "Lyre now opens folders".into(),
-                                Err(e) => s.notice = e,
-                            }
-                            s.dialog = None;
-                        })),
+                        .child(dialog_buttons_el(s, p)),
                 )
         }
         Dialog::Update => {
@@ -6070,20 +6234,10 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
             panel.child(
                 footer
                     .child(el().grow(1.0))
-                    .child(dialog_button(p, "Cancel", false).on_press(move |s: &mut App| {
-                        if !busy {
-                            s.dialog = None;
-                        }
-                    }))
-                    .child(dialog_button(p, if installing { "Installing…" } else { "Install" }, true).on_press(move |s: &mut App| {
-                        if !busy {
-                            start_update_install(s);
-                        }
-                    })),
+                    .child(dialog_buttons_el(s, p)),
             )
         }
-        Dialog::OpenWith { path, name, data, selected, remember } => {
-            let path = path.clone();
+        Dialog::OpenWith { name, data, selected, remember, .. } => {
             let picked = selected.clone();
             let mut panel = base().child(
                 text(format!("Open “{name}” with")).font(TILE_TEXT).color(p.text).truncate(),
@@ -6168,7 +6322,6 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
             }
 
             let via_picker = loaded.is_some_and(|d| d.default_via_picker);
-            let has_apps = loaded.is_some_and(|d| !d.apps.is_empty());
 
             // Ours to honour on Linux and macOS. On Windows the association is
             // hash-protected, so this row gives way to the system's own picker.
@@ -6206,33 +6359,7 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
                 .gap(8.0)
                 .items_center()
                 .child(el().grow(1.0))
-                .child(dialog_button(p, "Cancel", false).on_press(|s: &mut App| s.dialog = None));
-            if via_picker {
-                let target = path.clone();
-                footer = footer.child(
-                    dialog_button(p, "Choose another app…", false).on_press(move |s: &mut App| {
-                        if let Err(e) = shell::open_with_picker(&target) {
-                            s.notice = e;
-                        }
-                        s.dialog = None;
-                    }),
-                );
-            }
-            if has_apps {
-                let target = path.clone();
-                let app = picked.clone();
-                // Windows cannot be told a new default, so the one-off open is
-                // all that is left to honour there.
-                let commit = *remember && !via_picker;
-                footer = footer.child(
-                    dialog_button(p, "Open", true).on_press(move |s: &mut App| {
-                        if let Some(id) = &app {
-                            s.dialog = None;
-                            apply_open_with(s, &target, id, commit);
-                        }
-                    }),
-                );
-            }
+                .child(dialog_buttons_el(s, p));
             panel.child(footer)
         }
         Dialog::Properties(details) => {
@@ -6281,7 +6408,7 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
                         .w_full()
                         .gap(8.0)
                         .child(el().grow(1.0))
-                        .child(dialog_button(p, "Close", true).on_press(|s: &mut App| s.dialog = None)),
+                        .child(dialog_buttons_el(s, p)),
                 )
         }
     };
@@ -7477,6 +7604,9 @@ fn start_update_install(s: &mut App) {
 fn drain_update(s: &mut App) -> bool {
     let mut changed = false;
     let mut finished = false;
+    // A dialog opened from this drain is applied after it, because the worker's
+    // receiver is borrowed for the length of the loop.
+    let mut opening: Option<Dialog> = None;
     if let Some(rx) = &s.update_rx {
         while let Ok(msg) = rx.try_recv() {
             match msg {
@@ -7490,7 +7620,7 @@ fn drain_update(s: &mut App) -> bool {
                             // dialog (the default-manager offer); a manual check
                             // always shows what it found.
                             if !s.update_silent || s.dialog.is_none() {
-                                s.dialog = Some(Dialog::Update);
+                                opening = Some(Dialog::Update);
                             }
                             s.notice.clear();
                         }
@@ -7534,6 +7664,9 @@ fn drain_update(s: &mut App) -> bool {
     }
     if finished {
         s.update_rx = None;
+    }
+    if let Some(dialog) = opening {
+        open_dialog(s, dialog);
     }
     changed
 }
@@ -7634,7 +7767,7 @@ fn paste_into(s: &mut App, sources: Vec<PathBuf>, mode: fileops::Mode, target: P
     });
     s.menu = None;
     if conflict_exists {
-        s.dialog = Some(Dialog::PasteConflict { mode, sources, target });
+        open_dialog(s, Dialog::PasteConflict { mode, sources, target });
     } else {
         start_paste(s, mode, fileops::Conflict::Rename, sources, target);
     }
@@ -7647,7 +7780,7 @@ fn begin_delete(s: &mut App, permanent: bool) {
         return;
     }
     s.menu = None;
-    s.dialog = Some(Dialog::Delete { permanent, paths });
+    open_dialog(s, Dialog::Delete { permanent, paths });
 }
 
 fn begin_rename(s: &mut App) {
@@ -7655,7 +7788,7 @@ fn begin_rename(s: &mut App) {
     let mut edit = TextEdit::default();
     edit.text = e.name.clone();
     s.menu = None;
-    s.dialog = Some(Dialog::Rename { path: PathBuf::from(&e.path), edit });
+    open_dialog(s, Dialog::Rename { path: PathBuf::from(&e.path), edit });
 }
 
 fn begin_new_folder(s: &mut App) {
@@ -7666,7 +7799,7 @@ fn begin_new_folder(s: &mut App) {
     let mut edit = TextEdit::default();
     edit.text = "New folder".into();
     s.menu = None;
-    s.dialog = Some(Dialog::NewFolder { parent: s.root.clone(), edit });
+    open_dialog(s, Dialog::NewFolder { parent: s.root.clone(), edit });
 }
 
 fn commit_rename(s: &mut App) {
@@ -7815,7 +7948,7 @@ fn open_recent(s: &mut App, i: usize) {
 fn start_open_with(s: &mut App, path: String, name: String) {
     let (tx, rx) = std::sync::mpsc::channel();
     s.openwith_rx = Some(rx);
-    s.dialog = Some(Dialog::OpenWith {
+    open_dialog(s, Dialog::OpenWith {
         path: path.clone(),
         name,
         data: None,
@@ -7869,6 +8002,45 @@ fn apply_open_with(s: &mut App, path: &str, app_id: &str, remember: bool) {
 
 /// Global shortcuts. Returns true when the key was handled. Editing keys are
 /// left to a focused field or an open dialog.
+/// The keys the dialog on screen answers: Enter or Space presses the button the
+/// keyboard is on, the arrows walk between the buttons, and Escape is handled
+/// before this. A dialog with a field in it leaves every key to that field,
+/// which submits with Enter and moves the caret with the arrows.
+fn dialog_key(s: &mut App, key: &Key) -> bool {
+    let buttons = dialog_buttons(s.dialog.as_ref());
+    if buttons.is_empty() {
+        return false;
+    }
+    let typing = match s.dialog.as_ref() {
+        Some(Dialog::Rename { edit, .. }) | Some(Dialog::NewFolder { edit, .. }) => edit.focused,
+        _ => false,
+    };
+    if typing {
+        return false;
+    }
+    let index = dialog_focus_index(s, buttons.len());
+    match key {
+        Key::Enter => {
+            press_dialog_button(s, buttons[index]);
+            true
+        }
+        // A space is a character, not a named key.
+        Key::Text(text) if text == " " => {
+            press_dialog_button(s, buttons[index]);
+            true
+        }
+        Key::Left | Key::Up => {
+            s.dialog_focus = if index == 0 { buttons.len() - 1 } else { index - 1 };
+            true
+        }
+        Key::Right | Key::Down => {
+            s.dialog_focus = if index + 1 >= buttons.len() { 0 } else { index + 1 };
+            true
+        }
+        _ => false,
+    }
+}
+
 fn handle_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
     if ev.key == Key::Escape && (s.drag.is_some() || s.os_hover.is_some()) {
         s.drag = None;
@@ -7916,7 +8088,10 @@ fn handle_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
         }
         return false;
     }
-    if s.dialog.is_some() || s.search_edit.focused {
+    if s.dialog.is_some() {
+        return dialog_key(s, &ev.key);
+    }
+    if s.search_edit.focused {
         return false;
     }
     if ev.is_command('c') {
@@ -8126,7 +8301,7 @@ fn open_properties(s: &mut App) {
             entry.is_dir,
             kind_label(entry.kind),
         );
-        s.dialog = Some(Dialog::Properties(Box::new(details)));
+        open_dialog(s, Dialog::Properties(Box::new(details)));
     }
 }
 
@@ -9604,7 +9779,7 @@ fn main() {
                 s.mode = Mode::Details;
                 s.selected = vec![0];
                 let paths = selected_paths(s);
-                s.dialog = Some(Dialog::Delete { permanent: false, paths });
+                open_dialog(s, Dialog::Delete { permanent: false, paths });
             }),
             ("transfer", |s| {
                 s.view = View::Files;
@@ -9632,7 +9807,7 @@ fn main() {
                 if let Some(e) = s.entries.first() {
                     let mut edit = TextEdit::default();
                     edit.text = e.name.clone();
-                    s.dialog = Some(Dialog::Rename { path: PathBuf::from(&e.path), edit });
+                    open_dialog(s, Dialog::Rename { path: PathBuf::from(&e.path), edit });
                 }
             }),
             ("search", |s| {
@@ -9656,7 +9831,7 @@ fn main() {
             }),
             ("defaultdlg", |s| {
                 s.view = View::Files;
-                s.dialog = Some(Dialog::DefaultManager);
+                open_dialog(s, Dialog::DefaultManager);
             }),
             ("updatedlg", |s| {
                 s.view = View::Files;
@@ -9667,7 +9842,7 @@ fn main() {
                     url: "https://example.invalid/lyre.exe".into(),
                     signature: String::new(),
                 });
-                s.dialog = Some(Dialog::Update);
+                open_dialog(s, Dialog::Update);
             }),
             ("openwithdlg", |s| {
                 s.view = View::Files;
@@ -9686,7 +9861,7 @@ fn main() {
                     .default_app
                     .clone()
                     .or_else(|| data.apps.first().map(|app| app.id.clone()));
-                s.dialog = Some(Dialog::OpenWith {
+                open_dialog(s, Dialog::OpenWith {
                     path,
                     name,
                     data: Some(data),
@@ -10791,6 +10966,34 @@ mod tests {
 mod click_tests {
     use super::*;
 
+    /// The dialog draws one button per entry of the list the keyboard walks, so
+    /// the two can never offer different things.
+    #[test]
+    fn the_dialog_draws_the_buttons_the_keyboard_walks() {
+        let mut rt = runtime();
+        // Opened through `update` so the runtime knows the frame is out of date.
+        rt.update(|s, _tx| {
+            open_dialog(s, Dialog::Delete { permanent: true, paths: vec![PathBuf::from("/nowhere")] });
+        });
+        rt.frame(0.0);
+        let elements = rt.elements();
+        let drawn = elements
+            .iter()
+            .filter(|e| e.key.as_deref().is_some_and(|k| k.starts_with("dialog-button-")))
+            .count();
+        assert_eq!(
+            drawn,
+            dialog_buttons(rt.state.dialog.as_ref()).len(),
+            "every button of the dialog is on screen"
+        );
+        // And the row is where a hand expects it: both buttons in one band.
+        let cancel = elements
+            .iter()
+            .find(|e| e.key.as_deref() == Some("dialog-button-0"))
+            .expect("the first button");
+        assert!(cancel.rect[2] > 0.0 && cancel.rect[3] > 0.0, "and has a size to press");
+    }
+
     /// A press on a tab still switches to it now that the tab also answers an
     /// Alt+click, and a press on its close button still closes it.
     #[test]
@@ -10910,6 +11113,105 @@ mod click_tests {
             rt.state.view == View::ThisPc,
             "the Back button must return to This PC"
         );
+    }
+}
+
+#[cfg(test)]
+mod dialog_key_tests {
+    use super::*;
+
+    /// A window showing one file, selected, so the delete dialog has a target.
+    fn one_selected_file(tag: &str) -> (App, PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("lyre-keys-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("gone.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let mut s = init();
+        s.view = View::Files;
+        s.root = dir.clone();
+        s.crumbs = vec![dir.file_name().unwrap_or_default().to_string_lossy().into_owned()];
+        s.entries = vec![Entry {
+            name: "gone.txt".into(),
+            path: file.to_string_lossy().into_owned(),
+            is_dir: false,
+            size: 1,
+            modified: String::new(),
+            modified_at: None,
+            type_label: "Text document".into(),
+            kind: classify("gone.txt", false),
+            hidden: false,
+            system: false,
+            fixture: false,
+            fixture_size: String::new(),
+        }];
+        s.visible = vec![0];
+        s.selected = vec![0];
+        (s, dir, file)
+    }
+
+    /// The reported wish: Delete opens the dialog, and Enter confirms it without
+    /// the hand leaving the keyboard.
+    #[test]
+    fn enter_confirms_the_delete_dialog() {
+        let (mut s, dir, file) = one_selected_file("confirm");
+        begin_delete(&mut s, true);
+        assert!(matches!(s.dialog, Some(Dialog::Delete { .. })), "Delete opened the dialog");
+        let buttons = dialog_buttons(s.dialog.as_ref());
+        assert_eq!(
+            dialog_focus_index(&s, buttons.len()),
+            dialog_default_focus(&buttons),
+            "the keyboard starts on the dialog's primary button"
+        );
+        assert_eq!(
+            buttons[dialog_focus_index(&s, buttons.len())],
+            DialogButton::Confirm,
+            "which is Delete, so Enter confirms"
+        );
+
+        assert!(dialog_key(&mut s, &Key::Enter));
+        assert!(s.dialog.is_none(), "the dialog closed");
+        for _ in 0..250 {
+            drain_op(&mut s);
+            if s.transfer.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(!file.exists(), "Enter deleted the file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The arrows walk to Cancel, and Enter there stops without deleting.
+    #[test]
+    fn the_arrows_reach_cancel_and_enter_takes_it() {
+        let (mut s, dir, file) = one_selected_file("cancel");
+        begin_delete(&mut s, true);
+        assert!(dialog_key(&mut s, &Key::Left), "the arrow moved the focus");
+        let buttons = dialog_buttons(s.dialog.as_ref());
+        assert_eq!(
+            buttons[dialog_focus_index(&s, buttons.len())],
+            DialogButton::Cancel
+        );
+        assert!(dialog_key(&mut s, &Key::Enter));
+        assert!(s.dialog.is_none(), "Cancel closed the dialog");
+        assert!(s.transfer.is_none(), "and started nothing");
+        assert!(file.exists(), "the file is untouched");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A dialog with a field in it leaves the keys to that field: Enter submits
+    /// through the field itself, and the arrows move the caret.
+    #[test]
+    fn a_field_in_the_dialog_keeps_its_keys() {
+        let (mut s, dir, _file) = one_selected_file("field");
+        begin_new_folder(&mut s);
+        if let Some(Dialog::NewFolder { edit, .. }) = s.dialog.as_mut() {
+            edit.focused = true;
+        }
+        assert!(!dialog_key(&mut s, &Key::Left), "the field keeps the arrow");
+        assert!(!dialog_key(&mut s, &Key::Enter), "and the Enter that submits it");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

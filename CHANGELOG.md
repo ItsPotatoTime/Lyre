@@ -8,6 +8,15 @@ release notes rather than a second copy of them.
 
 ### Added
 
+- **Dialogs answer the keyboard.** A dialog draws its buttons from the one list
+  the keyboard walks, and it opens with the keyboard on its primary button: press
+  `Delete`, then Enter, and the item is deleted. The arrows move between the
+  buttons, Enter or Space presses the one they are on, and Escape still closes
+  without doing anything. A dialog with a name field leaves every key to that
+  field while it has the caret, so typing and Enter there behave as they always
+  have. The two small links inside dialogs, "Don't ask again" and "Don't check at
+  startup", are still the mouse's.
+
 - **A tab closes with Alt+click or the middle mouse button.** Both are what a
   browser does, and both close the tab under the pointer, its close button
   included. The middle button is not one the toolkit reports, so the window

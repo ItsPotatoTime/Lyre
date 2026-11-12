@@ -25,12 +25,13 @@ release notes rather than a second copy of them.
 
 ### Fixed
 
-- **This PC no longer turns the details pane on.** Opening the page switched the
+- **No page turns the details pane on for you.** Opening This PC switched the
   pane on and nothing switched it back, so one visit changed the setting for
-  every folder afterwards, and the change was saved with the rest. The pane
-  belongs to the person: opening This PC, or stepping back onto it, now leaves it
-  exactly as it was. The reference scene for the page sets it for its own capture
-  only.
+  every folder afterwards, and the change was saved with the rest; the Gallery
+  did the same to show a photo's details. Quick Access was quietly switching it
+  off on the way in. The pane belongs to the person: This PC, the Gallery, Quick
+  Access and a step back onto any of them now leave it exactly as it was. The
+  reference scene for This PC sets it for its own capture only.
 
 - **A failed delete says why it failed.** Every finished operation reloads the
   folder on screen, and reloading clears the notice; the outcome was written

@@ -9145,7 +9145,6 @@ fn show_gallery(s: &mut App, pictures: PathBuf) {
     s.tab = "Gallery".into();
     s.crumbs = vec!["Gallery".into()];
     s.search = "Search Gallery".into();
-    s.preview = true;
     s.contextual = true;
     s.groups.clear();
     clear_selection(s);
@@ -10159,9 +10158,10 @@ mod view_pref_tests {
     }
 
     /// The reported bug: opening This PC turned the details pane on, and the
-    /// choice was then saved, so it stayed on everywhere afterwards.
+    /// choice was then saved, so it stayed on everywhere afterwards. The Gallery
+    /// did the same, so every page answers to the same rule.
     #[test]
-    fn opening_this_pc_keeps_the_details_pane_as_it_was() {
+    fn opening_a_page_keeps_the_details_pane_as_it_was() {
         for preview in [false, true] {
             for open in 0..2 {
                 let mut s = init();
@@ -10176,6 +10176,19 @@ mod view_pref_tests {
                     s.preview, preview,
                     "This PC must not change the person's details pane"
                 );
+            }
+            // Quick Access goes through the same loader.
+            let mut s = init();
+            s.preview = preview;
+            load(&mut s, Fixture::QuickAccess);
+            assert_eq!(s.preview, preview, "Quick Access must leave the pane alone");
+            // The Gallery, on a machine that has Pictures to draw it from.
+            if gallery_folder().is_some() {
+                let mut s = init();
+                s.preview = preview;
+                navigate(&mut s, 1);
+                assert!(s.view == View::Gallery, "the rail press opened the Gallery");
+                assert_eq!(s.preview, preview, "the Gallery must leave the pane alone");
             }
         }
     }

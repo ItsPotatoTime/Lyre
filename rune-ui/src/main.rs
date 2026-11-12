@@ -9676,6 +9676,15 @@ fn fit_to_screen(saved: (u32, u32), screen: (u32, u32), scale: f32) -> Option<(u
 /// A release build is a window, not a console program, so a panic takes the
 /// window away and leaves nothing to read: "it just closed" is all anyone can
 /// report. The hook keeps the file the next report can name.
+/// Where a panic is written: `lyre-crash.log` beside the settings, or the
+/// temporary folder when the settings have no folder of their own.
+fn crash_log_path() -> PathBuf {
+    rune::prefs::Prefs::open(PREFS_ID)
+        .path()
+        .and_then(|file| file.parent().map(|dir| dir.join("lyre-crash.log")))
+        .unwrap_or_else(|| std::env::temp_dir().join("lyre-crash.log"))
+}
+
 fn record_panics() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -9687,10 +9696,7 @@ fn record_panics() {
             "lyre {} panicked at {place}\n{info}\n\n",
             env!("CARGO_PKG_VERSION")
         );
-        let log = rune::prefs::Prefs::open(PREFS_ID)
-            .path()
-            .and_then(|file| file.parent().map(|dir| dir.join("lyre-crash.log")))
-            .unwrap_or_else(|| std::env::temp_dir().join("lyre-crash.log"));
+        let log = crash_log_path();
         if let Some(dir) = log.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
@@ -11202,6 +11208,21 @@ mod click_tests {
 #[cfg(test)]
 mod paste_tests {
     use super::*;
+
+    /// The note a crash leaves behind is the only thing a windowed build can
+    /// say, so it has to name the panic and the line it came from.
+    #[test]
+    fn a_panic_is_written_to_the_crash_log() {
+        let log = crash_log_path();
+        let _ = std::fs::remove_file(&log);
+        record_panics();
+        let raised = std::panic::catch_unwind(|| panic!("probe panic for the log"));
+        assert!(raised.is_err(), "the panic was raised");
+        let text = std::fs::read_to_string(&log).expect("the log was written");
+        assert!(text.contains("probe panic for the log"), "it names the reason: {text}");
+        assert!(text.contains("main.rs"), "and the place: {text}");
+        let _ = std::fs::remove_file(&log);
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("lyre-paste-{tag}-{}", std::process::id()));

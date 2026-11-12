@@ -4,7 +4,11 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
-## [Unreleased]
+## [0.3.3]
+
+A patch release for the things that quietly did not work: Back out of a page,
+the mouse's side buttons, a delete that failed, the details pane, and every
+dialog's buttons.
 
 ### Added
 

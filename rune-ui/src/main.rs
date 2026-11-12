@@ -3782,8 +3782,16 @@ fn scroll_thumb(s: &App, p: Paint) -> El {
 /// is filled; the others are transparent until hovered.
 fn tab_button(s: &App, p: Paint, index: usize, tab: &Tab) -> El {
     let active = index == s.active_tab;
-    let name = tab.name.clone();
-    let glyph = place_of(tab.view, &tab.root).index();
+    // The showing tab is drawn from the live state, never from its snapshot.
+    // A snapshot is only taken when the tab is left, opened or closed, so a tab
+    // that navigated kept the name and icon it was opened at: the strip said
+    // Quick Access while the window showed Desktop.
+    let (name, view, root) = if active {
+        (s.tab.clone(), s.view, s.root.as_path())
+    } else {
+        (tab.name.clone(), tab.view, tab.root.as_path())
+    };
+    let glyph = place_of(view, root).index();
     let b = row()
         .key(format!("tab-{index}"))
         .on_drop_files(move |s: &mut App, files, tx: &mut Tx| {
@@ -6091,19 +6099,17 @@ fn rail_item(
     let ink = if active { p.text } else { p.secondary };
     let open = s.rail_open.contains(&index);
 
-    // The body carries the press that opens the place, so the chevron beside it
-    // can expand the list without also navigating.
+    // The row itself carries the press that opens the place, so the whole row is
+    // a target: on the body alone, the padding and the spacer beside it were not,
+    // and a press there did nothing. The chevron keeps its own press, which wins
+    // where it is drawn, so expanding a list still does not navigate.
     let body = row()
         .grow(1.0)
         .min_w(0.0)
         .gap(8.0)
         .items_center()
         .child(place_glyph(index, 16.0))
-        .child(text(label).font(ROW_TEXT).color(ink).grow(1.0).min_w(0.0).truncate())
-        .on_press_tx(move |s: &mut App, tx: &mut Tx| {
-            navigate(s, index);
-            tx.instant();
-        });
+        .child(text(label).font(ROW_TEXT).color(ink).grow(1.0).min_w(0.0).truncate());
     let body = if pin {
         body.child(ico(p, Ico::Pin, 10.0, p.tertiary))
     } else {
@@ -6114,6 +6120,10 @@ fn rail_item(
         .key(format!("rail-{index}"))
         .on_drop_files(move |s: &mut App, files, tx: &mut Tx| {
             take_drop(s, place_path(index).map(DropTarget::Folder), files, tx);
+        })
+        .on_press_tx(move |s: &mut App, tx: &mut Tx| {
+            navigate(s, index);
+            tx.instant();
         })
         .w_full()
         .h(28.0)
@@ -10511,5 +10521,97 @@ mod tests {
         assert!(!base.join("a.txt").exists());
         assert!(!s.entries.iter().any(|e| e.name == "a.txt"), "the listing must refresh");
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod click_tests {
+    use super::*;
+
+    fn runtime() -> rune::Runtime<App> {
+        let mut rt = rune::Runtime::new(init(), view, (1076.0, 600.0), rune::Env::new(true, 1.0));
+        rt.frame(0.0);
+        rt
+    }
+
+    /// An element's rect as `ElementInfo` reports it: x, y, width, height.
+    fn rect_of(rt: &rune::Runtime<App>, key: &str) -> [f32; 4] {
+        rt.elements()
+            .into_iter()
+            .find(|e| e.key.as_deref() == Some(key))
+            .unwrap_or_else(|| panic!("no element keyed {key}"))
+            .rect
+    }
+
+    /// A press and release at one point, then the frame after it.
+    fn click_at(rt: &mut rune::Runtime<App>, x: f32, y: f32) {
+        rt.pointer_down(x, y);
+        rt.pointer_up(x, y);
+        rt.frame(1.0 / 60.0);
+    }
+
+    /// The text a tab shows, read from the strip itself rather than from state.
+    fn tab_label(rt: &rune::Runtime<App>, index: usize) -> String {
+        let prefix = format!("window/tabs/tab-{index}/");
+        rt.elements()
+            .into_iter()
+            .find(|e| e.path.starts_with(&prefix) && e.role == "text")
+            .and_then(|e| e.text)
+            .unwrap_or_default()
+    }
+
+    /// The reported bug: a press on a folder sometimes did not open it, and it
+    /// took several presses. Part of the rail row was not pressable at all: the
+    /// press lived on the inner body, so the row's padding and the spacer beside
+    /// the label took it and did nothing with it.
+    #[test]
+    fn a_press_anywhere_on_a_rail_row_opens_the_place() {
+        let rt = runtime();
+        // Home is a folder on every platform, unlike Desktop, which a fresh
+        // Linux install does not have.
+        let r = rect_of(&rt, "rail-0");
+        let (w, h) = (r[2], r[3]);
+        for frac in [0.01f32, 0.03, 0.06, 0.1, 0.25, 0.5, 0.75, 0.95, 0.99] {
+            let mut rt = runtime();
+            click_at(&mut rt, r[0] + w * frac, r[1] + h * 0.5);
+            assert!(
+                rt.state.view == View::Files,
+                "a press at {frac} of the row opened nothing"
+            );
+        }
+    }
+
+    /// The chevron is drawn inside the row and keeps its own press: it expands
+    /// the place's list without also navigating to it.
+    #[test]
+    fn the_rail_chevron_still_only_expands() {
+        let mut rt = runtime();
+        let row = rect_of(&rt, "rail-9");
+        assert!(rt.state.rail_open.is_empty());
+        // The chevron is the first child of the row, past its 8 px padding.
+        click_at(&mut rt, row[0] + 8.0 + 5.5, row[1] + row[3] * 0.5);
+        assert!(
+            rt.state.view == View::QuickAccess,
+            "a press on the chevron must not open the place"
+        );
+        assert_eq!(rt.state.rail_open, vec![9], "the chevron expanded the place");
+    }
+
+    /// The reported bug: the strip kept saying Quick Access while the window
+    /// showed another folder. A tab's name and icon were read from the snapshot
+    /// taken when the tab was last left, which only a tab change refreshed.
+    #[test]
+    fn the_open_tab_follows_where_the_window_is() {
+        let mut rt = runtime();
+        assert_eq!(tab_label(&rt, 0), "Quick Access");
+        let row = rect_of(&rt, "rail-0");
+        click_at(&mut rt, row[0] + row[2] * 0.5, row[1] + row[3] * 0.5);
+        assert!(rt.state.view == View::Files, "the press opened Home");
+        assert_eq!(rt.state.tab, "Home");
+        assert_eq!(
+            tab_label(&rt, 0),
+            "Home",
+            "the strip must name the folder on screen, not the tab it was opened at"
+        );
     }
 }

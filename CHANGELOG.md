@@ -17,6 +17,13 @@ release notes rather than a second copy of them.
 
 ### Fixed
 
+- **A press on a rail row opens it wherever it lands.** The press was on the
+  row's inner content, so its padding, the spacer beside the label and the place's
+  own icon took the press and did nothing: the row looked clickable and part of it
+  was not, which read as needing several presses.
+- **The tab strip names the folder on screen.** A tab's label and icon were read
+  from the snapshot taken when it was last left, so a tab that navigated kept
+  saying Quick Access until another tab was opened or switched to.
 - **Only the place on screen is selected.** The rail lit whichever row was last
   pressed, so opening a pinned folder left This PC selected beside it, and two
   pins of the same folder could both look selected. Selection comes from the

@@ -778,6 +778,8 @@ struct App {
     #[cfg(target_os = "windows")]
     pending_os_drag: Option<(Vec<PathBuf>, Option<osdrag::DragPreview>)>,
     /// The window scale, for turning OS drop pixels into window points.
+    /// A query typed but not yet walked, and when it becomes worth walking.
+    search_pending: Option<(String, Instant)>,
     /// The letters typed so far, for jumping to a name by typing it.
     type_ahead: String,
     type_ahead_at: Instant,
@@ -1803,10 +1805,25 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
         if q.trim().is_empty() {
             clear_search(s);
             refresh_visible(s);
-        } else {
-            start_search(s, q);
+        } else if s.search_pending.as_ref().map(|(text, _)| text) != Some(&q) {
+            // Wait for the typing to stop. Every keystroke used to start a fresh
+            // walk and throw the previous one away, so a six-letter query meant
+            // six walks of the disk to answer one of them.
+            s.search_pending = Some((q, Instant::now() + std::time::Duration::from_millis(180)));
         }
         changed = true;
+    }
+    if let Some((text, due)) = s.search_pending.clone()
+        && Instant::now() >= due
+    {
+        s.search_pending = None;
+        if text == s.search_edit.text {
+            start_search(s, text);
+        }
+        changed = true;
+    }
+    if s.search_pending.is_some() {
+        tx.wake_after(std::time::Duration::from_millis(60));
     }
     changed
 }
@@ -2359,6 +2376,7 @@ fn init() -> App {
         pending_os_drag: None,
         type_ahead: String::new(),
         type_ahead_at: Instant::now(),
+        search_pending: None,
         window_settled: (0, 0),
         window_pending: None,
         window_changed_at: Instant::now(),
@@ -6935,6 +6953,7 @@ fn clear_search(s: &mut App) {
     s.search_hits.clear();
     s.search_query.clear();
     s.search_busy = false;
+    s.search_pending = None;
     clear_selection(s);
 }
 

@@ -196,7 +196,7 @@ pub fn search<F: FnMut(Event) -> bool>(req: &Request, cancel: &AtomicBool, mut e
         return;
     }
 
-    let outcome = walk(&pattern, &needle_bytes, Path::new(&req.path), req.show_hidden, cancel, matched_local, laid_out, &mut emit);
+    let outcome = walk(&folded_needle, Path::new(&req.path), req.show_hidden, cancel, matched_local, laid_out, &mut emit);
     let _ = emit(Event::Done {
         matched: outcome.matched,
         scanned: outcome.scanned,
@@ -284,10 +284,68 @@ struct Outcome {
 
 /// Breadth-first walk of the tree below `root`, matching names as they are read
 /// and streaming matches in batches. Only matches are stat'ed, so the walk costs
-/// about one readdir per folder rather than one stat per file.
+/// What the walking threads share: the directories still to read, how many are
+/// outstanding, and the counters the caller needs back.
+struct Walk {
+    queue: std::sync::Mutex<VecDeque<(PathBuf, usize)>>,
+    /// Directories queued or being read. Zero means the walk is finished, which
+    /// is what lets a worker with an empty queue know to stop rather than spin.
+    pending: std::sync::atomic::AtomicUsize,
+    cancel: AtomicBool,
+    scanned: std::sync::atomic::AtomicUsize,
+    matched: std::sync::atomic::AtomicUsize,
+    accepted: std::sync::atomic::AtomicUsize,
+    /// Something stopped the walk early: a limit, or the caller leaving.
+    cut: AtomicBool,
+}
+
+/// One worker's private matching state, so no lock is needed to score a name.
+struct Scratch {
+    pattern: Pattern,
+    needle: Needle,
+    matcher: Matcher,
+    buf: Vec<char>,
+    folded: String,
+    batch: Vec<Hit>,
+    last_flush: Instant,
+}
+
+impl Scratch {
+    fn new(query: &str) -> Self {
+        Self {
+            pattern: Pattern::parse(query, CaseMatching::Ignore, Normalization::Smart),
+            needle: Needle::new(query),
+            matcher: Matcher::new(Config::DEFAULT),
+            buf: Vec::new(),
+            folded: String::new(),
+            batch: Vec::new(),
+            last_flush: Instant::now(),
+        }
+    }
+}
+
+/// One less than the cores, so the window keeps a core of its own, and never so
+/// many that the walk competes with the renderer.
+fn worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|cores| cores.get())
+        .unwrap_or(2)
+        .saturating_sub(1)
+        .clamp(1, 8)
+}
+
+/// Breadth-first walk of the tree below `root`, on several threads, matching
+/// names as they are read and streaming matches in batches. Only matches are
+/// stat'ed, so the walk costs about one readdir per folder rather than one stat
+/// per file.
+///
+/// The queue is shared and every worker takes the next directory, which keeps
+/// the work balanced whatever shape the tree has. Only the caller emits, on its
+/// own thread, so the interface sees one ordered stream of batches while the
+/// reading happens in parallel. Which batch arrives first is not defined, and
+/// does not matter: the caller ranks the whole result once the walk ends.
 fn walk<F: FnMut(Event) -> bool>(
-    pattern: &Pattern,
-    needle: &Needle,
+    query: &str,
     root: &Path,
     show_hidden: bool,
     cancel: &AtomicBool,
@@ -295,29 +353,104 @@ fn walk<F: FnMut(Event) -> bool>(
     scanned_so_far: usize,
     emit: &mut F,
 ) -> Outcome {
-    let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::new();
-    queue.push_back((root.to_path_buf(), 0));
-    let mut matcher = Matcher::new(Config::DEFAULT);
-    let mut buf = Vec::new();
-    let mut folded = String::new();
-    let mut examined = scanned_so_far;
-    let mut matched = matched_so_far;
-    let mut accepted = 0usize;
-    let mut batch: Vec<Hit> = Vec::new();
-    let mut last_flush = Instant::now();
-    let mut cut = false;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
 
-    while let Some((dir, depth)) = queue.pop_front() {
-        if cancel.load(Ordering::Relaxed) {
+    let threads = worker_count();
+    let mut seed = VecDeque::new();
+    seed.push_back((root.to_path_buf(), 0));
+    let shared = std::sync::Arc::new(Walk {
+        queue: std::sync::Mutex::new(seed),
+        pending: AtomicUsize::new(1),
+        cancel: AtomicBool::new(false),
+        scanned: AtomicUsize::new(scanned_so_far),
+        matched: AtomicUsize::new(matched_so_far),
+        accepted: AtomicUsize::new(0),
+        cut: AtomicBool::new(false),
+    });
+
+    let (tx, rx) = mpsc::channel::<Vec<Hit>>();
+    let mut handles = Vec::with_capacity(threads);
+    for _ in 0..threads {
+        let shared = shared.clone();
+        let tx = tx.clone();
+        let query = query.to_string();
+        handles.push(std::thread::spawn(move || {
+            work(&shared, &tx, &query, show_hidden, matched_so_far);
+        }));
+    }
+    // The caller's own sender must go, or the channel never closes.
+    drop(tx);
+
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(20)) {
+            Ok(items) => {
+                let scanned = shared.scanned.load(Ordering::Relaxed);
+                if !emit(Event::Batch { items, scanned }) {
+                    shared.cancel.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if cancel.load(Ordering::Relaxed) {
+                    shared.cancel.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    for handle in handles {
+        let _ = handle.join();
+    }
+    let scanned = shared.scanned.load(Ordering::Relaxed);
+    let matched = shared.matched.load(Ordering::Relaxed);
+    let accepted = shared.accepted.load(Ordering::Relaxed);
+    Outcome {
+        matched,
+        scanned,
+        truncated: shared.cut.load(Ordering::Relaxed) || matched > matched_so_far + accepted,
+    }
+}
+
+/// Read directories until the queue is empty and nothing is outstanding.
+fn work(
+    shared: &Walk,
+    tx: &std::sync::mpsc::Sender<Vec<Hit>>,
+    query: &str,
+    show_hidden: bool,
+    matched_so_far: usize,
+) {
+    use std::sync::atomic::Ordering;
+
+    let mut scratch = Scratch::new(query);
+    loop {
+        if shared.cancel.load(Ordering::Relaxed) {
             break;
         }
-        let Ok(read) = fs::read_dir(&dir) else { continue };
-        let mut subdirs: Vec<(PathBuf, usize)> = Vec::new();
-        for item in read.flatten() {
-            if cancel.load(Ordering::Relaxed) {
+        let next = {
+            let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+            queue.pop_front()
+        };
+        let Some((dir, depth)) = next else {
+            if shared.pending.load(Ordering::Relaxed) == 0 {
                 break;
             }
-            examined += 1;
+            // Another worker is still reading a directory it took; it may yet
+            // add more, so wait rather than finish early.
+            std::thread::yield_now();
+            continue;
+        };
+        let Ok(read) = fs::read_dir(&dir) else {
+            shared.pending.fetch_sub(1, Ordering::Relaxed);
+            continue;
+        };
+        let mut subdirs: Vec<(PathBuf, usize)> = Vec::new();
+        for item in read.flatten() {
+            if shared.cancel.load(Ordering::Relaxed) {
+                break;
+            }
+            let examined = shared.scanned.fetch_add(1, Ordering::Relaxed) + 1;
             let raw = item.file_name();
             // Borrowed for valid UTF-8, which nearly every name is; the owned
             // string is only made for something that matched.
@@ -332,56 +465,73 @@ fn walk<F: FnMut(Event) -> bool>(
             if is_dir && !is_symlink && depth < MAX_DEPTH {
                 subdirs.push((item.path(), depth + 1));
             }
-            let Some(score) = score_name(pattern, needle, &name, &mut folded, &mut buf, &mut matcher) else {
+            let Some(score) = score_name(
+                &scratch.pattern,
+                &scratch.needle,
+                &name,
+                &mut scratch.folded,
+                &mut scratch.buf,
+                &mut scratch.matcher,
+            ) else {
                 continue;
             };
-            matched += 1;
-            if matched_so_far + accepted < LIMIT {
+            shared.matched.fetch_add(1, Ordering::Relaxed);
+            let accepted_now = shared.accepted.load(Ordering::Relaxed);
+            if matched_so_far + accepted_now < LIMIT {
                 // Same shortcut as scoring: an ASCII name needs no folded copy.
                 let hay = if name.is_ascii() {
                     name.as_ref()
                 } else {
-                    fold_into(&name, &mut folded);
-                    folded.as_str()
+                    fold_into(&name, &mut scratch.folded);
+                    scratch.folded.as_str()
                 };
                 let mut indices = Vec::new();
-                pattern.indices(Utf32Str::new(hay, &mut buf), &mut matcher, &mut indices);
+                scratch.pattern.indices(
+                    Utf32Str::new(hay, &mut scratch.buf),
+                    &mut scratch.matcher,
+                    &mut indices,
+                );
                 indices.sort_unstable();
                 indices.dedup();
                 if let Some(entry) = describe(name.into_owned(), item.path(), is_dir) {
-                    batch.push(Hit { entry, score, indices });
-                    accepted += 1;
+                    shared.accepted.fetch_add(1, Ordering::Relaxed);
+                    scratch.batch.push(Hit { entry, score, indices });
                 }
             }
-            if batch.len() >= BATCH_ITEMS || last_flush.elapsed().as_millis() as u64 >= BATCH_MS {
-                if !batch.is_empty() {
-                    let alive = emit(Event::Batch { items: std::mem::take(&mut batch), scanned: examined });
-                    last_flush = Instant::now();
-                    if !alive {
-                        cancel.store(true, Ordering::Relaxed);
-                        break;
-                    }
+            if scratch.batch.len() >= BATCH_ITEMS
+                || scratch.last_flush.elapsed().as_millis() as u64 >= BATCH_MS
+            {
+                if !scratch.batch.is_empty()
+                    && tx.send(std::mem::take(&mut scratch.batch)).is_err()
+                {
+                    shared.cancel.store(true, Ordering::Relaxed);
+                    break;
                 }
+                scratch.last_flush = Instant::now();
             }
             if examined >= MAX_SCANNED {
-                cut = true;
-                cancel.store(true, Ordering::Relaxed);
+                shared.cut.store(true, Ordering::Relaxed);
+                shared.cancel.store(true, Ordering::Relaxed);
                 break;
             }
         }
-        if !batch.is_empty() && (last_flush.elapsed().as_millis() as u64 >= BATCH_MS) {
-            let alive = emit(Event::Batch { items: std::mem::take(&mut batch), scanned: examined });
-            last_flush = Instant::now();
-            if !alive {
-                break;
-            }
+        if !scratch.batch.is_empty()
+            && scratch.last_flush.elapsed().as_millis() as u64 >= BATCH_MS
+            && tx.send(std::mem::take(&mut scratch.batch)).is_err()
+        {
+            shared.cancel.store(true, Ordering::Relaxed);
         }
-        queue.extend(subdirs);
+        if !subdirs.is_empty() {
+            let added = subdirs.len();
+            let mut queue = shared.queue.lock().unwrap_or_else(|e| e.into_inner());
+            queue.extend(subdirs);
+            shared.pending.fetch_add(added, Ordering::Relaxed);
+        }
+        shared.pending.fetch_sub(1, Ordering::Relaxed);
     }
-    if !batch.is_empty() {
-        let _ = emit(Event::Batch { items: batch, scanned: examined });
+    if !scratch.batch.is_empty() {
+        let _ = tx.send(scratch.batch);
     }
-    Outcome { matched, scanned: examined, truncated: cut || matched > matched_so_far + accepted }
 }
 
 /// Build a display row for a match found in the walk; metadata is paid for only

@@ -18,6 +18,13 @@ release notes rather than a second copy of them.
 
 ### Fixed
 
+- **A minimised window no longer shrinks the window for good.** While minimised,
+  the window reports the sliver it collapsed to, 160 by 28, and that was being
+  saved as the size to open at. Every launch after a minimise-then-close came back
+  at the smallest size allowed, which read as the whole interface falling apart.
+  A minimised window now remembers the size it had before, and it draws itself
+  again the moment it comes back rather than waiting for a click.
+
 - **No page overwrites the view, the sort or the details pane.** Opening This PC
   put the sort column back to Name and left the direction alone, so a Date
   modified, descending sort came out as Name, descending, and that was saved. It

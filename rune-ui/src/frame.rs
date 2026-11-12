@@ -111,6 +111,19 @@ mod imp {
         bottom: i32,
     }
 
+    /// `WINDOWPLACEMENT`: where a window sits when it is not minimised or
+    /// maximised, which is the size worth remembering.
+    #[repr(C)]
+    struct Placement {
+        length: u32,
+        flags: u32,
+        show_cmd: u32,
+        min_position: [i32; 2],
+        max_position: [i32; 2],
+        normal: Rect,
+        device: Rect,
+    }
+
     type SubclassProc =
         unsafe extern "system" fn(isize, u32, usize, isize, usize, usize) -> isize;
 
@@ -127,6 +140,8 @@ mod imp {
     unsafe extern "system" {
         fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
         fn IsZoomed(hwnd: isize) -> i32;
+        fn IsIconic(hwnd: isize) -> i32;
+        fn GetWindowPlacement(hwnd: isize, placement: *mut Placement) -> i32;
         fn GetWindowRect(hwnd: isize, rect: *mut Rect) -> i32;
         fn GetClientRect(hwnd: isize, rect: *mut Rect) -> i32;
         fn DefSubclassProc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
@@ -151,6 +166,11 @@ mod imp {
     }
 
     const WM_NCHITTEST: u32 = 0x0084;
+    const WM_SIZE: u32 = 0x0005;
+    const WM_SYSCOMMAND: u32 = 0x0112;
+    const SC_RESTORE: usize = 0xF120;
+    /// `WM_SIZE`'s wParam when the window is being minimised.
+    const SIZE_MINIMIZED: usize = 1;
     const SW_MINIMIZE: i32 = 6;
     const SW_MAXIMIZE: i32 = 3;
     const SW_RESTORE: i32 = 9;
@@ -181,6 +201,15 @@ mod imp {
                 crate::osdrag::win::run_pending();
                 RedrawWindow(hwnd, std::ptr::null(), std::ptr::null_mut(), RDW_INTERNALPAINT);
                 return 0;
+            }
+            // Coming back from minimised, the window is not redrawn until
+            // something else happens: it came back laid out for the sliver a
+            // minimised window reports, and stayed that way until a click. Ask
+            // for the paint that draws it at its real size instead.
+            if (msg == WM_SIZE && wparam != SIZE_MINIMIZED)
+                || (msg == WM_SYSCOMMAND && wparam & 0xFFF0 == SC_RESTORE)
+            {
+                RedrawWindow(hwnd, std::ptr::null(), std::ptr::null_mut(), RDW_INTERNALPAINT);
             }
             if msg == WM_NCHITTEST && IsZoomed(hwnd) == 0 {
                 let x = (lparam as u16) as i16 as i32;
@@ -285,6 +314,29 @@ mod imp {
     /// to describe.
     pub fn content_size() -> Option<(u32, u32)> {
         let &hwnd = HWND.get()?;
+        // A minimised window reports the sliver it collapsed to, and saving that
+        // is how a window came back at the smallest size allowed every time it
+        // was minimised before closing. Its normal placement is the size worth
+        // remembering, and this window is borderless, so that rect is the client.
+        if unsafe { IsIconic(hwnd) } != 0 {
+            let mut placement = Placement {
+                length: core::mem::size_of::<Placement>() as u32,
+                flags: 0,
+                show_cmd: 0,
+                min_position: [0, 0],
+                max_position: [0, 0],
+                normal: Rect { left: 0, top: 0, right: 0, bottom: 0 },
+                device: Rect { left: 0, top: 0, right: 0, bottom: 0 },
+            };
+            if unsafe { GetWindowPlacement(hwnd, &mut placement) } != 0 {
+                let width = (placement.normal.right - placement.normal.left).max(0) as u32;
+                let height = (placement.normal.bottom - placement.normal.top).max(0) as u32;
+                if width > 0 && height > 0 {
+                    return Some((width, height));
+                }
+            }
+            return None;
+        }
         let mut rect = Rect { left: 0, top: 0, right: 0, bottom: 0 };
         if unsafe { GetClientRect(hwnd, &mut rect) } == 0 {
             return None;

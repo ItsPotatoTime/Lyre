@@ -8819,7 +8819,14 @@ fn quick_tile(s: &App, p: Paint, label: &str, mark: Ico, top: &str, bottom: &str
 /// window opens at before the first frame has measured anything.
 fn window_width(s: &App) -> f32 {
     let window = s.rect_window.get()[2];
-    if window <= 0.0 { 1076.0 } else { window }
+    // A minimised window reports the sliver it collapsed to, and a frame drawn
+    // from that measurement lays the whole page out for 160 points wide. Below
+    // the smallest window this can be, the measurement is not the window.
+    if window < MIN_W * 0.5 {
+        1076.0
+    } else {
+        window
+    }
 }
 
 /// How wide the rail is for the window as it is.

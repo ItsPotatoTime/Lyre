@@ -191,6 +191,12 @@ fn remove_item(path: &Path) -> Result<(), String> {
     }
 }
 
+/// Take an item away, for a step being undone. A folder goes with everything in
+/// it.
+pub fn remove(path: &Path) -> Result<(), String> {
+    remove_item(path)
+}
+
 fn move_item(
     src: &Path,
     dst: &Path,
@@ -206,6 +212,8 @@ fn move_item(
 }
 
 /// Copy or move `sources` into the `target` directory, reporting progress.
+///
+/// Answers where each item landed, source first, so the paste can be taken back.
 pub fn paste<F: FnMut(Progress) -> bool>(
     mode: Mode,
     conflict: Conflict,
@@ -213,12 +221,12 @@ pub fn paste<F: FnMut(Progress) -> bool>(
     target: &Path,
     cancel: &AtomicBool,
     mut emit: F,
-) -> Result<usize, String> {
+) -> Result<Vec<(PathBuf, PathBuf)>, String> {
     let total = sources.len();
     let total_bytes: u64 = sources.iter().map(|p| item_size(p)).sum();
     let mut done_bytes = 0u64;
     let mut completed = 0u64;
-    let mut pasted = 0usize;
+    let mut landed: Vec<(PathBuf, PathBuf)> = Vec::new();
     // Bytes land inside the recursive copy, so a folder of ten thousand files
     // climbs smoothly instead of jumping from 0 to 100 at the end. Throttled
     // by time and by a sixteenth of the total so the channel never floods.
@@ -263,10 +271,20 @@ pub fn paste<F: FnMut(Progress) -> bool>(
         // A rename moves bytes without copying them; credit them at the end.
         completed += item_size(src);
         done_bytes = done_bytes.max(completed);
-        pasted += 1;
+        landed.push((src.clone(), dst));
         emit(Progress { done: i + 1, total, name, done_bytes, total_bytes });
     }
-    Ok(pasted)
+    Ok(landed)
+}
+
+/// Copy `pairs` again, source to destination, for a redo of a copy. Destinations
+/// are written fresh, so nothing is merged into what is already there.
+pub fn copy_again(pairs: &[(PathBuf, PathBuf)]) -> Result<(), String> {
+    let cancel = AtomicBool::new(false);
+    for (from, to) in pairs {
+        copy_item(from, to, &cancel, &mut |_| {})?;
+    }
+    Ok(())
 }
 
 /// Delete `paths` to the trash or permanently, reporting progress.

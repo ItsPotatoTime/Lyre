@@ -6,6 +6,16 @@ release notes rather than a second copy of them.
 
 ## [Unreleased]
 
+### Added
+
+- **Undo and redo.** `Ctrl+Z` takes back the last thing done to a file, and
+  `Ctrl+Y` or `Ctrl+Shift+Z` does it again: a rename, a new folder, a copy, or a
+  move. A copy is taken back by deleting what it made, and a move by putting each
+  item back where it came from. Doing something new drops the steps that could
+  have been redone, as an editor does. Deleting is not undoable: restoring from
+  the bin is the shell's job, not this window's. Both commands are in the More
+  menu, dimmed when there is nothing to take back.
+
 ### Changed
 
 - **The window goes much smaller, and the layout holds.** The floor was 760 by

@@ -495,7 +495,25 @@ struct ScanDone {
 /// Messages from the operation worker thread, drained in `poll`.
 enum OpMsg {
     Progress(fileops::Progress),
-    Done(Result<usize, String>),
+    Done {
+        outcome: Result<usize, String>,
+        /// What it did, in the form that can be taken back.
+        undo: Option<Undo>,
+    },
+}
+
+/// One finished file operation, in the form that can be taken back: what Ctrl+Z
+/// reverses and Ctrl+Y does again.
+#[derive(Clone)]
+enum Undo {
+    /// A name changed.
+    Rename { from: PathBuf, to: PathBuf },
+    /// A folder was made.
+    Made { path: PathBuf },
+    /// Items were copied here, so taking it back deletes the copies.
+    Copied { pairs: Vec<(PathBuf, PathBuf)> },
+    /// Items were moved away, so taking it back puts each one back.
+    Moved { pairs: Vec<(PathBuf, PathBuf)> },
 }
 
 /// Messages from the update worker thread, drained in `poll`.
@@ -887,6 +905,9 @@ struct App {
     /// Which of the dialog's buttons the keyboard is on, in drawing order.
     /// Enter and Space press it, the arrows move it.
     dialog_focus: usize,
+    /// What Ctrl+Z takes back, newest last, and what Ctrl+Y does again.
+    undo: Vec<Undo>,
+    redo: Vec<Undo>,
     /// The "Open with" worker's answer: listing applications touches the disk
     /// and, on Linux, runs `xdg-mime`, so it never runs on the UI thread.
     openwith_rx: Option<std::sync::mpsc::Receiver<openwith::OpenWith>>,
@@ -2765,6 +2786,8 @@ fn init() -> App {
         scan_seen: 0,
         dialog: None,
         dialog_focus: 0,
+        undo: Vec::new(),
+        redo: Vec::new(),
         openwith_rx: None,
         searching: false,
         search_hits: Vec::new(),
@@ -4927,6 +4950,26 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                     }
                 }
                 DropMenu::More => {
+                    // Undo and redo first, dimmed when there is nothing to take
+                    // back or do again, so the shortcut is discoverable.
+                    rows.push(
+                        menu_item(p, "Undo", None, Some("Ctrl+Z"), s.undo.is_empty())
+                            .on_press(|s: &mut App| {
+                                s.menu = None;
+                                undo_last(s);
+                            }),
+                    );
+                    h += MENU_ROW_H;
+                    rows.push(
+                        menu_item(p, "Redo", None, Some("Ctrl+Y"), s.redo.is_empty())
+                            .on_press(|s: &mut App| {
+                                s.menu = None;
+                                redo_last(s);
+                            }),
+                    );
+                    h += MENU_ROW_H;
+                    rows.push(menu_sep(p));
+                    h += 9.0;
                     rows.push(
                         menu_item(p, "Refresh", Some(Ico::Refresh), Some("F5"), false).on_press(
                             |s: &mut App| {
@@ -7721,6 +7764,109 @@ fn drain_update(s: &mut App) -> bool {
     changed
 }
 
+/// Remember something that can be taken back. Doing anything new drops the redo
+/// steps, as every editor does: they belong to a branch that no longer exists.
+fn record_undo(s: &mut App, action: Undo) {
+    s.undo.push(action);
+    s.redo.clear();
+}
+
+/// Take back the last operation. Ctrl+Z.
+fn undo_last(s: &mut App) -> bool {
+    let Some(action) = s.undo.pop() else {
+        s.notice = "Nothing to undo".into();
+        return true;
+    };
+    match take_back(&action) {
+        Ok(()) => {
+            s.redo.push(action);
+            after_undo(s, "Undone");
+        }
+        Err(e) => {
+            // It stays where it was: the operation is still in effect.
+            s.undo.push(action);
+            s.notice = e;
+        }
+    }
+    true
+}
+
+/// Do the last thing taken back again. Ctrl+Y.
+fn redo_last(s: &mut App) -> bool {
+    let Some(action) = s.redo.pop() else {
+        s.notice = "Nothing to redo".into();
+        return true;
+    };
+    match put_back(&action) {
+        Ok(()) => {
+            s.undo.push(action);
+            after_undo(s, "Redone");
+        }
+        Err(e) => {
+            s.redo.push(action);
+            s.notice = e;
+        }
+    }
+    true
+}
+
+/// Reload the folder on screen, so what was put back or taken away shows.
+fn after_undo(s: &mut App, word: &str) {
+    if s.view == View::Files {
+        let root = s.root.clone();
+        set_location(s, root);
+    }
+    s.notice = word.into();
+}
+
+/// Reverse one operation on disk.
+fn take_back(action: &Undo) -> Result<(), String> {
+    match action {
+        Undo::Rename { from, to } => fs::rename(to, from)
+            .map_err(|e| format!("Could not put the name back: {e}")),
+        Undo::Made { path } => fileops::remove(path)
+            .map_err(|e| format!("Could not remove the folder again: {e}")),
+        Undo::Copied { pairs } => {
+            for (_, copy) in pairs {
+                fileops::remove(copy).map_err(|e| format!("Could not remove the copy: {e}"))?;
+            }
+            Ok(())
+        }
+        Undo::Moved { pairs } => {
+            for (from, to) in pairs {
+                if let Some(parent) = from.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                fs::rename(to, from).map_err(|e| format!("Could not move it back: {e}"))?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Do one reversed operation again.
+fn put_back(action: &Undo) -> Result<(), String> {
+    match action {
+        Undo::Rename { from, to } => {
+            fs::rename(from, to).map_err(|e| format!("Could not rename it again: {e}"))
+        }
+        Undo::Made { path } => fs::create_dir_all(path)
+            .map_err(|e| format!("Could not make the folder again: {e}")),
+        Undo::Copied { pairs } => {
+            fileops::copy_again(pairs).map_err(|e| format!("Could not copy it again: {e}"))
+        }
+        Undo::Moved { pairs } => {
+            for (from, to) in pairs {
+                if let Some(parent) = to.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                fs::rename(from, to).map_err(|e| format!("Could not move it again: {e}"))?;
+            }
+            Ok(())
+        }
+    }
+}
+
 fn copy_selection(s: &mut App) {
     let paths = selected_paths(s);
     if !paths.is_empty() {
@@ -7758,7 +7904,19 @@ fn start_paste(s: &mut App, mode: fileops::Mode, conflict: fileops::Conflict, so
             !worker_cancel.load(Ordering::Relaxed)
         };
         let result = fileops::paste(mode, conflict, &sources, &target, &worker_cancel, emit);
-        let _ = tx.send(OpMsg::Done(result));
+        let (outcome, undo) = match result {
+            Ok(pairs) => {
+                let count = pairs.len();
+                let undo = if mode == fileops::Mode::Cut {
+                    Undo::Moved { pairs }
+                } else {
+                    Undo::Copied { pairs }
+                };
+                (Ok(count), Some(undo))
+            }
+            Err(e) => (Err(e), None),
+        };
+        let _ = tx.send(OpMsg::Done { outcome, undo });
     });
 }
 
@@ -7778,7 +7936,9 @@ fn start_delete(s: &mut App, mode: fileops::DeleteMode, paths: Vec<PathBuf>) {
             !worker_cancel.load(Ordering::Relaxed)
         };
         let result = fileops::delete(mode, &paths, &worker_cancel, emit);
-        let _ = tx.send(OpMsg::Done(result));
+        // A delete is not taken back: to the trash it could be, but only by
+        // going through the shell's own recycle bin, which this does not do.
+        let _ = tx.send(OpMsg::Done { outcome: result, undo: None });
     });
 }
 
@@ -7859,7 +8019,8 @@ fn commit_rename(s: &mut App) {
         return;
     }
     match fileops::rename(&path, &name) {
-        Ok(_) => {
+        Ok(target) => {
+            record_undo(s, Undo::Rename { from: path, to: target });
             if s.view == View::Files {
                 let root = s.root.clone();
                 set_location(s, root);
@@ -7876,7 +8037,8 @@ fn commit_new_folder(s: &mut App) {
         return;
     }
     match fileops::create_folder(&parent, &name) {
-        Ok(_) => {
+        Ok(path) => {
+            record_undo(s, Undo::Made { path });
             if s.view == View::Files {
                 let root = s.root.clone();
                 set_location(s, root);
@@ -7903,6 +8065,7 @@ fn drain_op(s: &mut App) -> bool {
     // below, because reloading a folder clears the notice: a failed delete used
     // to be reported into that clearing and say nothing at all.
     let mut outcome: Option<String> = None;
+    let mut undo: Option<Undo> = None;
     if let Some(rx) = &s.op_rx {
         while let Ok(msg) = rx.try_recv() {
             match msg {
@@ -7916,8 +8079,9 @@ fn drain_op(s: &mut App) -> bool {
                     }
                     changed = true;
                 }
-                OpMsg::Done(result) => {
+                OpMsg::Done { outcome: result, undo: action } => {
                     finished = true;
+                    undo = action;
                     let label = s.transfer.as_ref().map(|t| t.label).unwrap_or("Done");
                     let past = match label {
                         "Copying" => "Copied",
@@ -7945,6 +8109,9 @@ fn drain_op(s: &mut App) -> bool {
         }
         if let Some(outcome) = outcome {
             s.notice = outcome;
+        }
+        if let Some(action) = undo {
+            record_undo(s, action);
         }
         changed = true;
     }
@@ -8147,6 +8314,14 @@ fn handle_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
     if ev.is_command('c') {
         copy_selection(s);
         return true;
+    }
+    // Undo and redo, before the rest: Ctrl+Shift+Z is a redo too, the way most
+    // editors spell it.
+    if ev.is_command('z') {
+        return if ev.mods.shift { redo_last(s) } else { undo_last(s) };
+    }
+    if ev.is_command('y') {
+        return redo_last(s);
     }
     if ev.is_command('x') {
         cut_selection(s);
@@ -11420,6 +11595,201 @@ mod click_tests {
             rt.state.view == View::ThisPc,
             "the Back button must return to This PC"
         );
+    }
+}
+
+#[cfg(test)]
+mod undo_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lyre-undo-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A window on `dir`, with nothing on the undo stack.
+    fn open(dir: &Path) -> App {
+        let mut s = init();
+        s.view = View::Files;
+        s.root = dir.to_path_buf();
+        s.undo.clear();
+        s.redo.clear();
+        s
+    }
+
+    fn wait(s: &mut App) {
+        for _ in 0..250 {
+            drain_op(s);
+            if s.transfer.is_none() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        panic!("the operation did not finish");
+    }
+
+    fn rename_to(path: &Path, name: &str) -> Dialog {
+        let mut edit = TextEdit::default();
+        edit.text = name.into();
+        Dialog::Rename { path: path.to_path_buf(), edit }
+    }
+
+    #[test]
+    fn undo_puts_a_renamed_file_back_and_redo_renames_it_again() {
+        let dir = scratch("rename");
+        let before = dir.join("before.txt");
+        std::fs::write(&before, b"x").unwrap();
+        let mut s = open(&dir);
+        s.dialog = Some(rename_to(&before, "after.txt"));
+        commit_rename(&mut s);
+        assert!(dir.join("after.txt").exists(), "it was renamed");
+
+        undo_last(&mut s);
+        assert!(before.exists(), "the old name is back");
+        assert!(!dir.join("after.txt").exists(), "and the new one is gone");
+
+        redo_last(&mut s);
+        assert!(dir.join("after.txt").exists(), "redo renamed it again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_takes_a_new_folder_away_and_redo_makes_it_again() {
+        let dir = scratch("folder");
+        let mut s = open(&dir);
+        let mut edit = TextEdit::default();
+        edit.text = "made".into();
+        s.dialog = Some(Dialog::NewFolder { parent: dir.clone(), edit });
+        commit_new_folder(&mut s);
+        assert!(dir.join("made").is_dir(), "the folder was made");
+
+        undo_last(&mut s);
+        assert!(!dir.join("made").exists(), "undo took it away");
+
+        redo_last(&mut s);
+        assert!(dir.join("made").is_dir(), "redo made it again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undo_takes_a_copy_away_and_redo_copies_it_again() {
+        let source = scratch("copy-src");
+        let target = scratch("copy-dst");
+        let file = source.join("kept.txt");
+        std::fs::write(&file, b"hello").unwrap();
+        let mut s = open(&target);
+        start_paste(&mut s, fileops::Mode::Copy, fileops::Conflict::Rename, vec![file], target.clone());
+        wait(&mut s);
+        assert!(target.join("kept.txt").exists(), "the copy landed");
+
+        undo_last(&mut s);
+        assert!(!target.join("kept.txt").exists(), "undo took the copy away");
+        assert!(source.join("kept.txt").exists(), "and left the original");
+
+        redo_last(&mut s);
+        assert_eq!(
+            std::fs::read_to_string(target.join("kept.txt")).unwrap(),
+            "hello",
+            "redo copied it again"
+        );
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    #[test]
+    fn undo_moves_a_cut_file_back_and_redo_moves_it_again() {
+        let source = scratch("move-src");
+        let target = scratch("move-dst");
+        let file = source.join("moved.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let mut s = open(&target);
+        start_paste(&mut s, fileops::Mode::Cut, fileops::Conflict::Rename, vec![file.clone()], target.clone());
+        wait(&mut s);
+        assert!(target.join("moved.txt").exists(), "the file moved");
+        assert!(!file.exists(), "and left where it was");
+
+        undo_last(&mut s);
+        assert!(file.exists(), "undo moved it back");
+        assert!(!target.join("moved.txt").exists());
+
+        redo_last(&mut s);
+        assert!(target.join("moved.txt").exists(), "redo moved it again");
+        let _ = std::fs::remove_dir_all(&source);
+        let _ = std::fs::remove_dir_all(&target);
+    }
+
+    /// Doing something new drops what could have been redone: those steps belong
+    /// to a branch that no longer exists.
+    #[test]
+    fn a_new_operation_drops_the_redo_steps() {
+        let dir = scratch("branch");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let mut s = open(&dir);
+        s.dialog = Some(rename_to(&file, "b.txt"));
+        commit_rename(&mut s);
+        undo_last(&mut s);
+        assert_eq!(s.redo.len(), 1, "the rename is there to redo");
+
+        let mut edit = TextEdit::default();
+        edit.text = "fresh".into();
+        s.dialog = Some(Dialog::NewFolder { parent: dir.clone(), edit });
+        commit_new_folder(&mut s);
+        assert!(s.redo.is_empty(), "the new folder dropped it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With nothing to take back, Ctrl+Z says so rather than doing something.
+    #[test]
+    fn undo_with_nothing_to_undo_says_so() {
+        let dir = scratch("empty");
+        let mut s = open(&dir);
+        undo_last(&mut s);
+        assert_eq!(s.notice, "Nothing to undo");
+        assert!(s.undo.is_empty() && s.redo.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The chord itself, through the key handler the window calls.
+    #[test]
+    fn ctrl_z_takes_it_back_and_ctrl_y_does_it_again() {
+        let dir = scratch("keys");
+        let before = dir.join("one.txt");
+        std::fs::write(&before, b"x").unwrap();
+        let chord = |key: Key, shift: bool| KeyEvent {
+            key,
+            mods: rune::Mods { cmd: true, shift, ..rune::Mods::default() },
+        };
+        let mut rt = rune::Runtime::new(init(), view, (900.0, 600.0), rune::Env::new(true, 1.0));
+        rt.update(|s, _tx| {
+            s.view = View::Files;
+            s.root = dir.clone();
+            s.undo.clear();
+            s.redo.clear();
+            s.dialog = Some(rename_to(&before, "two.txt"));
+            commit_rename(s);
+        });
+
+        let undo = chord(Key::Command('z'), false);
+        rt.update(|s, tx| assert!(handle_key(s, &undo, tx), "Ctrl+Z is handled"));
+        assert!(before.exists(), "Ctrl+Z put the name back");
+
+        let redo = chord(Key::Command('y'), false);
+        rt.update(|s, tx| assert!(handle_key(s, &redo, tx), "Ctrl+Y is handled"));
+        assert!(dir.join("two.txt").exists(), "Ctrl+Y renamed it again");
+
+        // Ctrl+Shift+Z is the other way to redo.
+        let undo = chord(Key::Command('z'), false);
+        rt.update(|s, tx| {
+            handle_key(s, &undo, tx);
+        });
+        assert!(before.exists(), "undone again");
+        let shift_redo = chord(Key::Command('z'), true);
+        rt.update(|s, tx| assert!(handle_key(s, &shift_redo, tx)));
+        assert!(dir.join("two.txt").exists(), "Ctrl+Shift+Z redid it");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

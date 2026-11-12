@@ -4,7 +4,10 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
-## [Unreleased]
+## [0.3.2]
+
+A patch release for the rail: its places are found where the system keeps them,
+Home is the home folder, and its rows answer a press wherever it lands.
 
 ### Changed
 
@@ -14,6 +17,18 @@ release notes rather than a second copy of them.
   home directory — `/home/<name>`, `C:\Users\<name>` — with its own rail row, its
   own breadcrumbs, and Up to the folder that holds it. A window still opens on
   Quick Access.
+
+- **A search walks the disk once, not once per keystroke.** Every change to the
+  search box cancelled the running walk and started a fresh one, so typing six
+  letters walked the disk six times and answered once. A query is now walked 180
+  ms after the typing stops, the tree is read on every core but one, and the
+  names a walk finds are kept for the rest of that search, so the next query in
+  the same box matches them without touching the disk. Measured on
+  `C:\Windows\System32` in a release build, a query that matches nothing went
+  from 185,000 entries a second to about 520,000, so a five-million-entry disk
+  takes seconds rather than half a minute. The kept names are dropped when the
+  search box is cleared or the folder changes, so an answer is never older than
+  the search it belongs to.
 
 ### Fixed
 

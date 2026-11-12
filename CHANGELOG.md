@@ -8,6 +8,13 @@ release notes rather than a second copy of them.
 
 ### Fixed
 
+- **A failed delete says why it failed.** Every finished operation reloads the
+  folder on screen, and reloading clears the notice; the outcome was written
+  before that reload, so a delete Windows refused reported into the clearing and
+  said nothing at all. The message now lands after the reload. Creating a folder
+  in a folder you may not write to already said so, and both are covered by tests
+  that give a folder and a file a deny entry and expect the message and no crash.
+
 - **Back returns to the page you came from.** History recorded folders, and
   This PC, Quick Access and the Gallery are not folders: each keeps the last real
   folder behind it, and that folder was the whole of what a step recorded. Opening

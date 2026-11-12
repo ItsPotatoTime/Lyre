@@ -7679,6 +7679,10 @@ fn cancel_op(s: &mut App) {
 fn drain_op(s: &mut App) -> bool {
     let mut changed = false;
     let mut finished = false;
+    // What the operation has to say. It is put on screen only after the reload
+    // below, because reloading a folder clears the notice: a failed delete used
+    // to be reported into that clearing and say nothing at all.
+    let mut outcome: Option<String> = None;
     if let Some(rx) = &s.op_rx {
         while let Ok(msg) = rx.try_recv() {
             match msg {
@@ -7701,10 +7705,10 @@ fn drain_op(s: &mut App) -> bool {
                         "Deleting" => "Deleted",
                         _ => "Finished",
                     };
-                    match result {
-                        Ok(n) => s.notice = format!("{past} {n} item{}", if n == 1 { "" } else { "s" }),
-                        Err(e) => s.notice = e,
-                    }
+                    outcome = Some(match result {
+                        Ok(n) => format!("{past} {n} item{}", if n == 1 { "" } else { "s" }),
+                        Err(e) => e,
+                    });
                 }
             }
         }
@@ -7718,6 +7722,9 @@ fn drain_op(s: &mut App) -> bool {
         if s.view == View::Files {
             let root = s.root.clone();
             set_location(s, root);
+        }
+        if let Some(outcome) = outcome {
+            s.notice = outcome;
         }
         changed = true;
     }
@@ -10858,6 +10865,122 @@ mod click_tests {
 #[cfg(test)]
 mod history_tests {
     use super::*;
+
+    /// Creating or deleting where the account has no permission must say so and
+    /// leave the window as it was: the reported symptom was the application
+    /// closing instead.
+    #[cfg(windows)]
+    mod permissions {
+        use super::*;
+
+        /// A folder that can be read and listed but not written to: Everyone is
+        /// denied write-data and add-file, which is what C:\Projects is for an
+        /// account without it.
+        fn read_only(tag: &str) -> Option<PathBuf> {
+            let dir = std::env::temp_dir().join(format!("lyre-perm-{tag}-{}", std::process::id()));
+            let _ = deny(&dir, false);
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).ok()?;
+            deny(&dir, true)?.then_some(dir)
+        }
+
+        /// Grant or remove the deny entry; false when this account cannot.
+        fn deny(dir: &Path, on: bool) -> Option<bool> {
+            let mut command = std::process::Command::new("icacls");
+            command.arg(dir);
+            if on {
+                command.arg("/deny").arg("*S-1-1-0:(WD,AD)");
+            } else {
+                command.arg("/remove:d").arg("*S-1-1-0");
+            }
+            command.output().ok().map(|out| out.status.success())
+        }
+
+        fn clean(dir: &Path) {
+            deny(dir, false);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        fn open_in(dir: &Path) -> App {
+            let mut s = init();
+            s.view = View::Files;
+            s.root = dir.to_path_buf();
+            s.crumbs = vec![dir.file_name().unwrap_or_default().to_string_lossy().into_owned()];
+            s
+        }
+
+        #[test]
+        fn creating_a_folder_where_you_may_not_says_so() {
+            let Some(dir) = read_only("create") else { return };
+            let mut s = open_in(&dir);
+            begin_new_folder(&mut s);
+            if let Some(Dialog::NewFolder { edit, .. }) = s.dialog.as_mut() {
+                edit.text = "new folder".into();
+            }
+            commit_new_folder(&mut s);
+            assert!(s.dialog.is_none(), "the dialog closes either way");
+            assert!(
+                s.notice.contains("Could not create the folder"),
+                "the window must say why, got {:?}",
+                s.notice
+            );
+            assert!(same_path(&s.root, &dir), "and stay in the folder it was in");
+            clean(&dir);
+        }
+
+        #[test]
+        fn deleting_a_file_that_cannot_be_deleted_says_so() {
+            // A plain writable folder, so the file can be made first; the deny
+            // entry then goes on the file, which is what a protected item has.
+            let dir = std::env::temp_dir().join(format!("lyre-perm-delete-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            let file = dir.join("kept.txt");
+            std::fs::write(&file, b"x").unwrap();
+            // Windows lets a file be deleted through its folder's delete-child
+            // right, so both the file and the folder have to refuse it.
+            let denied = std::process::Command::new("icacls")
+                .arg(&file)
+                .args(["/deny", "*S-1-1-0:(D)"])
+                .output()
+                .is_ok_and(|out| out.status.success())
+                && std::process::Command::new("icacls")
+                    .arg(&dir)
+                    .args(["/deny", "*S-1-1-0:(DC)"])
+                    .output()
+                    .is_ok_and(|out| out.status.success());
+            if !denied {
+                clean(&dir);
+                return;
+            }
+
+            let mut s = open_in(&dir);
+            start_delete(&mut s, fileops::DeleteMode::Permanent, vec![file.clone()]);
+            for _ in 0..250 {
+                drain_op(&mut s);
+                if s.transfer.is_none() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            assert!(s.transfer.is_none(), "the operation ends rather than hanging");
+            assert!(file.exists(), "the file it could not delete is still there");
+            assert!(
+                s.notice.contains("os error 5") || s.notice.contains("Access is denied"),
+                "the window must say why it could not delete, got {:?}",
+                s.notice
+            );
+            let _ = std::process::Command::new("icacls")
+                .arg(&file)
+                .args(["/remove:d", "*S-1-1-0"])
+                .output();
+            let _ = std::process::Command::new("icacls")
+                .arg(&dir)
+                .args(["/remove:d", "*S-1-1-0"])
+                .output();
+            clean(&dir);
+        }
+    }
 
     /// A folder on disk that is not one of the rail's places.
     fn scratch(tag: &str) -> PathBuf {

@@ -4,7 +4,12 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
-## [Unreleased]
+## [0.3.5]
+
+A release for a move that went wrong and took the projects with it: what a paste
+did is kept even when it stopped part way, a folder that was made is only removed
+again while it is still empty, and replacing merges into a folder instead of
+deleting what only the destination had.
 
 ### Fixed
 

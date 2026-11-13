@@ -208,6 +208,7 @@ bun run dev:web
 | `Ctrl+Shift+C` | Copy path |
 | `Ctrl+C` / `Ctrl+X` / `Ctrl+V` | Copy, cut, paste |
 | `Delete` | Move to the trash |
+| `Ctrl+Z` / `Ctrl+Y` | Undo, redo |
 | `Shift+F10` | Context menu at the selection |
 | `Ctrl+Shift+2` / `Ctrl+Shift+6` | Large icons, details |
 | `Ctrl+A`, `Shift+arrows`, `Ctrl+click`, `Shift+click` | Selection |
@@ -219,10 +220,9 @@ bun run dev:web
 The two side buttons on a mouse are back and forward, walking the same per-tab
 history as `Alt+Left` and `Alt+Right`.
 
-`Ctrl+Z`, `Ctrl+Y`, `Ctrl+N`, `Ctrl+D`, `Alt+Z`, `Alt+P` and `F6` do nothing on
-purpose: there is no undo history, second window or pin gesture behind them yet,
-and a shortcut that silently does the wrong thing is worse than one that is
-absent.
+`Ctrl+N`, `Ctrl+D`, `Alt+Z`, `Alt+P` and `F6` do nothing on purpose: there is no
+second window or pin gesture behind them yet, and a shortcut that silently does
+the wrong thing is worse than one that is absent.
 
 ## Status
 

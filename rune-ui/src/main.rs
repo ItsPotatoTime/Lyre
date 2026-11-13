@@ -7791,17 +7791,17 @@ fn undo_last(s: &mut App) -> bool {
         s.notice = "Nothing to undo".into();
         return true;
     };
-    match take_back(&action) {
-        Ok(()) => {
-            s.redo.push(action);
-            after_undo(s, "Undone");
-        }
-        Err(e) => {
-            // It stays where it was: the operation is still in effect.
-            s.undo.push(action);
-            s.notice = e;
-        }
+    let stepped = take_back(&action);
+    if let Some(went) = stepped.went {
+        s.redo.push(went);
     }
+    // Whatever could not be taken back stays where it was, so the next press
+    // tries only that and not the part that already went through.
+    if let Some(left) = stepped.left {
+        s.undo.push(left);
+    }
+    reload_after_undo(s);
+    s.notice = stepped.error.unwrap_or_else(|| "Undone".into());
     true
 }
 
@@ -7811,85 +7811,160 @@ fn redo_last(s: &mut App) -> bool {
         s.notice = "Nothing to redo".into();
         return true;
     };
-    match put_back(&action) {
-        Ok(()) => {
-            s.undo.push(action);
-            after_undo(s, "Redone");
-        }
-        Err(e) => {
-            s.redo.push(action);
-            s.notice = e;
-        }
+    let stepped = put_back(&action);
+    if let Some(went) = stepped.went {
+        s.undo.push(went);
     }
+    if let Some(left) = stepped.left {
+        s.redo.push(left);
+    }
+    reload_after_undo(s);
+    s.notice = stepped.error.unwrap_or_else(|| "Redone".into());
     true
 }
 
 /// Reload the folder on screen, so what was put back or taken away shows.
-fn after_undo(s: &mut App, word: &str) {
+fn reload_after_undo(s: &mut App) {
     if s.view == View::Files {
         let root = s.root.clone();
         set_location(s, root);
     }
-    s.notice = word.into();
+}
+
+/// What one press of undo or redo managed: the part that went through, the part
+/// that is left, and the first reason a step stopped. One item that cannot be
+/// stepped does not stop the others, and nothing is reported as done that is not.
+struct Stepped {
+    went: Option<Undo>,
+    left: Option<Undo>,
+    error: Option<String>,
+}
+
+impl Stepped {
+    /// The whole operation went through.
+    fn whole(action: &Undo) -> Self {
+        Stepped { went: Some(action.clone()), left: None, error: None }
+    }
+
+    /// Nothing could be done, and the operation is still in effect.
+    fn stopped(action: &Undo, error: String) -> Self {
+        Stepped { went: None, left: Some(action.clone()), error: Some(error) }
+    }
+
+    /// Nothing could be done, and nothing is left to try either.
+    fn kept(error: String) -> Self {
+        Stepped { went: None, left: None, error: Some(error) }
+    }
+
+    /// Step a list of items one at a time, keeping the order and gathering what
+    /// could not be stepped once the first refusal is in.
+    fn each<T>(
+        items: Vec<T>,
+        mut step: impl FnMut(&T) -> Result<(), String>,
+        rebuild: impl Fn(Vec<T>) -> Undo,
+    ) -> Self {
+        let mut went = Vec::new();
+        let mut rest = Vec::new();
+        let mut error = None;
+        for item in items {
+            if error.is_some() {
+                rest.push(item);
+                continue;
+            }
+            match step(&item) {
+                Ok(()) => went.push(item),
+                Err(e) => {
+                    error = Some(e);
+                    rest.push(item);
+                }
+            }
+        }
+        Stepped {
+            went: (!went.is_empty()).then(|| rebuild(went)),
+            left: (!rest.is_empty()).then(|| rebuild(rest)),
+            error,
+        }
+    }
 }
 
 /// Reverse one operation on disk.
-fn take_back(action: &Undo) -> Result<(), String> {
+fn take_back(action: &Undo) -> Stepped {
     match action {
-        Undo::Rename { from, to } => fs::rename(to, from)
-            .map_err(|e| format!("Could not put the name back: {e}")),
-        Undo::Made { path } => fileops::remove(path)
-            .map_err(|e| format!("Could not remove the folder again: {e}")),
-        Undo::Copied { pairs } => {
-            for (_, copy) in pairs {
-                fileops::remove(copy).map_err(|e| format!("Could not remove the copy: {e}"))?;
+        Undo::Rename { from, to } => match fs::rename(to, from) {
+            Ok(()) => Stepped::whole(action),
+            Err(e) => Stepped::stopped(action, format!("Could not put the name back: {e}")),
+        },
+        // Only a folder still empty is ours to take away. A folder that has
+        // collected something since it was made was taken away whole, and with
+        // it everything inside: nothing on the undo stack recorded those items.
+        Undo::Made { path } => match fs::remove_dir(path) {
+            Ok(()) => Stepped::whole(action),
+            Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => Stepped::kept(format!(
+                "{} has things in it now, so it was kept",
+                path.display()
+            )),
+            Err(e) => {
+                Stepped::stopped(action, format!("Could not remove the folder again: {e}"))
             }
-            Ok(())
-        }
-        Undo::Moved { pairs } => {
-            for (from, to) in pairs {
-                if let Some(parent) = from.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                fs::rename(to, from).map_err(|e| format!("Could not move it back: {e}"))?;
-            }
-            Ok(())
-        }
-        Undo::Trashed { items } => {
-            fileops::restore(items).map_err(|e| format!("Could not take it out of the trash: {e}"))
-        }
+        },
+        Undo::Copied { pairs } => Stepped::each(
+            pairs.clone(),
+            |(_, copy)| {
+                fileops::remove(copy).map_err(|e| format!("Could not remove the copy: {e}"))
+            },
+            |pairs| Undo::Copied { pairs },
+        ),
+        Undo::Moved { pairs } => step_moved(pairs.clone(), true),
+        Undo::Trashed { items } => match fileops::restore(items) {
+            Ok(()) => Stepped::whole(action),
+            Err(e) => Stepped::stopped(action, format!("Could not take it out of the trash: {e}")),
+        },
     }
 }
 
 /// Do one reversed operation again.
-fn put_back(action: &Undo) -> Result<(), String> {
+fn put_back(action: &Undo) -> Stepped {
     match action {
-        Undo::Rename { from, to } => {
-            fs::rename(from, to).map_err(|e| format!("Could not rename it again: {e}"))
-        }
-        Undo::Made { path } => fs::create_dir_all(path)
-            .map_err(|e| format!("Could not make the folder again: {e}")),
-        Undo::Copied { pairs } => {
-            fileops::copy_again(pairs).map_err(|e| format!("Could not copy it again: {e}"))
-        }
-        Undo::Moved { pairs } => {
-            for (from, to) in pairs {
-                if let Some(parent) = to.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                fs::rename(from, to).map_err(|e| format!("Could not move it again: {e}"))?;
-            }
-            Ok(())
-        }
+        Undo::Rename { from, to } => match fs::rename(from, to) {
+            Ok(()) => Stepped::whole(action),
+            Err(e) => Stepped::stopped(action, format!("Could not rename it again: {e}")),
+        },
+        Undo::Made { path } => match fs::create_dir_all(path) {
+            Ok(()) => Stepped::whole(action),
+            Err(e) => Stepped::stopped(action, format!("Could not make the folder again: {e}")),
+        },
+        Undo::Copied { pairs } => match fileops::copy_again(pairs) {
+            Ok(()) => Stepped::whole(action),
+            Err(e) => Stepped::stopped(action, format!("Could not copy it again: {e}")),
+        },
+        Undo::Moved { pairs } => step_moved(pairs.clone(), false),
         Undo::Trashed { items } => {
             // Deleting again: the originals are what the trash recorded.
             let paths: Vec<PathBuf> = items.iter().map(|item| item.original.clone()).collect();
             let cancel = std::sync::atomic::AtomicBool::new(false);
-            fileops::delete(fileops::DeleteMode::Trash, &paths, &cancel, |_| true)
-                .map(|_| ())
-                .map_err(|e| format!("Could not delete it again: {e}"))
+            match fileops::delete(fileops::DeleteMode::Trash, &paths, &cancel, |_| true) {
+                Ok(_) => Stepped::whole(action),
+                Err(e) => Stepped::stopped(action, format!("Could not delete it again: {e}")),
+            }
         }
     }
+}
+
+/// Step a list of moved items one at a time, back the way they came or the way
+/// they went. Whatever cannot go stays with the direction it still needs.
+fn step_moved(pairs: Vec<(PathBuf, PathBuf)>, back: bool) -> Stepped {
+    Stepped::each(
+        pairs,
+        |(from, to)| {
+            let (src, dst) = if back { (to, from) } else { (from, to) };
+            if let Some(parent) = dst.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let said = if back { "Could not move it back" } else { "Could not move it again" };
+            fs::rename(src, dst).map_err(|e| format!("{said}: {e}"))
+        },
+        |pairs| Undo::Moved { pairs },
+    )
 }
 
 fn copy_selection(s: &mut App) {
@@ -7928,18 +8003,27 @@ fn start_paste(s: &mut App, mode: fileops::Mode, conflict: fileops::Conflict, so
             let _ = progress_tx.send(OpMsg::Progress(p));
             !worker_cancel.load(Ordering::Relaxed)
         };
-        let result = fileops::paste(mode, conflict, &sources, &target, &worker_cancel, emit);
-        let (outcome, undo) = match result {
-            Ok(pairs) => {
-                let count = pairs.len();
-                let undo = if mode == fileops::Mode::Cut {
-                    Undo::Moved { pairs }
-                } else {
-                    Undo::Copied { pairs }
-                };
-                (Ok(count), Some(undo))
+        let pasted = fileops::paste(mode, conflict, &sources, &target, &worker_cancel, emit);
+        let count = pasted.landed.len();
+        // What landed is on the disk whatever the paste said next, so it goes on
+        // the undo stack even when the paste stopped: a move that broke half way
+        // used to leave no record, and the next Ctrl+Z undid the folder's birth
+        // instead, taking the moved items away with it.
+        let undo = (!pasted.landed.is_empty()).then(|| {
+            if mode == fileops::Mode::Cut {
+                Undo::Moved { pairs: pasted.landed }
+            } else {
+                Undo::Copied { pairs: pasted.landed }
             }
-            Err(e) => (Err(e), None),
+        });
+        let outcome = match pasted.error {
+            None => Ok(count),
+            Some(e) if count == 0 => Err(e),
+            Some(e) => Err(format!(
+                "{} {count} item{}, then stopped: {e}",
+                if mode == fileops::Mode::Cut { "Moved" } else { "Copied" },
+                if count == 1 { "" } else { "s" }
+            )),
         };
         let _ = tx.send(OpMsg::Done { outcome, undo });
     });
@@ -12636,5 +12720,197 @@ mod link_tests {
             "a file's shortcut names no folder to open here"
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+}
+
+#[cfg(test)]
+mod move_tests {
+    use super::*;
+
+    fn move_scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lyre-move-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A project folder with something in it, so an emptied folder shows.
+    fn move_project(root: &Path, name: &str) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(dir.join("index.html"), b"<h1>hi</h1>").unwrap();
+        std::fs::write(dir.join("src").join("app.js"), b"main()").unwrap();
+    }
+
+    fn move_open(root: &Path) -> App {
+        let mut s = init();
+        s.view = View::Files;
+        s.root = root.to_path_buf();
+        s.undo.clear();
+        s.redo.clear();
+        s.entries = scan(root).0;
+        refresh_visible(&mut s);
+        s
+    }
+
+    fn move_paths(root: &Path, names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(|name| root.join(name)).collect()
+    }
+
+    fn move_wait(s: &mut App) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            drain_op(s);
+            if s.transfer.is_none() {
+                return;
+            }
+            assert!(Instant::now() < deadline, "the operation did not finish");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Let go of a drag over a folder, the way the window does it.
+    fn drop_onto(s: &mut App, sources: &[PathBuf], target: PathBuf, mode: fileops::Mode) {
+        s.drag = Some(DragState {
+            paths: sources.iter().map(|p| p.to_string_lossy().into_owned()).collect(),
+            at: (0.0, 0.0),
+            shift: false,
+            target: Some(DropTarget::Folder(target)),
+            target_key: String::new(),
+            mode,
+        });
+        finish_drag(s);
+    }
+
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut out: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|item| item.file_name().to_string_lossy().into_owned())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// The reported bug: two projects dragged into a folder made for them.
+    #[test]
+    fn two_projects_move_into_the_folder_made_for_them() {
+        let root = move_scratch("two");
+        move_project(&root, "Presenter");
+        move_project(&root, "presenter-pwa");
+        let mut s = move_open(&root);
+        let mut edit = TextEdit::default();
+        edit.text = "ChurchApp".into();
+        s.dialog = Some(Dialog::NewFolder { parent: root.clone(), edit });
+        commit_new_folder(&mut s);
+        assert!(root.join("ChurchApp").is_dir(), "the folder was made");
+        let sources = move_paths(&root, &["Presenter", "presenter-pwa"]);
+        drop_onto(&mut s, &sources, root.join("ChurchApp"), fileops::Mode::Cut);
+        move_wait(&mut s);
+        assert_eq!(names_in(&root), vec!["ChurchApp".to_string()], "only the folder is left");
+        assert_eq!(
+            names_in(&root.join("ChurchApp")),
+            vec!["Presenter".to_string(), "presenter-pwa".to_string()],
+            "both projects are in it"
+        );
+        assert!(root.join("ChurchApp").join("Presenter").join("index.html").exists());
+        assert!(root.join("ChurchApp").join("presenter-pwa").join("src").join("app.js").exists());
+
+        // Ctrl+Z puts both back where they came from, and only then takes the
+        // folder away: the move is what the last press has to take back.
+        undo_last(&mut s);
+        assert_eq!(
+            names_in(&root),
+            vec!["ChurchApp".to_string(), "Presenter".to_string(), "presenter-pwa".to_string()],
+            "undo moved both projects back: {}",
+            s.notice
+        );
+        assert!(root.join("Presenter").join("index.html").exists());
+        undo_last(&mut s);
+        assert!(!root.join("ChurchApp").exists(), "a second press takes the empty folder away");
+
+        // Ctrl+Y twice does the folder and the move again.
+        redo_last(&mut s);
+        assert!(root.join("ChurchApp").is_dir(), "redo made the folder again");
+        redo_last(&mut s);
+        assert!(
+            root.join("ChurchApp").join("Presenter").join("index.html").exists(),
+            "and redo moved the projects in again: {}",
+            s.notice
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A selection that names the destination itself is refused before anything
+    /// moves, so there is no half-done move to explain.
+    #[test]
+    fn a_drop_that_names_its_own_destination_moves_nothing() {
+        let root = move_scratch("own");
+        move_project(&root, "Presenter");
+        move_project(&root, "presenter-pwa");
+        let mut s = move_open(&root);
+        let mut edit = TextEdit::default();
+        edit.text = "ChurchApp".into();
+        s.dialog = Some(Dialog::NewFolder { parent: root.clone(), edit });
+        commit_new_folder(&mut s);
+        assert!(root.join("ChurchApp").is_dir(), "the folder was made");
+        // Picked along with the folder itself.
+        let sources = move_paths(&root, &["Presenter", "ChurchApp"]);
+        drop_onto(&mut s, &sources, root.join("ChurchApp"), fileops::Mode::Cut);
+        move_wait(&mut s);
+        assert!(
+            root.join("Presenter").join("index.html").exists(),
+            "the project stayed where it was: {}",
+            s.notice
+        );
+        assert_eq!(
+            names_in(&root.join("ChurchApp")),
+            Vec::<String>::new(),
+            "nothing landed in the folder"
+        );
+
+        // Ctrl+Z has only the folder to take back, and the projects are safe.
+        undo_last(&mut s);
+        assert!(!root.join("ChurchApp").exists(), "the folder is gone: {}", s.notice);
+        assert!(root.join("Presenter").join("index.html").exists(), "and the project is untouched");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A move that stops half way still moved things, so Ctrl+Z must put those
+    /// back. It used to leave no record and then delete the folder the items
+    /// had just landed in, which took them with it.
+    #[test]
+    fn undo_after_a_move_that_stopped_half_way_puts_it_back() {
+        let root = move_scratch("halfway");
+        move_project(&root, "Presenter");
+        move_project(&root, "presenter-pwa");
+        let mut s = move_open(&root);
+        let mut edit = TextEdit::default();
+        edit.text = "ChurchApp".into();
+        s.dialog = Some(Dialog::NewFolder { parent: root.clone(), edit });
+        commit_new_folder(&mut s);
+        // The last item cannot go, as a locked file or a vanished path would
+        // decide, so the paste lands two and stops.
+        let mut sources = move_paths(&root, &["Presenter", "presenter-pwa"]);
+        sources.push(root.join("Ghost"));
+        drop_onto(&mut s, &sources, root.join("ChurchApp"), fileops::Mode::Cut);
+        move_wait(&mut s);
+        assert!(
+            root.join("ChurchApp").join("Presenter").join("index.html").exists(),
+            "the projects that did move are there: {}",
+            s.notice
+        );
+        assert!(root.join("ChurchApp").join("presenter-pwa").join("index.html").exists());
+        assert!(s.notice.contains("then stopped"), "the stop is said: {}", s.notice);
+
+        undo_last(&mut s);
+        assert!(
+            root.join("Presenter").join("index.html").exists(),
+            "undo put the moved project back: {}",
+            s.notice
+        );
+        assert!(root.join("presenter-pwa").join("index.html").exists(), "and the other too");
+        assert!(root.join("ChurchApp").is_dir(), "the folder itself is left alone");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

@@ -4,6 +4,29 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
+## [Unreleased]
+
+### Fixed
+
+- **A move that stops half way can be taken back.** A paste that landed some of
+  its items and then failed recorded nothing to undo, so `Ctrl+Z` fell through to
+  taking the folder away and deleted the folder those items had just landed in
+  with them. What a paste did is now recorded even when it stops, the status bar
+  says how many went before it did, and an undo that cannot finish all of it
+  keeps what it could not do for the next press instead of reporting it done.
+
+- **A folder that was made is only removed again while it is still empty.** Once
+  something is inside it, `Ctrl+Z` says so and leaves it.
+
+- **A selection that names its own destination is refused before anything
+  moves**, so a drop onto a folder that is part of the selection no longer
+  leaves half of itself done.
+
+- **Replacing keeps what only the destination has.** Choosing Replace deleted the
+  destination and copied into a fresh one, so a folder's other files went with
+  it, and a copy aimed at the item's own path emptied it. A folder is merged into
+  now, a file is written over, and an item is never written over itself.
+
 ## [0.3.4]
 
 A release for what the window was keeping from you: a page that overwrote your

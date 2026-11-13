@@ -119,7 +119,24 @@ away. [Platform detail](platforms.md#dragging-out-of-an-archive)
 A paste that would land on an existing name asks first: keep both, which numbers
 the incoming item (`a.txt`, `a (2).txt`), or replace. Replacing merges a folder
 rather than deleting it, so files that exist only in the destination survive and
-only the files present in both are written over.
+only the files present in both are written over. An item is never written over
+itself: replacing something with itself says that it is already there.
+
+## Undo
+
+`Ctrl+Z` takes back the last operation and `Ctrl+Y`, or `Ctrl+Shift+Z`, does it
+again: a rename, a new folder, a copy, a move, or a delete to the trash. Each is
+recorded in the form that reverses it, so a move puts every item back where it
+came from, recreating a parent folder that has gone since, and a copy is taken
+back by deleting what it made. A delete comes back out of the bin itself. A new
+operation drops the steps that could have been redone, as an editor does, and a
+permanent delete records nothing, which is what makes it permanent.
+
+Two things are refused rather than done. A folder that was made is only removed
+while it is still empty: once something is inside it, the undo says so and leaves
+it. And a paste reports what it did when it stops part way, so the next `Ctrl+Z`
+moves those items back rather than taking the folder they landed in away with
+them.
 
 Delete moves to the freedesktop trash, which the desktop itself can put back.
 

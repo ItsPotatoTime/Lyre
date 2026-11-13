@@ -312,7 +312,59 @@ fn move_item(
 
 /// Copy or move `sources` into the `target` directory, reporting progress.
 ///
-/// Answers where each item landed, source first, so the paste can be taken back.
+/// Answers where each item landed, source first, and why it stopped, so a paste
+/// that broke half way is still a paste that moved things and can be taken back.
+pub struct Pasted {
+    pub landed: Vec<(PathBuf, PathBuf)>,
+    pub error: Option<String>,
+}
+
+impl Pasted {
+    fn refused(reason: &str) -> Self {
+        Pasted { landed: Vec::new(), error: Some(reason.into()) }
+    }
+}
+
+/// One item of a paste: where it landed, or why it did not go.
+fn paste_one(
+    mode: Mode,
+    conflict: Conflict,
+    src: &Path,
+    target: &Path,
+    cancel: &AtomicBool,
+    report: &mut dyn FnMut(u64),
+) -> Result<PathBuf, String> {
+    let name = name_of(src);
+    let mut dst = target.join(&name);
+    // Never paste a folder into itself.
+    if src.is_dir() && dst.starts_with(src) && dst != src {
+        return Err("Cannot paste a folder into itself.".into());
+    }
+    if dst.exists() {
+        match conflict {
+            Conflict::Rename => dst = free_path(&dst),
+            Conflict::Overwrite => {
+                // A file and a folder cannot stand in for one another in place.
+                // Everything else merges, so what is only in the destination
+                // survives and only the names in both are written over.
+                if dst.is_dir() != src.is_dir() {
+                    remove_item(&dst)?;
+                }
+            }
+        }
+    }
+    // Settled after the conflict: a copy read from the file it is writing leaves
+    // it empty, so an item is never written over itself.
+    if dst == src {
+        return Err("That item is already here.".into());
+    }
+    match mode {
+        Mode::Copy => copy_item(src, &dst, cancel, report)?,
+        Mode::Cut => move_item(src, &dst, cancel, report)?,
+    }
+    Ok(dst)
+}
+
 pub fn paste<F: FnMut(Progress) -> bool>(
     mode: Mode,
     conflict: Conflict,
@@ -320,12 +372,33 @@ pub fn paste<F: FnMut(Progress) -> bool>(
     target: &Path,
     cancel: &AtomicBool,
     mut emit: F,
-) -> Result<Vec<(PathBuf, PathBuf)>, String> {
+) -> Pasted {
+    // A selection that names the destination itself is refused before anything
+    // moves: stopping half way leaves the person to work out which half went.
+    for src in sources {
+        let dst = target.join(name_of(src));
+        if !src.is_dir() {
+            continue;
+        }
+        // Strictly inside, where renaming the newcomer cannot rescue it.
+        if dst != *src && dst.starts_with(src) {
+            return Pasted::refused("Cannot paste a folder into itself.");
+        }
+        // A folder replaced by itself would be written over itself.
+        if dst == *src && conflict == Conflict::Overwrite {
+            return Pasted::refused(if sources.len() == 1 {
+                "That item is already here."
+            } else {
+                "Those items are already here."
+            });
+        }
+    }
     let total = sources.len();
     let total_bytes: u64 = sources.iter().map(|p| item_size(p)).sum();
     let mut done_bytes = 0u64;
     let mut completed = 0u64;
     let mut landed: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut error = None;
     // Bytes land inside the recursive copy, so a folder of ten thousand files
     // climbs smoothly instead of jumping from 0 to 100 at the end. Throttled
     // by time and by a sixteenth of the total so the channel never floods.
@@ -340,18 +413,7 @@ pub fn paste<F: FnMut(Progress) -> bool>(
         if !emit(Progress { done: i, total, name: name.clone(), done_bytes, total_bytes }) {
             break;
         }
-        let mut dst = target.join(&name);
-        if dst.exists() {
-            match conflict {
-                Conflict::Rename => dst = free_path(&dst),
-                Conflict::Overwrite => remove_item(&dst)?,
-            }
-        }
-        // Never paste a folder into itself.
-        if src.is_dir() && dst.starts_with(src) {
-            return Err("Cannot paste a folder into itself.".into());
-        }
-        {
+        let outcome = {
             let mut report = |add: u64| {
                 done_bytes += add;
                 if last_emit.elapsed() >= std::time::Duration::from_millis(60)
@@ -362,18 +424,23 @@ pub fn paste<F: FnMut(Progress) -> bool>(
                     emit(Progress { done: i, total, name: name.clone(), done_bytes, total_bytes });
                 }
             };
-            match mode {
-                Mode::Copy => copy_item(src, &dst, cancel, &mut report)?,
-                Mode::Cut => move_item(src, &dst, cancel, &mut report)?,
+            paste_one(mode, conflict, src, target, cancel, &mut report)
+        };
+        match outcome {
+            Ok(dst) => {
+                // A rename moves bytes without copying them; credit them at the end.
+                completed += item_size(src);
+                done_bytes = done_bytes.max(completed);
+                landed.push((src.clone(), dst));
+                emit(Progress { done: i + 1, total, name, done_bytes, total_bytes });
+            }
+            Err(e) => {
+                error = Some(e);
+                break;
             }
         }
-        // A rename moves bytes without copying them; credit them at the end.
-        completed += item_size(src);
-        done_bytes = done_bytes.max(completed);
-        landed.push((src.clone(), dst));
-        emit(Progress { done: i + 1, total, name, done_bytes, total_bytes });
     }
-    Ok(landed)
+    Pasted { landed, error }
 }
 
 /// Copy `pairs` again, source to destination, for a redo of a copy. Destinations
@@ -799,7 +866,8 @@ mod tests {
         let dest = base.join("copy");
         fs::create_dir_all(&dest).unwrap();
         let cancel = AtomicBool::new(false);
-        if let Err(error) = paste(Mode::Copy, Conflict::Rename, &[folder.clone()], &dest, &cancel, noop) {
+        let pasted = paste(Mode::Copy, Conflict::Rename, std::slice::from_ref(&folder), &dest, &cancel, noop);
+        if let Some(error) = pasted.error {
             panic!("the copy must finish, it said: {error}");
         }
         assert!(
@@ -823,7 +891,7 @@ mod tests {
         fs::create_dir_all(&dest).unwrap();
         let cancel = AtomicBool::new(false);
         let mut seen = Vec::new();
-        paste(
+        let pasted = paste(
             Mode::Copy,
             Conflict::Rename,
             &[src],
@@ -833,8 +901,9 @@ mod tests {
                 seen.push((p.done_bytes, p.total_bytes));
                 true
             },
-        )
-        .unwrap();
+        );
+        assert!(pasted.error.is_none(), "the copy must finish: {:?}", pasted.error);
+        assert_eq!(pasted.landed.len(), 1, "and one item landed");
         let total = 32 * 4096;
         assert!(
             seen.iter().any(|&(d, t)| t == total && d > 0 && d < total),
@@ -863,7 +932,9 @@ mod tests {
         let src = dir.join("a.txt");
         fs::write(&src, "hello").unwrap();
         let cancel = AtomicBool::new(false);
-        paste(Mode::Copy, Conflict::Rename, &[src.clone()], &dst, &cancel, noop).unwrap();
+        let pasted = paste(Mode::Copy, Conflict::Rename, std::slice::from_ref(&src), &dst, &cancel, noop);
+        assert!(pasted.error.is_none(), "the copy must finish: {:?}", pasted.error);
+        assert_eq!(pasted.landed, vec![(src.clone(), dst.join("a.txt"))], "it says where it landed");
         assert!(src.exists());
         assert_eq!(fs::read_to_string(dst.join("a.txt")).unwrap(), "hello");
         let _ = fs::remove_dir_all(&dir);
@@ -878,7 +949,9 @@ mod tests {
         let src = dir.join("a.txt");
         fs::write(&src, "incoming").unwrap();
         let cancel = AtomicBool::new(false);
-        paste(Mode::Cut, Conflict::Rename, &[src.clone()], &dst, &cancel, noop).unwrap();
+        let pasted = paste(Mode::Cut, Conflict::Rename, std::slice::from_ref(&src), &dst, &cancel, noop);
+        assert!(pasted.error.is_none(), "the move must finish: {:?}", pasted.error);
+        assert_eq!(pasted.landed.len(), 1, "one item landed");
         assert!(!src.exists(), "cut removes the original");
         assert_eq!(fs::read_to_string(dst.join("a.txt")).unwrap(), "existing");
         assert_eq!(fs::read_to_string(dst.join("a (2).txt")).unwrap(), "incoming");
@@ -894,7 +967,8 @@ mod tests {
         let src = dir.join("a.txt");
         fs::write(&src, "new").unwrap();
         let cancel = AtomicBool::new(false);
-        paste(Mode::Copy, Conflict::Overwrite, &[src], &dst, &cancel, noop).unwrap();
+        let pasted = paste(Mode::Copy, Conflict::Overwrite, &[src], &dst, &cancel, noop);
+        assert!(pasted.error.is_none(), "the copy must finish: {:?}", pasted.error);
         assert_eq!(fs::read_to_string(dst.join("a.txt")).unwrap(), "new");
         assert!(!dst.join("a (2).txt").exists());
         let _ = fs::remove_dir_all(&dir);
@@ -906,7 +980,7 @@ mod tests {
         let a = dir.join("a.txt");
         fs::write(&a, "x").unwrap();
         let cancel = AtomicBool::new(false);
-        delete(DeleteMode::Permanent, &[a.clone()], &cancel, noop).unwrap();
+        delete(DeleteMode::Permanent, std::slice::from_ref(&a), &cancel, noop).unwrap();
         assert!(!a.exists());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -931,8 +1005,111 @@ mod tests {
         fs::write(src.join("nested/b.txt"), "deep").unwrap();
         let dst = dir.join("dst");
         let cancel = AtomicBool::new(false);
-        paste(Mode::Copy, Conflict::Rename, &[src], &dst, &cancel, noop).unwrap();
+        let pasted = paste(Mode::Copy, Conflict::Rename, &[src], &dst, &cancel, noop);
+        assert!(pasted.error.is_none(), "the copy must finish: {:?}", pasted.error);
         assert_eq!(fs::read_to_string(dst.join("src/nested/b.txt")).unwrap(), "deep");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A paste that stops part way says what it already moved, so the window can
+    /// put that on the undo stack instead of leaving the folder's birth there.
+    #[test]
+    fn a_paste_that_stops_part_way_reports_what_it_moved() {
+        let dir = scratch("partway");
+        let dst = dir.join("dst");
+        fs::create_dir_all(&dst).unwrap();
+        let first = dir.join("first.txt");
+        fs::write(&first, "one").unwrap();
+        let second = dir.join("second.txt");
+        fs::write(&second, "two").unwrap();
+        let cancel = AtomicBool::new(false);
+        // The destination itself is one of the sources: refused before anything
+        // moves, so no half-done paste to explain.
+        let pasted = paste(Mode::Cut, Conflict::Rename, std::slice::from_ref(&dst), &dst, &cancel, noop);
+        assert!(pasted.landed.is_empty(), "nothing moves when the target is the source");
+        assert_eq!(
+            pasted.error.as_deref(),
+            Some("Cannot paste a folder into itself."),
+            "and it says why"
+        );
+        assert!(dst.is_dir(), "the folder is still there");
+
+        // A cancel in the middle keeps what already landed in the answer.
+        let pasted = paste(Mode::Cut, Conflict::Rename, &[first.clone(), second.clone()], &dst, &cancel, |_| false);
+        assert!(pasted.error.is_none(), "stopping by hand is not a failure");
+        assert!(pasted.landed.is_empty(), "the first report stops the paste before it moves");
+
+        let mut steps = 0;
+        let pasted = paste(Mode::Cut, Conflict::Rename, &[first.clone(), second.clone()], &dst, &cancel, |_| {
+            steps += 1;
+            steps < 2
+        });
+        assert!(pasted.error.is_none(), "stopping by hand is not a failure");
+        assert_eq!(pasted.landed, vec![(first.clone(), dst.join("first.txt"))], "the one that went is named");
+        assert!(dst.join("first.txt").exists() && second.exists(), "and that is the disk's truth");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Replacing keeps what only the destination has: a folder is merged into,
+    /// not deleted and written again.
+    #[test]
+    fn replacing_a_folder_merges_instead_of_deleting_it() {
+        let dir = scratch("merge");
+        let dst = dir.join("dst");
+        let src = dir.join("package");
+        fs::create_dir_all(dst.join("package")).unwrap();
+        fs::write(dst.join("package/only-here.txt"), "keep me").unwrap();
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("shared.txt"), "new").unwrap();
+        let cancel = AtomicBool::new(false);
+        let pasted = paste(Mode::Copy, Conflict::Overwrite, std::slice::from_ref(&src), &dst, &cancel, noop);
+        assert!(pasted.error.is_none(), "the copy must finish: {:?}", pasted.error);
+        assert_eq!(
+            fs::read_to_string(dst.join("package/only-here.txt")).unwrap(),
+            "keep me",
+            "a file only the destination has survives"
+        );
+        assert_eq!(fs::read_to_string(dst.join("package/shared.txt")).unwrap(), "new");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Replacing an item with itself must leave it alone: the copy would read the
+    /// file it had just truncated, so the item came back empty.
+    #[test]
+    fn replacing_an_item_with_itself_leaves_it() {
+        let dir = scratch("self");
+        let folder = dir.join("Presenter");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("index.html"), "<h1>hi</h1>").unwrap();
+        let cancel = AtomicBool::new(false);
+        let pasted = paste(Mode::Copy, Conflict::Overwrite, std::slice::from_ref(&folder), &dir, &cancel, noop);
+        assert_eq!(pasted.error.as_deref(), Some("That item is already here."));
+        assert!(pasted.landed.is_empty(), "nothing was written");
+        assert_eq!(
+            fs::read_to_string(folder.join("index.html")).unwrap(),
+            "<h1>hi</h1>",
+            "the item is untouched"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Keeping both inside the folder an item already lives in still numbers the
+    /// newcomer, for a file and for a folder.
+    #[test]
+    fn keep_both_in_the_same_folder_numbers_the_newcomer() {
+        let dir = scratch("dup");
+        fs::write(dir.join("a.txt"), "one").unwrap();
+        let folder = dir.join("Presenter");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("index.html"), "<h1>hi</h1>").unwrap();
+        let cancel = AtomicBool::new(false);
+        for src in [dir.join("a.txt"), folder.clone()] {
+            let pasted = paste(Mode::Copy, Conflict::Rename, std::slice::from_ref(&src), &dir, &cancel, noop);
+            assert!(pasted.error.is_none(), "the copy must finish: {:?}", pasted.error);
+        }
+        assert_eq!(fs::read_to_string(dir.join("a (2).txt")).unwrap(), "one");
+        assert!(dir.join("Presenter (2)").join("index.html").exists(), "the folder was copied too");
+        assert_eq!(fs::read_to_string(folder.join("index.html")).unwrap(), "<h1>hi</h1>");
         let _ = fs::remove_dir_all(&dir);
     }
 }

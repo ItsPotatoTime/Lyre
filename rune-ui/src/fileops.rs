@@ -310,6 +310,19 @@ fn move_item(
     remove_item(src)
 }
 
+/// Move one item to a full destination path, for the steps of undo and
+/// redo: a rename where it can, a copy across volumes where it cannot.
+/// The destination must be free. A bare rename writes over whatever stands
+/// there on Unix without a word, so an undo could land on a file that took
+/// the place since; what stands there now is never written over.
+pub fn relocate(src: &Path, dst: &Path) -> Result<(), String> {
+    if fs::symlink_metadata(dst).is_ok() {
+        return Err(format!("{} is there already.", dst.display()));
+    }
+    let cancel = AtomicBool::new(false);
+    move_item(src, dst, &cancel, &mut |_| {})
+}
+
 /// Copy or move `sources` into the `target` directory, reporting progress.
 ///
 /// Answers where each item landed, source first, and why it stopped, so a paste
@@ -443,11 +456,16 @@ pub fn paste<F: FnMut(Progress) -> bool>(
     Pasted { landed, error }
 }
 
-/// Copy `pairs` again, source to destination, for a redo of a copy. Destinations
-/// are written fresh, so nothing is merged into what is already there.
+/// Copy `pairs` again, source to destination, for a redo of a copy. A
+/// destination that has been taken since is refused rather than written
+/// over: the redo recreates what the copy made, it does not replace what
+/// is there now.
 pub fn copy_again(pairs: &[(PathBuf, PathBuf)]) -> Result<(), String> {
     let cancel = AtomicBool::new(false);
     for (from, to) in pairs {
+        if fs::symlink_metadata(to).is_ok() {
+            return Err(format!("{} is there already.", to.display()));
+        }
         copy_item(from, to, &cancel, &mut |_| {})?;
     }
     Ok(())
@@ -1110,6 +1128,19 @@ mod tests {
         assert_eq!(fs::read_to_string(dir.join("a (2).txt")).unwrap(), "one");
         assert!(dir.join("Presenter (2)").join("index.html").exists(), "the folder was copied too");
         assert_eq!(fs::read_to_string(folder.join("index.html")).unwrap(), "<h1>hi</h1>");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copying_again_refuses_a_destination_that_was_taken() {
+        let dir = scratch("again");
+        let src = dir.join("src.txt");
+        let dst = dir.join("copy.txt");
+        fs::write(&src, "original").unwrap();
+        fs::write(&dst, "taken since").unwrap();
+        let pairs = vec![(src.clone(), dst.clone())];
+        assert!(copy_again(&pairs).is_err(), "a taken destination is refused");
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "taken since", "and left as it was");
         let _ = fs::remove_dir_all(&dir);
     }
 }

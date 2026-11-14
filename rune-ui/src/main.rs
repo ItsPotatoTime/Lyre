@@ -7890,7 +7890,7 @@ impl Stepped {
 /// Reverse one operation on disk.
 fn take_back(action: &Undo) -> Stepped {
     match action {
-        Undo::Rename { from, to } => match fs::rename(to, from) {
+        Undo::Rename { from, to } => match fileops::relocate(to, from) {
             Ok(()) => Stepped::whole(action),
             Err(e) => Stepped::stopped(action, format!("Could not put the name back: {e}")),
         },
@@ -7925,7 +7925,7 @@ fn take_back(action: &Undo) -> Stepped {
 /// Do one reversed operation again.
 fn put_back(action: &Undo) -> Stepped {
     match action {
-        Undo::Rename { from, to } => match fs::rename(from, to) {
+        Undo::Rename { from, to } => match fileops::relocate(from, to) {
             Ok(()) => Stepped::whole(action),
             Err(e) => Stepped::stopped(action, format!("Could not rename it again: {e}")),
         },
@@ -7961,7 +7961,7 @@ fn step_moved(pairs: Vec<(PathBuf, PathBuf)>, back: bool) -> Stepped {
                 let _ = fs::create_dir_all(parent);
             }
             let said = if back { "Could not move it back" } else { "Could not move it again" };
-            fs::rename(src, dst).map_err(|e| format!("{said}: {e}"))
+            fileops::relocate(src, dst).map_err(|e| format!("{said}: {e}"))
         },
         |pairs| Undo::Moved { pairs },
     )
@@ -11822,6 +11822,35 @@ mod undo_tests {
 
         redo_last(&mut s);
         assert!(dir.join("after.txt").exists(), "redo renamed it again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undoing_a_rename_does_not_write_over_a_newer_file() {
+        let dir = scratch("renameblock");
+        let from = dir.join("a.txt");
+        let to = dir.join("b.txt");
+        std::fs::write(&to, b"renamed").unwrap();
+        std::fs::write(&from, b"newer").unwrap();
+        let stepped = take_back(&Undo::Rename { from: from.clone(), to: to.clone() });
+        assert!(stepped.error.is_some(), "the step refuses rather than overwriting");
+        assert_eq!(std::fs::read_to_string(&from).unwrap(), "newer", "the newer file is untouched");
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "renamed", "the renamed file stays put");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undoing_a_move_does_not_write_over_a_newer_file() {
+        let dir = scratch("moveblock");
+        let from = dir.join("a.txt");
+        let to = dir.join("b.txt");
+        std::fs::write(&to, b"moved").unwrap();
+        std::fs::write(&from, b"newer").unwrap();
+        let action = Undo::Moved { pairs: vec![(from.clone(), to.clone())] };
+        let stepped = take_back(&action);
+        assert!(stepped.error.is_some(), "the step refuses rather than overwriting");
+        assert_eq!(std::fs::read_to_string(&from).unwrap(), "newer", "the newer file is untouched");
+        assert_eq!(std::fs::read_to_string(&to).unwrap(), "moved", "the moved file stays put");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

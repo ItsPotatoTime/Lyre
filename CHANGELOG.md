@@ -4,6 +4,19 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
+## [Unreleased]
+
+### Fixed
+
+- **An update download is capped, and the installer is staged where nothing
+  can be planted.** The download grew in memory without a limit, so a broken
+  or hostile server could fill the machine; it now stops at a size no build
+  of this application approaches. The installer also landed at one fixed
+  name in the shared temporary folder, where a link planted at that name
+  ahead of time would be written through; it is staged at a name unique to
+  the run, created new, so the bytes that were verified are the bytes that
+  run.
+
 ## [0.3.5]
 
 A release for a move that went wrong and took the projects with it: what a paste

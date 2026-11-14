@@ -105,7 +105,29 @@ pub fn download_and_install<F: FnMut(UpdateEvent)>(offer: &Offer, mut on_event: 
         .call()
         .map_err(|e| format!("Could not download the update: {e}"))?;
     let total: Option<u64> = response.header("Content-Length").and_then(|v| v.parse().ok());
-    let mut reader = response.into_reader();
+    let bytes = take_capped(response.into_reader(), MAX_UPDATE_BYTES, total, &mut on_event)?;
+
+    verify(&bytes, &offer.signature)?;
+    on_event(UpdateEvent::Installing);
+    install(&bytes, &offer.url)
+}
+
+/// The largest download an update may be. A build of this application is
+/// tens of megabytes; a response without end is a broken or hostile server
+/// filling memory until the machine gives up, signature or no signature.
+const MAX_UPDATE_BYTES: u64 = 1 << 30;
+
+/// Read a download into memory a chunk at a time, reporting progress, and
+/// stop rather than grow past `cap` bytes.
+fn take_capped(
+    mut reader: impl std::io::Read,
+    cap: u64,
+    total: Option<u64>,
+    on_event: &mut impl FnMut(UpdateEvent),
+) -> Result<Vec<u8>, String> {
+    if total.is_some_and(|declared| declared > cap) {
+        return Err("The update is larger than any build of this application; refusing it.".into());
+    }
     let mut bytes: Vec<u8> = Vec::new();
     let mut buffer = [0u8; 65536];
     loop {
@@ -114,12 +136,45 @@ pub fn download_and_install<F: FnMut(UpdateEvent)>(offer: &Offer, mut on_event: 
             break;
         }
         bytes.extend_from_slice(&buffer[..read]);
+        if bytes.len() as u64 > cap {
+            return Err(
+                "The update download did not end where a build of this application ends; refusing it."
+                    .into(),
+            );
+        }
         on_event(UpdateEvent::Progress { downloaded: bytes.len() as u64, total });
     }
+    Ok(bytes)
+}
 
-    verify(&bytes, &offer.signature)?;
-    on_event(UpdateEvent::Installing);
-    install(&bytes, &offer.url)
+/// Write bytes to a temporary file no one else can have named first, and
+/// return its path. The installer used to land at one fixed name in the
+/// shared temporary folder, where anything running as this user could plant
+/// a link at that name ahead of time and have the verified bytes written
+/// through it somewhere else. The name is unique to this call and opened
+/// with `create_new`, which refuses a path that already stands, link or
+/// not, so the bytes that were verified are the bytes handed over.
+#[cfg_attr(not(any(target_os = "windows", target_os = "macos")), allow(dead_code))]
+fn stage_temp(bytes: &[u8], leaf: &str) -> Result<std::path::PathBuf, String> {
+    use std::io::Write as _;
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let dir = std::env::temp_dir();
+    for _ in 0..100 {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = dir.join(format!("lyre-update-{}-{n}-{leaf}", std::process::id()));
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(mut file) => {
+                if let Err(e) = file.write_all(bytes) {
+                    let _ = std::fs::remove_file(&path);
+                    return Err(format!("Could not stage the update: {e}"));
+                }
+                return Ok(path);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("Could not stage the update: {e}")),
+        }
+    }
+    Err("Could not find a free name for the update in the temporary folder.".into())
 }
 
 /// Nothing installs that the project key does not vouch for.
@@ -197,8 +252,7 @@ fn replace_beside(target: &std::path::Path, bytes: &[u8]) -> Result<(), String> 
 /// Write the installer somewhere temporary and hand it to the platform.
 #[cfg(target_os = "windows")]
 fn install(bytes: &[u8], _url: &str) -> Result<(), String> {
-    let path = std::env::temp_dir().join("lyre-update.exe");
-    std::fs::write(&path, bytes).map_err(|e| format!("Could not stage the installer: {e}"))?;
+    let path = stage_temp(bytes, "installer.exe")?;
     std::process::Command::new(&path)
         .spawn()
         .map_err(|e| format!("Could not run the installer: {e}"))?;
@@ -217,8 +271,7 @@ fn install(bytes: &[u8], _url: &str) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 fn install(bytes: &[u8], url: &str) -> Result<(), String> {
     let ext = if url.ends_with(".dmg") { "dmg" } else { "tar.gz" };
-    let path = std::env::temp_dir().join(format!("lyre-update.{ext}"));
-    std::fs::write(&path, bytes).map_err(|e| format!("Could not stage the update: {e}"))?;
+    let path = stage_temp(bytes, &format!("update.{ext}"))?;
     std::process::Command::new("open")
         .arg(&path)
         .spawn()
@@ -266,6 +319,43 @@ mod tests {
         let text = String::from_utf8_lossy(&decoded);
         assert!(text.starts_with("untrusted comment: minisign public key:"));
         assert!(text.lines().nth(1).is_some_and(|line| line.starts_with("RW")));
+    }
+
+    #[test]
+    fn a_download_past_the_cap_is_refused() {
+        let data = vec![7u8; 100];
+        let mut events = |_| {};
+        assert!(take_capped(&data[..], 50, None, &mut events).is_err(), "a stream past the cap is refused");
+        assert!(
+            take_capped(&data[..], 50, Some(51), &mut events).is_err(),
+            "a declared length past the cap is refused up front"
+        );
+        let taken = take_capped(&data[..], 100, Some(100), &mut events).expect("a download at the cap is taken");
+        assert_eq!(taken, data);
+    }
+
+    #[test]
+    fn a_staged_update_never_follows_a_planted_link() {
+        let dir = std::env::temp_dir();
+        let victim = dir.join(format!("lyre-update-victim-{}", std::process::id()));
+        std::fs::write(&victim, b"do not touch").unwrap();
+        let mut planted = Vec::new();
+        #[cfg(unix)]
+        for n in 0..64 {
+            let candidate = dir.join(format!("lyre-update-{}-{n}-installer.exe", std::process::id()));
+            if std::os::unix::fs::symlink(&victim, &candidate).is_ok() {
+                planted.push(candidate);
+            }
+        }
+        let staged = stage_temp(b"the verified bytes", "installer.exe").expect("staging succeeds");
+        assert!(!planted.contains(&staged), "the staged file got a name of its own");
+        assert_eq!(std::fs::read(&staged).unwrap(), b"the verified bytes");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"do not touch", "nothing was written through a link");
+        let _ = std::fs::remove_file(&staged);
+        let _ = std::fs::remove_file(&victim);
+        for path in planted {
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[test]

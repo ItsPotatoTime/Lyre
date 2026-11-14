@@ -205,13 +205,25 @@ fn install(bytes: &[u8], _url: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The file an update replaces: the `.AppImage` file `APPIMAGE` names when
+/// running inside one, else the executable itself. Inside an AppImage the
+/// running binary is AppRun on a read-only mount, so replacing the
+/// executable would replace nothing the person can launch, and fail besides.
+#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(dead_code))]
+fn update_target(appimage: Option<std::ffi::OsString>, exe: std::path::PathBuf) -> std::path::PathBuf {
+    match appimage {
+        Some(path) if !path.is_empty() => std::path::PathBuf::from(path),
+        _ => exe,
+    }
+}
+
 #[cfg(all(unix, not(target_os = "macos")))]
 fn install(bytes: &[u8], _url: &str) -> Result<(), String> {
     // An AppImage replaces itself. It cannot be written over directly, because it
     // is the file being executed, so it is staged beside and renamed into place.
     let exe = std::env::current_exe()
         .map_err(|e| format!("Could not locate this application: {e}"))?;
-    replace_beside(&exe, bytes)
+    replace_beside(&update_target(std::env::var_os("APPIMAGE"), exe), bytes)
 }
 
 #[cfg(target_os = "macos")]
@@ -266,6 +278,23 @@ mod tests {
         let text = String::from_utf8_lossy(&decoded);
         assert!(text.starts_with("untrusted comment: minisign public key:"));
         assert!(text.lines().nth(1).is_some_and(|line| line.starts_with("RW")));
+    }
+
+    #[test]
+    fn an_update_replaces_the_appimage_it_runs_from() {
+        let exe = std::path::PathBuf::from("/mount/AppRun");
+        let image = std::ffi::OsString::from("/home/user/Apps/Lyre.AppImage");
+        assert_eq!(
+            update_target(Some(image), exe.clone()),
+            std::path::PathBuf::from("/home/user/Apps/Lyre.AppImage"),
+            "the .AppImage file is replaced, not AppRun inside the mount"
+        );
+        assert_eq!(update_target(None, exe.clone()), exe, "outside an AppImage the executable is replaced");
+        assert_eq!(
+            update_target(Some(std::ffi::OsString::new()), exe.clone()),
+            exe,
+            "an empty APPIMAGE names nothing"
+        );
     }
 
     #[test]

@@ -4,6 +4,16 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
+## [Unreleased]
+
+### Fixed
+
+- **The folder watcher can no longer die at a poll deadline.** The fallback
+  poll slept for the smaller of a slice and the time left to its deadline,
+  computed from a second clock read after the check; a thread preempted
+  between the two woke past the deadline and panicked on the subtraction,
+  ending live refresh for that folder. The wait now saturates at zero.
+
 ## [0.3.5]
 
 A release for a move that went wrong and took the projects with it: what a paste

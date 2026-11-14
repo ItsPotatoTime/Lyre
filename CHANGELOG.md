@@ -4,6 +4,17 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
+## [Unreleased]
+
+### Fixed
+
+- **Undo and redo no longer write over a file that took the place.** Putting a
+  renamed or moved item back used a bare rename, which on Unix replaces
+  whatever now stands at the old path in silence, and the same applied to
+  copying a file again. The steps now refuse when the destination is occupied,
+  saying so and leaving both files as they are, and a step across volumes falls
+  back to copying instead of failing where a rename cannot cross.
+
 ## [0.3.5]
 
 A release for a move that went wrong and took the projects with it: what a paste

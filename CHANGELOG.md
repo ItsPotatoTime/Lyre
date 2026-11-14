@@ -4,6 +4,16 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
+## [Unreleased]
+
+### Fixed
+
+- **A keep-both name is always found.** Finding a free "name (2)" style
+  destination gave up after 9,999 taken names and returned the colliding
+  path itself, so a keep-both paste would write over the item it was
+  keeping, and a delete would replace the copy already in the trash.
+  Numbering now continues past that point instead of falling back.
+
 ## [0.3.5]
 
 A release for a move that went wrong and took the projects with it: what a paste

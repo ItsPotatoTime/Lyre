@@ -4,6 +4,17 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
+## [Unreleased]
+
+### Fixed
+
+- **Deep search respects the hidden and system marks.** The recursive and
+  cached searches filtered hidden files by name alone, so on Windows a file
+  marked hidden or system in its attributes, with an ordinary name, was
+  offered as a result while "show hidden" was off. A match is now checked
+  against its attributes once described, under the same rule as the folder
+  on screen.
+
 ## [0.3.5]
 
 A release for a move that went wrong and took the projects with it: what a paste

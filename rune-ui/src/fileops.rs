@@ -64,7 +64,22 @@ pub fn free_path(dst: &Path) -> PathBuf {
             return candidate;
         }
     }
-    dst.to_path_buf()
+    // Every numbered name is taken. The fallback used to be the colliding
+    // path itself, so a keep-both paste wrote over the item it was keeping
+    // and a delete replaced the copy already in the trash. Keep numbering
+    // instead, from a counter no other call in this process reuses, so the
+    // first free number is the answer.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(10_000);
+    loop {
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = match &ext {
+            Some(ext) => parent.join(format!("{stem} ({n}){ext}")),
+            None => parent.join(format!("{stem} ({n})")),
+        };
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
 }
 
 /// How deep a walk follows folders. A link that points back at a folder above
@@ -1110,6 +1125,20 @@ mod tests {
         assert_eq!(fs::read_to_string(dir.join("a (2).txt")).unwrap(), "one");
         assert!(dir.join("Presenter (2)").join("index.html").exists(), "the folder was copied too");
         assert_eq!(fs::read_to_string(folder.join("index.html")).unwrap(), "<h1>hi</h1>");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_free_path_never_falls_back_to_the_taken_one() {
+        let dir = scratch("full");
+        let dst = dir.join("a.txt");
+        fs::write(&dst, "taken").unwrap();
+        for n in 2..10_000 {
+            fs::write(dir.join(format!("a ({n}).txt")), "").unwrap();
+        }
+        let free = free_path(&dst);
+        assert_ne!(free, dst, "the taken path itself is never the answer");
+        assert!(!free.exists(), "the answer is free: {}", free.display());
         let _ = fs::remove_dir_all(&dir);
     }
 }

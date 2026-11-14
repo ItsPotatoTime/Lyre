@@ -75,7 +75,7 @@ Shipped in 0.1.0 and 0.2.0:
 - On Windows: folder-handler registration, Win+E, and a signed self-updater.
 
 Deliberately not implemented, and said so in the interface rather than failing silently:
-sharing, searching inside file contents rather than by name, undo history, a second
+sharing, searching inside file contents rather than by name, a second
 window, and tab persistence. The current list is in `README.md` under "Status".
 
 Constraints:

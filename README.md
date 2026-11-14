@@ -78,8 +78,7 @@ Releases carry an installer for every platform, built by
 Arch users can build from the PKGBUILDs in
 [packaging/aur](packaging/aur) until the packages are in the AUR, after which it
 is `paru -S lyre-bin` (the prebuilt release) or `paru -S lyre` (from source). A
-Flatpak manifest lives in [flatpak](flatpak/app.lyre.files.yml) but is not
-published yet.
+Flatpak manifest is planned, but it is not in the tree yet.
 
 Nothing is signed, so Windows SmartScreen and macOS Gatekeeper each ask once.
 Per-platform detail, the AUR submission steps and the release procedure are in
@@ -174,8 +173,8 @@ bun buildit --rune # release build for whichever OS is running it
 
 `bun buildit --rune` writes `rune-ui/target/release/lyre-rune`. The release
 workflow builds the same binary on each platform and packages it: an NSIS setup
-on Windows, an AppImage on Linux, a universal `.app` on macOS. Flags are in
-[docs/building.md](docs/building.md).
+on Windows, an AppImage on Linux, a universal `.app` on macOS. The build
+flags are documented in the usage comment at the top of `scripts/buildit.ts`.
 
 The earlier Tauri application that used to live in `src/` and `src-tauri/` has
 been removed, now that the Rune crate is what ships. It remains in git history.

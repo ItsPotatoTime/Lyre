@@ -59,16 +59,9 @@ for what has to happen before they exist there.
 
 ### Flatpak
 
-Not published yet, because it has not been built and installed once. The manifest
-is in [flatpak/app.lyre.files.yml](../flatpak/app.lyre.files.yml) and can be
-built locally, which needs `flatpak-builder` and about a gigabyte of runtime:
-
-```bash
-flatpak install flathub org.gnome.Platform//44 org.gnome.Sdk//44 \
-    org.freedesktop.Sdk.Extension.rust-stable//44
-flatpak-builder --user --install --force-clean build-dir flatpak/app.lyre.files.yml
-flatpak run app.lyre.files
-```
+Not published yet, and the manifest is not in the tree yet, so there is
+nothing to build from here. This section returns, with the build commands,
+when the manifest lands.
 
 ## Windows
 

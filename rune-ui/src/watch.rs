@@ -170,7 +170,9 @@ fn poll_fallback(
             if stop.load(Ordering::Acquire) {
                 return;
             }
-            std::thread::sleep(Duration::from_millis(100).min(deadline - Instant::now()));
+            std::thread::sleep(
+                Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+            );
         }
         let current = fingerprint(path);
         if current != last {

@@ -117,6 +117,15 @@ fn copy_at(
     if depth > MAX_DEPTH {
         return Err(format!("{}: the folders nest too deeply to copy", src.display()));
     }
+    // A link at the top of a copy is copied as a link, like the ones inside a
+    // folder below; following it with metadata alone would copy whatever it
+    // points at and call that the copy.
+    if fs::symlink_metadata(src)
+        .map(|meta| meta.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return copy_link(src, dst);
+    }
     let meta = fs::metadata(src).map_err(|e| format!("{}: {e}", src.display()))?;
     if meta.is_dir() {
         fs::create_dir_all(dst).map_err(|e| format!("{}: {e}", dst.display()))?;
@@ -325,7 +334,11 @@ impl Pasted {
     }
 }
 
-/// One item of a paste: where it landed, or why it did not go.
+/// One item of a paste: where it landed, or why it did not go. A failure
+/// also names the destination when this paste created it and the copy
+/// stopped part way, so the caller can record the partial item for undo;
+/// a destination that already stood there is never part of that record,
+/// because a merge into it must be left alone.
 fn paste_one(
     mode: Mode,
     conflict: Conflict,
@@ -333,12 +346,20 @@ fn paste_one(
     target: &Path,
     cancel: &AtomicBool,
     report: &mut dyn FnMut(u64),
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, (String, Option<PathBuf>)> {
     let name = name_of(src);
     let mut dst = target.join(&name);
-    // Never paste a folder into itself.
+    // Never paste a folder into itself. The lexical check misses a link: a
+    // symlink to a folder pasted into the folder it points at lands inside
+    // its own target, so the resolved paths are compared too.
     if src.is_dir() && dst.starts_with(src) && dst != src {
-        return Err("Cannot paste a folder into itself.".into());
+        return Err(("Cannot paste a folder into itself.".into(), None));
+    }
+    if let (Ok(src_real), Ok(target_real)) = (fs::canonicalize(src), fs::canonicalize(target)) {
+        let dst_real = target_real.join(&name);
+        if src_real.is_dir() && dst_real.starts_with(&src_real) && dst_real != src_real {
+            return Err(("Cannot paste a folder into itself.".into(), None));
+        }
     }
     if dst.exists() {
         match conflict {
@@ -348,7 +369,7 @@ fn paste_one(
                 // Everything else merges, so what is only in the destination
                 // survives and only the names in both are written over.
                 if dst.is_dir() != src.is_dir() {
-                    remove_item(&dst)?;
+                    remove_item(&dst).map_err(|e| (e, None))?;
                 }
             }
         }
@@ -356,13 +377,17 @@ fn paste_one(
     // Settled after the conflict: a copy read from the file it is writing leaves
     // it empty, so an item is never written over itself.
     if dst == src {
-        return Err("That item is already here.".into());
+        return Err(("That item is already here.".into(), None));
     }
-    match mode {
-        Mode::Copy => copy_item(src, &dst, cancel, report)?,
-        Mode::Cut => move_item(src, &dst, cancel, report)?,
+    let stood_there = dst.exists();
+    let outcome = match mode {
+        Mode::Copy => copy_item(src, &dst, cancel, report),
+        Mode::Cut => move_item(src, &dst, cancel, report),
+    };
+    match outcome {
+        Ok(()) => Ok(dst),
+        Err(e) => Err((e, (!stood_there && dst.exists()).then(|| dst.clone()))),
     }
-    Ok(dst)
 }
 
 pub fn paste<F: FnMut(Progress) -> bool>(
@@ -413,6 +438,9 @@ pub fn paste<F: FnMut(Progress) -> bool>(
         if !emit(Progress { done: i, total, name: name.clone(), done_bytes, total_bytes }) {
             break;
         }
+        // Measured before the item goes: after a cut the source is gone, and
+        // its size read then is zero, so a move's progress never added up.
+        let size = item_size(src);
         let outcome = {
             let mut report = |add: u64| {
                 done_bytes += add;
@@ -429,12 +457,18 @@ pub fn paste<F: FnMut(Progress) -> bool>(
         match outcome {
             Ok(dst) => {
                 // A rename moves bytes without copying them; credit them at the end.
-                completed += item_size(src);
+                completed += size;
                 done_bytes = done_bytes.max(completed);
                 landed.push((src.clone(), dst));
                 emit(Progress { done: i + 1, total, name, done_bytes, total_bytes });
             }
-            Err(e) => {
+            Err((e, partial)) => {
+                // A destination this paste created and then stopped inside is
+                // part of what the paste did: recording it lets undo take the
+                // partial copy back instead of leaving it behind.
+                if let Some(dst) = partial {
+                    landed.push((src.clone(), dst));
+                }
                 error = Some(e);
                 break;
             }
@@ -1110,6 +1144,90 @@ mod tests {
         assert_eq!(fs::read_to_string(dir.join("a (2).txt")).unwrap(), "one");
         assert!(dir.join("Presenter (2)").join("index.html").exists(), "the folder was copied too");
         assert_eq!(fs::read_to_string(folder.join("index.html")).unwrap(), "<h1>hi</h1>");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A copy that stops inside a folder records the partial destination it
+    /// created, so undo can take it back instead of leaving it behind.
+    #[test]
+    fn a_stopped_copy_records_the_partial_folder() {
+        let dir = scratch("partial");
+        let src = dir.join("deep");
+        let mut deep = src.clone();
+        fs::create_dir_all(&deep).unwrap();
+        // Nest past the copy depth limit so the copy stops part way in.
+        for _ in 0..520 {
+            deep = deep.join("d");
+            fs::create_dir_all(&deep).unwrap();
+        }
+        let out = dir.join("out");
+        fs::create_dir_all(&out).unwrap();
+        let cancel = AtomicBool::new(false);
+        let pasted = paste(Mode::Copy, Conflict::Rename, std::slice::from_ref(&src), &out, &cancel, noop);
+        assert!(pasted.error.is_some(), "the copy stops at the depth limit");
+        assert_eq!(pasted.landed.len(), 1, "the partial folder is recorded for undo");
+        assert_eq!(pasted.landed[0].1, out.join("deep"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A link pasted on its own is copied as a link, like the ones inside a
+    /// copied folder, not as the contents of what it points at.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_pasted_alone_is_copied_as_a_link() {
+        let dir = scratch("toplink");
+        let real = dir.join("real.txt");
+        fs::write(&real, "contents").unwrap();
+        let link = dir.join("link.txt");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let out = dir.join("out");
+        fs::create_dir_all(&out).unwrap();
+        let cancel = AtomicBool::new(false);
+        let pasted = paste(Mode::Copy, Conflict::Rename, std::slice::from_ref(&link), &out, &cancel, noop);
+        assert!(pasted.error.is_none(), "the paste must finish: {:?}", pasted.error);
+        let landed = out.join("link.txt");
+        let meta = fs::symlink_metadata(&landed).unwrap();
+        assert!(meta.file_type().is_symlink(), "the copy is a link, not the target's contents");
+        assert_eq!(fs::read_link(&landed).unwrap(), real);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A folder cannot be pasted into itself through a link to it either:
+    /// the lexical guard cannot see it, so the resolved paths decide.
+    #[cfg(unix)]
+    #[test]
+    fn pasting_a_link_into_its_own_target_is_refused() {
+        let dir = scratch("selflink");
+        let folder = dir.join("folder");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("a.txt"), "one").unwrap();
+        let link = dir.join("shortcut");
+        std::os::unix::fs::symlink(&folder, &link).unwrap();
+        let cancel = AtomicBool::new(false);
+        let pasted = paste(Mode::Copy, Conflict::Rename, std::slice::from_ref(&link), &folder, &cancel, noop);
+        assert_eq!(pasted.error.as_deref(), Some("Cannot paste a folder into itself."));
+        assert!(pasted.landed.is_empty(), "nothing was written");
+        assert!(!folder.join("shortcut").exists(), "nothing landed in the target");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A move's progress counts the item that went: its size is read before
+    /// it moves, because afterwards the source is gone and reads as zero.
+    #[test]
+    fn a_moves_progress_reaches_the_total() {
+        let dir = scratch("movecount");
+        let file = dir.join("a.txt");
+        fs::write(&file, "12345").unwrap();
+        let out = dir.join("out");
+        fs::create_dir_all(&out).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut last_done_bytes = 0u64;
+        let pasted = paste(Mode::Cut, Conflict::Rename, std::slice::from_ref(&file), &out, &cancel, |p| {
+            last_done_bytes = p.done_bytes;
+            true
+        });
+        assert!(pasted.error.is_none(), "the move must finish: {:?}", pasted.error);
+        assert_eq!(last_done_bytes, 5, "the moved bytes are credited");
         let _ = fs::remove_dir_all(&dir);
     }
 }

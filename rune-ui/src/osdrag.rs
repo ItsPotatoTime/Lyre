@@ -60,6 +60,8 @@ pub fn sender() -> Option<std::sync::mpsc::Sender<OsDragMsg>> {
 static NEXT_ROOT: AtomicU64 = AtomicU64::new(0);
 const PREFIX: &str = "lyre-drop-";
 const MAX_STAGED_ITEMS: usize = 4096;
+/// The deepest a staged folder may nest, matching fileops' copy guard.
+const MAX_SNAPSHOT_DEPTH: usize = 512;
 
 /// Whether a path is ephemeral: any source under the system temp directory may
 /// be deleted by its drag source as soon as the drop ends.
@@ -92,22 +94,36 @@ pub fn stage(paths: &[PathBuf]) -> Vec<PathBuf> {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("item"));
         let dst = root.join(name);
-        if snapshot(path, &dst, &mut budget) {
+        if snapshot(path, &dst, &mut budget, 0) {
             out.push(dst);
         }
     }
     out
 }
 
-fn snapshot(src: &Path, dst: &Path, budget: &mut usize) -> bool {
-    if *budget == 0 {
+fn snapshot(src: &Path, dst: &Path, budget: &mut usize, depth: usize) -> bool {
+    if *budget == 0 || depth > MAX_SNAPSHOT_DEPTH {
         return false;
     }
     *budget -= 1;
-    let meta = match std::fs::metadata(src) {
+    // symlink_metadata, not metadata: a link is staged as the file it points
+    // at and never walked through. Following one with metadata would recurse
+    // into a junction that points back up the tree until the stack or the
+    // budget gave out; fileops guards its copy against exactly this.
+    let meta = match std::fs::symlink_metadata(src) {
         Ok(m) => m,
         Err(_) => return false,
     };
+    if meta.file_type().is_symlink() {
+        let Ok(target) = std::fs::metadata(src) else { return false };
+        if !target.is_file() {
+            return false;
+        }
+        if let Some(parent) = dst.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        return std::fs::copy(src, dst).is_ok();
+    }
     if meta.is_dir() {
         if std::fs::create_dir_all(dst).is_err() {
             return false;
@@ -115,7 +131,7 @@ fn snapshot(src: &Path, dst: &Path, budget: &mut usize) -> bool {
         let Ok(reader) = std::fs::read_dir(src) else { return false };
         for item in reader.flatten() {
             let name = item.file_name();
-            snapshot(&item.path(), &dst.join(name), budget);
+            snapshot(&item.path(), &dst.join(name), budget, depth + 1);
         }
         true
     } else {
@@ -173,7 +189,7 @@ pub fn sweep_stale() {
 pub mod win {
     use super::{DragPreview, OsDragMsg, OsDrop, stage};
     use std::ffi::c_void;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::mpsc::Sender;
 
@@ -526,6 +542,28 @@ pub mod win {
         out
     }
 
+    /// Where a virtual member lands inside the staging folder. A member name
+    /// comes from the drag source, which is another application, so it is
+    /// untrusted: the path is rebuilt from plain name components only, and a
+    /// name carrying a parent step, a root, or a drive is refused outright
+    /// rather than trimmed into a shape that might still escape the folder.
+    fn staged_member_path(root: &Path, name: &str) -> Option<PathBuf> {
+        use std::path::Component;
+        let mut dst = root.to_path_buf();
+        let mut parts = 0usize;
+        for component in Path::new(name).components() {
+            match component {
+                Component::Normal(part) => {
+                    dst.push(part);
+                    parts += 1;
+                }
+                Component::CurDir => {}
+                _ => return None,
+            }
+        }
+        (parts > 0).then_some(dst)
+    }
+
     /// Every path or virtual member the source offers, extracted in full.
     unsafe fn collect(data: *mut c_void, descriptor: u16, contents: u16) -> Vec<PathBuf> {
         unsafe {
@@ -559,8 +597,7 @@ pub mod win {
             ));
             let mut out = Vec::new();
             for (i, name) in names.iter().enumerate() {
-                let name = name.replace('/', "\\");
-                let dst = root.join(name.trim_start_matches('\\'));
+                let Some(dst) = staged_member_path(&root, name) else { continue };
                 let Some(stream_medium) = get_medium(data, contents, i as i32, TYMED_ISTREAM) else { continue };
                 let stream = stream_medium.data as *mut *const StreamVtable;
                 if let Some(parent) = dst.parent() {
@@ -571,11 +608,18 @@ pub mod win {
                 loop {
                     let mut read = 0u32;
                     let hr = ((*(*stream)).read)(stream as *mut c_void, buf.as_mut_ptr().cast(), buf.len() as u32, &mut read);
-                    if hr != S_OK || read == 0 {
-                        break;
+                    if read > 0 {
+                        use std::io::Write;
+                        if file.write_all(&buf[..read as usize]).is_err() {
+                            break;
+                        }
                     }
-                    use std::io::Write;
-                    if file.write_all(&buf[..read as usize]).is_err() {
+                    // S_OK means a full buffer with more behind it. The final,
+                    // partial read reports S_FALSE with its byte count set, and
+                    // those bytes are written above before the loop stops;
+                    // breaking on the status first would lose the tail of
+                    // nearly every virtual file.
+                    if hr != S_OK || read == 0 {
                         break;
                     }
                 }

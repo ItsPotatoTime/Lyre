@@ -4,6 +4,24 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
+## [Unreleased]
+
+### Fixed
+
+- **Files dragged out of mail clients and archivers arrive whole.** A virtual
+  file's final read reports a partial success rather than success, and the
+  staging loop stopped before writing those bytes, so a small attachment
+  landed empty and a larger one was cut at a 64 KB boundary. The bytes a
+  read delivers are written before its status decides whether to continue.
+
+- **A dragged member cannot name a path outside the staging folder.** Member
+  names come from the drag source, another application, and were joined onto
+  the staging folder nearly as given, so a name with parent steps or a drive
+  in it wrote wherever it named. Member paths are rebuilt from plain name
+  components now, and a name carrying anything else is refused. A staged
+  folder's links are also never walked through any more, the guard the copy
+  path already had.
+
 ## [0.3.5]
 
 A release for a move that went wrong and took the projects with it: what a paste

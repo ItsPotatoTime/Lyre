@@ -4,6 +4,17 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
+## [Unreleased]
+
+### Fixed
+
+- **Redoing a delete keeps the new deletion's record.** Doing a delete again
+  after taking it back kept the first deletion's trash records for the undo
+  that follows. Those name a stay in the trash that has already ended, and on
+  Windows an old record stops matching its bin entry soon enough that the
+  next undo would report the item gone. The record the new deletion makes is
+  the one kept now.
+
 ## [0.3.5]
 
 A release for a move that went wrong and took the projects with it: what a paste

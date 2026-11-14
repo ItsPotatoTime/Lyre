@@ -4,6 +4,16 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
+## [Unreleased]
+
+### Fixed
+
+- **A Linux self-update replaces the `.AppImage` file.** The update replaced
+  the running executable, which inside an AppImage is AppRun on the read-only
+  mounted image, not the `.AppImage` file that gets launched. The file the
+  `APPIMAGE` variable names is replaced now, so an updated copy is the one
+  that opens next time.
+
 ## [0.3.5]
 
 A release for a move that went wrong and took the projects with it: what a paste

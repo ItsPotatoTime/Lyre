@@ -235,7 +235,12 @@ fn restore_one(item: &Trashed) -> Result<(), String> {
     if let Some(parent) = item.original.parent() {
         let _ = fs::create_dir_all(parent);
     }
-    fs::rename(trashed, &item.original).map_err(|e| format!("Could not take it out of the trash: {e}"))?;
+    // The trash lives on the home volume, so an item deleted from another
+    // volume (a stick, a second drive, a tmpfs) cannot be renamed back: the
+    // move falls back to copying, the same one that took it there.
+    let cancel = AtomicBool::new(false);
+    move_item(trashed, &item.original, &cancel, &mut |_| {})
+        .map_err(|e| format!("Could not take it out of the trash: {e}"))?;
     let _ = fs::remove_file(info);
     Ok(())
 }

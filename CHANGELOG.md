@@ -4,6 +4,16 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
+## [Unreleased]
+
+### Fixed
+
+- **Taking a deletion back works across volumes.** The trash lives on the
+  home volume, and putting an item back renamed it, which the system refuses
+  across volumes; an item deleted from a stick, a second drive, or a tmpfs
+  could be trashed but never restored. The restore now moves the item the
+  same way the delete did, copying when a rename cannot cross.
+
 ## [0.3.5]
 
 A release for a move that went wrong and took the projects with it: what a paste

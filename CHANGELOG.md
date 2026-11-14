@@ -4,6 +4,17 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
+## [Unreleased]
+
+### Fixed
+
+- **A match in the folder on screen shows once.** Recursive search scored the
+  current folder's entries in the local pass and again in the walk, so each of
+  its matches appeared twice in the results and was counted twice; an answer
+  served from the name cache did the same. The walk still reads the folder
+  (its subfolders are walked and its names are cached) but leaves scoring it
+  to the local pass, and the cache leaves its names alone too.
+
 ## [0.3.5]
 
 A release for a move that went wrong and took the projects with it: what a paste

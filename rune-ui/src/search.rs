@@ -221,10 +221,11 @@ pub fn search<F: FnMut(Event) -> bool>(req: &Request, cancel: &AtomicBool, mut e
         && needle.chars().count() >= 2
         && let Some(cache) = &req.cache
     {
-        let (hits, matched) = filter_cache(cache, &pattern, &needle_bytes, req.show_hidden);
+        let (hits, matched) = filter_cache(cache, &pattern, &needle_bytes, req.show_hidden, &req.path, !req.local.is_empty());
         if !hits.is_empty() && !emit(Event::Batch { items: hits, scanned: cache.len() }) {
             return;
         }
+        let matched = matched + matched_local;
         let _ = emit(Event::Done {
             matched,
             scanned: cache.len(),
@@ -246,7 +247,7 @@ pub fn search<F: FnMut(Event) -> bool>(req: &Request, cancel: &AtomicBool, mut e
         return;
     }
 
-    let outcome = walk(&folded_needle, Path::new(&req.path), req.show_hidden, cancel, matched_local, laid_out, &mut emit);
+    let outcome = walk(&folded_needle, Path::new(&req.path), req.show_hidden, !req.local.is_empty(), cancel, matched_local, laid_out, &mut emit);
     let _ = emit(Event::Done {
         matched: outcome.matched,
         scanned: outcome.scanned,
@@ -353,6 +354,9 @@ struct Walk {
     names: std::sync::Mutex<Vec<(u32, Box<str>, bool)>>,
     /// The cap was passed, so this walk's names cannot be used as an index.
     overflow: AtomicBool,
+    /// The caller supplied the folder's entries, so the local pass owns the
+    /// root's matches and the walk leaves scoring them alone.
+    cover_root: bool,
 }
 
 /// One worker's private matching state, so no lock is needed to score a name.
@@ -419,6 +423,7 @@ fn walk<F: FnMut(Event) -> bool>(
     query: &str,
     root: &Path,
     show_hidden: bool,
+    cover_root: bool,
     cancel: &AtomicBool,
     matched_so_far: usize,
     scanned_so_far: usize,
@@ -441,6 +446,7 @@ fn walk<F: FnMut(Event) -> bool>(
         dirs: std::sync::Mutex::new(Vec::new()),
         names: std::sync::Mutex::new(Vec::new()),
         overflow: AtomicBool::new(false),
+        cover_root,
     });
 
     let (tx, rx) = mpsc::channel::<Vec<Hit>>();
@@ -560,49 +566,56 @@ fn work(
                     flush_cached(shared, &mut scratch.cached);
                 }
             }
-            let Some(score) = score_name(
-                &scratch.pattern,
-                &scratch.needle,
-                &name,
-                &mut scratch.folded,
-                &mut scratch.buf,
-                &mut scratch.matcher,
-            ) else {
-                continue;
-            };
-            shared.matched.fetch_add(1, Ordering::Relaxed);
-            let accepted_now = shared.accepted.load(Ordering::Relaxed);
-            if matched_so_far + accepted_now < LIMIT {
-                // Same shortcut as scoring: an ASCII name needs no folded copy.
-                let hay = if name.is_ascii() {
-                    name.as_ref()
-                } else {
-                    fold_into(&name, &mut scratch.folded);
-                    scratch.folded.as_str()
-                };
-                let mut indices = Vec::new();
-                scratch.pattern.indices(
-                    Utf32Str::new(hay, &mut scratch.buf),
+            // When the caller supplied the folder's entries, the local pass
+            // already scored and showed them, so scoring the root's entries
+            // again here would show every one of its matches twice and count
+            // them twice. Its names still go into the cache above, and its
+            // subfolders are still queued below. With no snapshot supplied
+            // the walk answers for the root as well.
+            if (depth > 0 || !shared.cover_root)
+                && let Some(score) = score_name(
+                    &scratch.pattern,
+                    &scratch.needle,
+                    &name,
+                    &mut scratch.folded,
+                    &mut scratch.buf,
                     &mut scratch.matcher,
-                    &mut indices,
-                );
-                indices.sort_unstable();
-                indices.dedup();
-                if let Some(entry) = describe(name.into_owned(), item.path(), is_dir) {
-                    shared.accepted.fetch_add(1, Ordering::Relaxed);
-                    scratch.batch.push(Hit { entry, score, indices });
-                }
-            }
-            if scratch.batch.len() >= BATCH_ITEMS
-                || scratch.last_flush.elapsed().as_millis() as u64 >= BATCH_MS
+                )
             {
-                if !scratch.batch.is_empty()
-                    && tx.send(std::mem::take(&mut scratch.batch)).is_err()
-                {
-                    shared.cancel.store(true, Ordering::Relaxed);
-                    break;
+                shared.matched.fetch_add(1, Ordering::Relaxed);
+                let accepted_now = shared.accepted.load(Ordering::Relaxed);
+                if matched_so_far + accepted_now < LIMIT {
+                    // Same shortcut as scoring: an ASCII name needs no folded copy.
+                    let hay = if name.is_ascii() {
+                        name.as_ref()
+                    } else {
+                        fold_into(&name, &mut scratch.folded);
+                        scratch.folded.as_str()
+                    };
+                    let mut indices = Vec::new();
+                    scratch.pattern.indices(
+                        Utf32Str::new(hay, &mut scratch.buf),
+                        &mut scratch.matcher,
+                        &mut indices,
+                    );
+                    indices.sort_unstable();
+                    indices.dedup();
+                    if let Some(entry) = describe(name.into_owned(), item.path(), is_dir) {
+                        shared.accepted.fetch_add(1, Ordering::Relaxed);
+                        scratch.batch.push(Hit { entry, score, indices });
+                    }
                 }
-                scratch.last_flush = Instant::now();
+                if scratch.batch.len() >= BATCH_ITEMS
+                    || scratch.last_flush.elapsed().as_millis() as u64 >= BATCH_MS
+                {
+                    if !scratch.batch.is_empty()
+                        && tx.send(std::mem::take(&mut scratch.batch)).is_err()
+                    {
+                        shared.cancel.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                    scratch.last_flush = Instant::now();
+                }
             }
             if examined >= MAX_SCANNED {
                 shared.cut.store(true, Ordering::Relaxed);
@@ -639,6 +652,8 @@ fn filter_cache(
     pattern: &Pattern,
     needle: &Needle,
     show_hidden: bool,
+    root: &str,
+    cover_root: bool,
 ) -> (Vec<Hit>, usize) {
     let mut matcher = Matcher::new(Config::DEFAULT);
     let mut buf = Vec::new();
@@ -647,6 +662,13 @@ fn filter_cache(
     let mut matched = 0usize;
     for (dir, name, is_dir) in &cache.names {
         if !show_hidden && name.starts_with('.') {
+            continue;
+        }
+        // The folder on screen is in the cache too, under the root itself.
+        // When the caller supplied its entries the local pass already scored
+        // and showed them, so counting or showing them again here would
+        // repeat every one of its matches.
+        if cover_root && cache.dirs.get(*dir as usize).map(|path| &**path) == Some(root) {
             continue;
         }
         let Some(score) = score_name(pattern, needle, name, &mut folded, &mut buf, &mut matcher)
@@ -1030,5 +1052,90 @@ mod tests {
         // Local then Done, no Batch (no recursive walk for one character).
         assert!(matches!(events.last(), Some(Event::Done { .. })));
         assert!(!events.iter().any(|e| matches!(e, Event::Batch { .. })));
+    }
+
+    /// A real tree on disk: `report.txt` in the root, `report-deep.txt` in a
+    /// subfolder. The root's entries are what the local pass is given.
+    fn temp_tree() -> PathBuf {
+        let root = std::env::temp_dir().join(format!("lyre-search-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("report.txt"), b"x").unwrap();
+        fs::write(root.join("sub").join("report-deep.txt"), b"x").unwrap();
+        root
+    }
+
+    fn batch_names(events: &[Event]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Batch { items, .. } => Some(items),
+                _ => None,
+            })
+            .flatten()
+            .map(|h| h.entry.name.as_str())
+            .collect()
+    }
+
+    fn done_matched(events: &[Event]) -> usize {
+        match events.last() {
+            Some(Event::Done { matched, .. }) => *matched,
+            _ => panic!("the last event is not Done"),
+        }
+    }
+
+    #[test]
+    fn walk_does_not_repeat_the_current_folders_matches() {
+        let root = temp_tree();
+        let local = vec![entry("report.txt", false), entry("sub", true)];
+        let req = Request {
+            path: root.to_string_lossy().into_owned(),
+            local,
+            query: "report".into(),
+            recursive: true,
+            show_hidden: false,
+            show_protected: false,
+            cache: None,
+        };
+        let events = collect_events(&req);
+        assert_eq!(batch_names(&events), vec!["report-deep.txt"], "the walk adds only what is deeper");
+        assert_eq!(done_matched(&events), 2, "each match is counted once");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cached_answers_do_not_repeat_the_current_folders_matches() {
+        let root = temp_tree();
+        let path = root.to_string_lossy().into_owned();
+        let first = Request {
+            path: path.clone(),
+            local: Vec::new(),
+            query: "report".into(),
+            recursive: true,
+            show_hidden: false,
+            show_protected: false,
+            cache: None,
+        };
+        let events = collect_events(&first);
+        let cache = events
+            .iter()
+            .find_map(|e| match e {
+                Event::Index(cache) => Some(cache.clone()),
+                _ => None,
+            })
+            .expect("the walk leaves an index behind");
+        let second = Request {
+            path,
+            local: vec![entry("report.txt", false)],
+            query: "report".into(),
+            recursive: true,
+            show_hidden: false,
+            show_protected: false,
+            cache: Some(cache),
+        };
+        let events = collect_events(&second);
+        assert_eq!(batch_names(&events), vec!["report-deep.txt"], "the cache adds only what is deeper");
+        assert_eq!(done_matched(&events), 2, "each match is counted once");
+        let _ = fs::remove_dir_all(&root);
     }
 }

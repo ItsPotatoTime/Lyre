@@ -4,6 +4,18 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
+## [Unreleased]
+
+### Fixed
+
+- **Rename and new folder refuse names that would leave the folder.** A typed
+  name was joined onto the folder as-is, so a name like `../notes.txt` moved
+  the item out of its folder, and an absolute name on Windows replaced the
+  folder outright. Names carrying a separator, a parent step, or nothing at
+  all are refused now. A rename that only changes a name's case also works
+  on case-insensitive filesystems, where it used to report that an item with
+  that name already exists: the item it meant was itself.
+
 ## [0.3.5]
 
 A release for a move that went wrong and took the projects with it: what a paste

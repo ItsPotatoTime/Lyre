@@ -4,6 +4,17 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
+## [Unreleased]
+
+### Fixed
+
+- **On macOS, a file edited in place now refreshes the view.** The folder is
+  watched through its own vnode, which reports entries coming and going but
+  not a child file's contents changing, and the watcher blocked on it
+  without a timeout, so an in-place edit never showed. The watcher now
+  compares the folder's fingerprint at intervals while idle on macOS, the
+  same check the fallback for unwatchable volumes already made.
+
 ## [0.3.5]
 
 A release for a move that went wrong and took the projects with it: what a paste

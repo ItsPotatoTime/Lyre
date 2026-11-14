@@ -7939,13 +7939,28 @@ fn put_back(action: &Undo) -> Stepped {
         },
         Undo::Moved { pairs } => step_moved(pairs.clone(), false),
         Undo::Trashed { items } => {
-            // Deleting again: the originals are what the trash recorded.
+            // Deleting again: the originals are what the trash recorded. What
+            // answers for this deletion afterwards is the record the new
+            // deletion makes, not the old one: the old record names a stay in
+            // the trash that has already been taken back, and on Windows an
+            // old record stops matching its bin entry soon enough that
+            // putting it back would report the item gone.
             let paths: Vec<PathBuf> = items.iter().map(|item| item.original.clone()).collect();
             let cancel = std::sync::atomic::AtomicBool::new(false);
             let deleted = fileops::delete(fileops::DeleteMode::Trash, &paths, &cancel, |_| true);
-            match deleted.error {
-                None => Stepped::whole(action),
-                Some(e) => Stepped::stopped(action, format!("Could not delete it again: {e}")),
+            if !deleted.trashed.is_empty() {
+                // Keep the records the new deletion made: the old ones name a
+                // stay in the trash that has already been taken back.
+                Stepped {
+                    went: Some(Undo::Trashed { items: deleted.trashed }),
+                    left: None,
+                    error: deleted.error.map(|e| format!("Could not delete it again: {e}")),
+                }
+            } else {
+                match deleted.error {
+                    None => Stepped::whole(action),
+                    Some(e) => Stepped::stopped(action, format!("Could not delete it again: {e}")),
+                }
             }
         }
     }
@@ -11857,6 +11872,38 @@ mod undo_tests {
         assert!(stepped.error.is_some(), "the step refuses rather than overwriting");
         assert_eq!(std::fs::read_to_string(&from).unwrap(), "newer", "the newer file is untouched");
         assert_eq!(std::fs::read_to_string(&to).unwrap(), "moved", "the moved file stays put");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn redoing_a_delete_records_the_new_deletion() {
+        let dir = scratch("redotrash");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let first = fileops::delete(
+            fileops::DeleteMode::Trash,
+            std::slice::from_ref(&file),
+            &cancel,
+            |_| true,
+        );
+        let first_when = first.trashed[0].when;
+        let action = Undo::Trashed { items: first.trashed };
+        let back = take_back(&action);
+        assert!(back.error.is_none(), "the delete is taken back: {:?}", back.error);
+        assert!(file.exists(), "and the file is back");
+
+        let redone = put_back(&action);
+        assert!(redone.error.is_none(), "the delete is done again: {:?}", redone.error);
+        assert!(!file.exists(), "and the file is gone again");
+        let Some(Undo::Trashed { items }) = redone.went else {
+            panic!("the redo records a deletion");
+        };
+        assert_eq!(items.len(), 1);
+        assert!(items[0].when > first_when, "the record is the new deletion's, not the first one's");
+        let restored = take_back(&Undo::Trashed { items });
+        assert!(restored.error.is_none(), "the new record takes it back: {:?}", restored.error);
+        assert!(file.exists(), "and the file comes back out");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

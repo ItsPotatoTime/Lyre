@@ -75,6 +75,7 @@ pub fn stage(paths: &[PathBuf]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut root: Option<PathBuf> = None;
     let mut budget = MAX_STAGED_ITEMS;
+    let mut staged = 0usize;
     for path in paths {
         if !ephemeral(path) {
             out.push(path.clone());
@@ -91,7 +92,13 @@ pub fn stage(paths: &[PathBuf]) -> Vec<PathBuf> {
             .file_name()
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("item"));
-        let dst = root.join(name);
+        // Each item gets a subfolder of its own: two sources with the same
+        // name (the same attachment saved by two applications, in different
+        // temp folders) used to land on one path, the second writing over
+        // the first, and both paths in the result pointing at the second's
+        // bytes.
+        let dst = root.join(staged.to_string()).join(name);
+        staged += 1;
         if snapshot(path, &dst, &mut budget) {
             out.push(dst);
         }
@@ -113,11 +120,21 @@ fn snapshot(src: &Path, dst: &Path, budget: &mut usize) -> bool {
             return false;
         }
         let Ok(reader) = std::fs::read_dir(src) else { return false };
-        for item in reader.flatten() {
-            let name = item.file_name();
-            snapshot(&item.path(), &dst.join(name), budget);
+        // A folder is only staged whole. A child that cannot be read, or
+        // the item budget running out part way, used to be reported as a
+        // complete snapshot with some of the folder silently missing.
+        let mut complete = true;
+        for item in reader {
+            match item {
+                Ok(item) => {
+                    if !snapshot(&item.path(), &dst.join(item.file_name()), budget) {
+                        complete = false;
+                    }
+                }
+                Err(_) => complete = false,
+            }
         }
-        true
+        complete
     } else {
         if let Some(parent) = dst.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -1510,6 +1527,39 @@ mod tests {
         assert_eq!(std::fs::read(staged[0].join("sub/a.txt")).unwrap(), b"payload");
         release(&staged);
         assert!(!staged[0].exists());
+    }
+
+    #[test]
+    #[test]
+    fn same_named_sources_stage_side_by_side() {
+        let base = std::env::temp_dir().join(format!("lyre-stage-names-{}", std::process::id()));
+        let one = base.join("one");
+        let two = base.join("two");
+        std::fs::create_dir_all(&one).unwrap();
+        std::fs::create_dir_all(&two).unwrap();
+        std::fs::write(one.join("report.txt"), "from one").unwrap();
+        std::fs::write(two.join("report.txt"), "from two").unwrap();
+        let out = stage(&[one.join("report.txt"), two.join("report.txt")]);
+        assert_eq!(out.len(), 2, "both items are staged");
+        assert_ne!(out[0], out[1], "and they do not share a path");
+        assert_eq!(std::fs::read_to_string(&out[0]).unwrap(), "from one");
+        assert_eq!(std::fs::read_to_string(&out[1]).unwrap(), "from two");
+        release(&out);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn a_folder_past_the_item_budget_is_not_staged_at_all() {
+        let base = std::env::temp_dir().join(format!("lyre-stage-budget-{}", std::process::id()));
+        let folder = base.join("wide");
+        std::fs::create_dir_all(&folder).unwrap();
+        for n in 0..(MAX_STAGED_ITEMS + 4) {
+            std::fs::write(folder.join(format!("f{n}")), "").unwrap();
+        }
+        let out = stage(std::slice::from_ref(&folder));
+        assert!(out.is_empty(), "a folder that cannot be staged whole is left out, not staged in part");
+        release(&out);
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

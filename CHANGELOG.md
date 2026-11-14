@@ -4,6 +4,18 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
+## [Unreleased]
+
+### Fixed
+
+- **Staged drag items no longer overwrite each other, and folders stage
+  whole or not at all.** Two dragged items with the same name from
+  different temp folders landed on the one staging path, so the drop pasted
+  the second item twice and lost the first. Each item stages in its own
+  subfolder now. A folder whose contents ran past the staging budget was
+  also reported as fully staged with the remainder silently missing; it is
+  left out now, like an item that cannot be read.
+
 ## [0.3.5]
 
 A release for a move that went wrong and took the projects with it: what a paste

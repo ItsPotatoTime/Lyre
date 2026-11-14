@@ -75,12 +75,19 @@ fn run(
     };
     let mut first: Option<Instant> = None;
     let mut last = Instant::now();
+    let mut last_print = fingerprint(path);
     while !stop.load(Ordering::Acquire) {
-        // Idle: block forever. In a burst: wake at the quiet gap or the cap,
-        // whichever comes first, so a nonstop writer cannot starve the refresh.
+        // Idle: block forever, unless the backend polls when idle (below). In
+        // a burst: wake at the quiet gap or the cap, whichever comes first, so
+        // a nonstop writer cannot starve the refresh.
         let timeout = first.map(|start| {
             let deadline = (start + BURST_CAP).min(last + QUIET);
             deadline.saturating_duration_since(Instant::now())
+        }).or_else(|| {
+            backend.polls_when_idle().then(|| {
+                let entries = last_print.map_or(0, |(_, n)| n);
+                Duration::from_millis((500 + entries as u64 / 8).min(3000))
+            })
         });
         let (event, dead) = backend.wait(timeout);
         if stop.load(Ordering::Acquire) {
@@ -94,13 +101,28 @@ fn run(
                 continue;
             }
         } else if first.is_none() {
-            return;
+            if !backend.polls_when_idle() {
+                return;
+            }
+            // The idle wait timed out. A backend that polls when idle cannot
+            // see a file edited in place (the macOS vnode watches the folder,
+            // and a child's contents are not the folder's), so compare
+            // fingerprints and carry on watching either way.
+            let current = fingerprint(path);
+            if current != last_print {
+                last_print = current;
+                if !flush(path, tx, wake) {
+                    return;
+                }
+            }
+            continue;
         }
         first = None;
         backend.rearm();
         if !flush(path, tx, wake) {
             return;
         }
+        last_print = fingerprint(path);
         if dead {
             // The notification source is gone (folder deleted, watch limit):
             // a fingerprint keeps the folder live until navigation replaces us.
@@ -341,6 +363,11 @@ mod platform {
 
         /// Put the next read outstanding before the rescan is handed over, so
         /// changes during the scan are not lost either.
+        /// Whether an idle wait may time out so the caller can compare
+        /// fingerprints: true where the notification source cannot see a
+        /// file edited in place.
+        pub fn polls_when_idle(&self) -> bool { false }
+
         pub fn rearm(&mut self) {
             if !self.pending {
                 self.issue();
@@ -478,6 +505,11 @@ mod platform {
         }
 
         /// The inotify watch stays armed across rescans; nothing to re-issue.
+        /// Whether an idle wait may time out so the caller can compare
+        /// fingerprints: true where the notification source cannot see a
+        /// file edited in place.
+        pub fn polls_when_idle(&self) -> bool { false }
+
         pub fn rearm(&mut self) {}
 
         pub fn wait(&mut self, timeout: Option<Duration>) -> (bool, bool) {
@@ -657,6 +689,11 @@ mod platform {
         }
 
         /// The vnode note stays armed across rescans; nothing to re-issue.
+        /// Whether an idle wait may time out so the caller can compare
+        /// fingerprints: true where the notification source cannot see a
+        /// file edited in place.
+        pub fn polls_when_idle(&self) -> bool { true }
+
         pub fn rearm(&mut self) {}
 
         pub fn wait(&mut self, timeout: Option<Duration>) -> (bool, bool) {
@@ -723,6 +760,11 @@ mod platform {
         pub fn new(_path: &Path) -> Result<(Self, Cancel), String> {
             Err("no native folder notifications on this platform".into())
         }
+
+        /// Whether an idle wait may time out so the caller can compare
+        /// fingerprints: true where the notification source cannot see a
+        /// file edited in place.
+        pub fn polls_when_idle(&self) -> bool { false }
 
         pub fn rearm(&mut self) {}
 

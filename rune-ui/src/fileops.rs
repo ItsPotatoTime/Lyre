@@ -202,6 +202,10 @@ pub struct Trashed {
 pub struct Deleted {
     pub count: usize,
     pub trashed: Vec<Trashed>,
+    /// Why the delete stopped, when it did. The items counted and trashed
+    /// above still went, and their records are kept, so a delete that
+    /// stopped half way can still be taken back for the part that landed.
+    pub error: Option<String>,
 }
 
 /// Put deleted items back where they came from, newest first, so a folder is
@@ -453,18 +457,23 @@ pub fn copy_again(pairs: &[(PathBuf, PathBuf)]) -> Result<(), String> {
     Ok(())
 }
 
-/// Delete `paths` to the trash or permanently, reporting progress.
+/// Delete `paths` to the trash or permanently, reporting progress. Like
+/// paste, what a delete did is reported even when it stops: the failure
+/// rides in the outcome instead of discarding the records of the items
+/// that already went, which used to leave them in the trash with no way
+/// back through undo.
 pub fn delete<F: FnMut(Progress) -> bool>(
     mode: DeleteMode,
     paths: &[PathBuf],
     cancel: &AtomicBool,
     mut emit: F,
-) -> Result<Deleted, String> {
+) -> Deleted {
     let total = paths.len();
     let total_bytes: u64 = paths.iter().map(|p| item_size(p)).sum();
     let mut done_bytes = 0u64;
     let mut deleted = 0usize;
     let mut trashed: Vec<Trashed> = Vec::new();
+    let mut error = None;
     for (i, path) in paths.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             break;
@@ -474,15 +483,25 @@ pub fn delete<F: FnMut(Progress) -> bool>(
             break;
         }
         let size = item_size(path);
-        match mode {
-            DeleteMode::Permanent => remove_item(path)?,
-            DeleteMode::Trash => trashed.push(trash_one(path)?),
+        let failed = match mode {
+            DeleteMode::Permanent => remove_item(path).err(),
+            DeleteMode::Trash => match trash_one(path) {
+                Ok(item) => {
+                    trashed.push(item);
+                    None
+                }
+                Err(e) => Some(e),
+            },
+        };
+        if let Some(e) = failed {
+            error = Some(e);
+            break;
         }
         done_bytes += size;
         deleted += 1;
         emit(Progress { done: i + 1, total, name, done_bytes, total_bytes });
     }
-    Ok(Deleted { count: deleted, trashed })
+    Deleted { count: deleted, trashed, error }
 }
 
 pub fn create_folder(parent: &Path, name: &str) -> Result<PathBuf, String> {
@@ -818,11 +837,12 @@ mod tests {
         let file = dir.join("gone.txt");
         fs::write(&file, b"content").unwrap();
         let cancel = AtomicBool::new(false);
-        let Ok(deleted) = delete(DeleteMode::Trash, std::slice::from_ref(&file), &cancel, noop) else {
+        let deleted = delete(DeleteMode::Trash, std::slice::from_ref(&file), &cancel, noop);
+        if deleted.error.is_some() {
             // A machine with the bin turned off cannot delete this way at all.
             let _ = fs::remove_dir_all(&dir);
             return;
-        };
+        }
         assert_eq!(deleted.count, 1);
         assert!(!file.exists(), "it went to the trash");
         assert_eq!(deleted.trashed.len(), 1, "and the trash recorded where it came from");
@@ -980,7 +1000,7 @@ mod tests {
         let a = dir.join("a.txt");
         fs::write(&a, "x").unwrap();
         let cancel = AtomicBool::new(false);
-        delete(DeleteMode::Permanent, std::slice::from_ref(&a), &cancel, noop).unwrap();
+        delete(DeleteMode::Permanent, std::slice::from_ref(&a), &cancel, noop);
         assert!(!a.exists());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1110,6 +1130,23 @@ mod tests {
         assert_eq!(fs::read_to_string(dir.join("a (2).txt")).unwrap(), "one");
         assert!(dir.join("Presenter (2)").join("index.html").exists(), "the folder was copied too");
         assert_eq!(fs::read_to_string(folder.join("index.html")).unwrap(), "<h1>hi</h1>");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A delete that stops half way keeps the records of what already went,
+    /// so the part that landed in the trash can still be taken back, and the
+    /// failure is reported rather than swallowing both.
+    #[test]
+    fn a_stopped_delete_keeps_what_went() {
+        let dir = scratch("delstop");
+        let gone = dir.join("gone.txt");
+        fs::write(&gone, "one").unwrap();
+        let missing = dir.join("missing.txt");
+        let outcome = delete(DeleteMode::Trash, &[gone.clone(), missing], &AtomicBool::new(false), noop);
+        assert_eq!(outcome.count, 1, "the first item went");
+        assert_eq!(outcome.trashed.len(), 1, "its record survived the failure");
+        assert!(outcome.error.is_some(), "the failure is reported");
+        assert!(!gone.exists(), "the first item still went to the trash");
         let _ = fs::remove_dir_all(&dir);
     }
 }

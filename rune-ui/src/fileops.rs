@@ -485,20 +485,50 @@ pub fn delete<F: FnMut(Progress) -> bool>(
     Ok(Deleted { count: deleted, trashed })
 }
 
+/// A name typed for a rename or a new folder names one item inside one
+/// folder: it may not be empty, be a step to somewhere else, or carry a
+/// separator. Without the check the name is joined onto a parent, so a
+/// name like `../notes.txt` moves the item out of its folder entirely,
+/// and on Windows an absolute name replaces the parent in the join.
+fn check_new_name(name: &str) -> Result<(), String> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return Err("That name cannot be used here.".into());
+    }
+    Ok(())
+}
+
 pub fn create_folder(parent: &Path, name: &str) -> Result<PathBuf, String> {
+    check_new_name(name)?;
     let path = free_path(&parent.join(name));
     fs::create_dir(&path).map_err(|e| format!("Could not create the folder: {e}"))?;
     Ok(path)
 }
 
 pub fn rename(path: &Path, new_name: &str) -> Result<PathBuf, String> {
+    check_new_name(new_name)?;
     let parent = path.parent().ok_or("That item cannot be renamed.")?;
     let target = parent.join(new_name);
     if target == path {
         return Ok(path.to_path_buf());
     }
     if target.exists() {
-        return Err("An item with that name already exists.".into());
+        // On a case-insensitive filesystem the item that exists can be this
+        // very item under another case; renaming `a.txt` to `A.txt` is a
+        // rename, not a collision.
+        let same_item = fs::canonicalize(&target)
+            .ok()
+            .zip(fs::canonicalize(path).ok())
+            .map(|(found, this)| found == this)
+            .unwrap_or(false);
+        if !same_item {
+            return Err("An item with that name already exists.".into());
+        }
     }
     fs::rename(path, &target).map_err(|e| format!("Could not rename: {e}"))?;
     Ok(target)
@@ -1110,6 +1140,37 @@ mod tests {
         assert_eq!(fs::read_to_string(dir.join("a (2).txt")).unwrap(), "one");
         assert!(dir.join("Presenter (2)").join("index.html").exists(), "the folder was copied too");
         assert_eq!(fs::read_to_string(folder.join("index.html")).unwrap(), "<h1>hi</h1>");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A rename or a new folder name that carries a step or a separator would
+    /// land outside the folder on screen; both are refused before anything
+    /// moves, and nothing appears outside.
+    #[test]
+    fn names_with_separators_are_refused() {
+        let dir = scratch("names");
+        let file = dir.join("a.txt");
+        fs::write(&file, "one").unwrap();
+        for bad in ["../b.txt", "..\\b.txt", "sub/b.txt", "..", ".", ""] {
+            assert!(rename(&file, bad).is_err(), "rename to {bad:?} is refused");
+            assert!(create_folder(&dir, bad).is_err(), "a folder named {bad:?} is refused");
+        }
+        assert!(file.exists(), "the file never moved");
+        assert!(!dir.parent().unwrap().join("b.txt").exists(), "nothing landed outside");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An ordinary rename and an ordinary new folder still work.
+    #[test]
+    fn plain_names_still_work() {
+        let dir = scratch("plain");
+        let file = dir.join("a.txt");
+        fs::write(&file, "one").unwrap();
+        let renamed = rename(&file, "b.txt").unwrap();
+        assert_eq!(renamed, dir.join("b.txt"));
+        assert!(renamed.exists());
+        let folder = create_folder(&dir, "Notes").unwrap();
+        assert!(folder.is_dir());
         let _ = fs::remove_dir_all(&dir);
     }
 }

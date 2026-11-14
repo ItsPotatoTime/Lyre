@@ -4,6 +4,17 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
+## [Unreleased]
+
+### Fixed
+
+- **A delete that stops half way can be taken back.** Deleting several items
+  reported the first failure by discarding the outcome, including the trash
+  records of the items that already went, so those sat in the trash with no
+  way back through undo. A delete now reports what it did the way a paste
+  does: the records ride with the outcome, the status says how many went
+  before it stopped, and undo restores them.
+
 ## [0.3.5]
 
 A release for a move that went wrong and took the projects with it: what a paste

@@ -4,6 +4,26 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
+## [Unreleased]
+
+### Fixed
+
+- **A copy that stops inside a folder can be taken back.** A paste recorded
+  an item only when it finished, so a folder copy that failed part way (a
+  full disk, a tree nested past the depth limit) left a partial copy behind
+  with no record, and undo could not remove it. A destination the paste
+  created is recorded even when the copy stops; a destination that already
+  stood there is not, so a merge into it is still left alone.
+
+- **A link pasted on its own is copied as a link**, like the ones inside a
+  copied folder, instead of as the contents of what it points at; and a
+  folder can no longer be pasted into itself through a link to it, which the
+  path comparison could not see and the resolved paths now catch.
+
+- **A move's progress adds up.** An item's size was read after it landed,
+  when a cut's source no longer exists and reads as zero, so the bar stayed
+  short of the total for the whole move. The size is read before it goes.
+
 ## [0.3.5]
 
 A release for a move that went wrong and took the projects with it: what a paste

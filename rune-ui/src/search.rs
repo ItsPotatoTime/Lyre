@@ -221,7 +221,7 @@ pub fn search<F: FnMut(Event) -> bool>(req: &Request, cancel: &AtomicBool, mut e
         && needle.chars().count() >= 2
         && let Some(cache) = &req.cache
     {
-        let (hits, matched) = filter_cache(cache, &pattern, &needle_bytes, req.show_hidden);
+        let (hits, matched) = filter_cache(cache, &pattern, &needle_bytes, req.show_hidden, req.show_protected);
         if !hits.is_empty() && !emit(Event::Batch { items: hits, scanned: cache.len() }) {
             return;
         }
@@ -246,7 +246,7 @@ pub fn search<F: FnMut(Event) -> bool>(req: &Request, cancel: &AtomicBool, mut e
         return;
     }
 
-    let outcome = walk(&folded_needle, Path::new(&req.path), req.show_hidden, cancel, matched_local, laid_out, &mut emit);
+    let outcome = walk(&folded_needle, Path::new(&req.path), req.show_hidden, req.show_protected, cancel, matched_local, laid_out, &mut emit);
     let _ = emit(Event::Done {
         matched: outcome.matched,
         scanned: outcome.scanned,
@@ -419,6 +419,7 @@ fn walk<F: FnMut(Event) -> bool>(
     query: &str,
     root: &Path,
     show_hidden: bool,
+    show_protected: bool,
     cancel: &AtomicBool,
     matched_so_far: usize,
     scanned_so_far: usize,
@@ -450,7 +451,7 @@ fn walk<F: FnMut(Event) -> bool>(
         let tx = tx.clone();
         let query = query.to_string();
         handles.push(std::thread::spawn(move || {
-            work(&shared, &tx, &query, show_hidden, matched_so_far);
+            work(&shared, &tx, &query, show_hidden, show_protected, matched_so_far);
         }));
     }
     // The caller's own sender must go, or the channel never closes.
@@ -502,6 +503,7 @@ fn work(
     tx: &std::sync::mpsc::Sender<Vec<Hit>>,
     query: &str,
     show_hidden: bool,
+    show_protected: bool,
     matched_so_far: usize,
 ) {
     use std::sync::atomic::Ordering;
@@ -589,8 +591,15 @@ fn work(
                 indices.sort_unstable();
                 indices.dedup();
                 if let Some(entry) = describe(name.into_owned(), item.path(), is_dir) {
-                    shared.accepted.fetch_add(1, Ordering::Relaxed);
-                    scratch.batch.push(Hit { entry, score, indices });
+                    if visible(entry.hidden, entry.system, show_hidden, show_protected) {
+                        shared.accepted.fetch_add(1, Ordering::Relaxed);
+                        scratch.batch.push(Hit { entry, score, indices });
+                    } else {
+                        // It matched the query, but the settings keep it out,
+                        // like a name that starts with a dot: not a match the
+                        // count may claim either.
+                        shared.matched.fetch_sub(1, Ordering::Relaxed);
+                    }
                 }
             }
             if scratch.batch.len() >= BATCH_ITEMS
@@ -634,11 +643,27 @@ fn work(
 
 /// Answer a query from names already gathered, reading metadata only for what
 /// ends up shown. This is the walk's match path with the directory reads removed.
+/// Whether an item with these marks may be shown under the folder's
+/// settings: the rule `score_local` applies to the folder on screen. The
+/// name checks in the walk and the cache can only see the name itself; on
+/// Windows the hidden and system marks live in the file's attributes, so a
+/// match the name lets through is checked again once it has been described.
+fn visible(hidden: bool, system: bool, show_hidden: bool, show_protected: bool) -> bool {
+    if hidden && system {
+        show_hidden && show_protected
+    } else if hidden {
+        show_hidden
+    } else {
+        true
+    }
+}
+
 fn filter_cache(
     cache: &NameCache,
     pattern: &Pattern,
     needle: &Needle,
     show_hidden: bool,
+    show_protected: bool,
 ) -> (Vec<Hit>, usize) {
     let mut matcher = Matcher::new(Config::DEFAULT);
     let mut buf = Vec::new();
@@ -670,7 +695,11 @@ fn filter_cache(
         let folder = cache.dirs.get(*dir as usize).map(|path| &**path).unwrap_or("");
         let path = Path::new(folder).join(&**name);
         if let Some(entry) = describe(name.to_string(), path, *is_dir) {
-            hits.push(Hit { entry, score, indices });
+            if visible(entry.hidden, entry.system, show_hidden, show_protected) {
+                hits.push(Hit { entry, score, indices });
+            } else {
+                matched -= 1;
+            }
         }
     }
     (hits, matched)
@@ -957,6 +986,20 @@ mod speed_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn visibility_follows_the_folder_on_screen() {
+        // A plain item shows under every setting.
+        assert!(visible(false, false, false, false));
+        assert!(visible(false, false, true, true));
+        // A hidden item needs hidden shown.
+        assert!(!visible(true, false, false, false));
+        assert!(visible(true, false, true, false));
+        // A hidden system item needs both, like the listing shows it.
+        assert!(!visible(true, true, true, false));
+        assert!(!visible(true, true, false, true));
+        assert!(visible(true, true, true, true));
+    }
 
     fn entry(name: &str, is_dir: bool) -> crate::Entry {
         let kind = crate::classify(name, is_dir);

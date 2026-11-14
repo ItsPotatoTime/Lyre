@@ -7942,9 +7942,10 @@ fn put_back(action: &Undo) -> Stepped {
             // Deleting again: the originals are what the trash recorded.
             let paths: Vec<PathBuf> = items.iter().map(|item| item.original.clone()).collect();
             let cancel = std::sync::atomic::AtomicBool::new(false);
-            match fileops::delete(fileops::DeleteMode::Trash, &paths, &cancel, |_| true) {
-                Ok(_) => Stepped::whole(action),
-                Err(e) => Stepped::stopped(action, format!("Could not delete it again: {e}")),
+            let deleted = fileops::delete(fileops::DeleteMode::Trash, &paths, &cancel, |_| true);
+            match deleted.error {
+                None => Stepped::whole(action),
+                Some(e) => Stepped::stopped(action, format!("Could not delete it again: {e}")),
             }
         }
     }
@@ -8044,15 +8045,20 @@ fn start_delete(s: &mut App, mode: fileops::DeleteMode, paths: Vec<PathBuf>) {
             let _ = progress_tx.send(OpMsg::Progress(p));
             !worker_cancel.load(Ordering::Relaxed)
         };
-        let result = fileops::delete(mode, &paths, &worker_cancel, emit);
+        let deleted = fileops::delete(mode, &paths, &worker_cancel, emit);
         // A delete to the trash can be taken back; a permanent one cannot, so it
-        // records nothing to undo.
-        let (outcome, undo) = match result {
-            Ok(deleted) => {
-                let undo = (!deleted.trashed.is_empty()).then_some(Undo::Trashed { items: deleted.trashed });
-                (Ok(deleted.count), undo)
-            }
-            Err(e) => (Err(e), None),
+        // records nothing to undo. What went to the trash is recorded even when
+        // the delete stopped half way, like a paste, so the part that landed
+        // can still be taken back.
+        let undo = (!deleted.trashed.is_empty()).then_some(Undo::Trashed { items: deleted.trashed });
+        let outcome = match deleted.error {
+            None => Ok(deleted.count),
+            Some(e) if deleted.count == 0 => Err(e),
+            Some(e) => Err(format!(
+                "Deleted {} item{}, then stopped: {e}",
+                deleted.count,
+                if deleted.count == 1 { "" } else { "s" }
+            )),
         };
         let _ = tx.send(OpMsg::Done { outcome, undo });
     });

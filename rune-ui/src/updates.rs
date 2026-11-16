@@ -13,7 +13,6 @@
 
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::io::Read;
 
 const ENDPOINT: &str = "https://github.com/ItsPotatoTime/Lyre/releases/latest/download/latest.json";
 /// The project's minisign public key (base64 of the key file), from the old
@@ -368,6 +367,7 @@ mod tests {
         let dir = std::env::temp_dir();
         let victim = dir.join(format!("lyre-update-victim-{}", std::process::id()));
         std::fs::write(&victim, b"do not touch").unwrap();
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut planted = Vec::new();
         #[cfg(unix)]
         for n in 0..64 {

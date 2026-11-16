@@ -1574,7 +1574,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn same_named_sources_stage_side_by_side() {
         let base = std::env::temp_dir().join(format!("lyre-stage-names-{}", std::process::id()));
         let one = base.join("one");

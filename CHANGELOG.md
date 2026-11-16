@@ -8,6 +8,98 @@ release notes rather than a second copy of them.
 
 ### Fixed
 
+- **Rename and new folder refuse names that would leave the folder.** A typed
+  name was joined onto the folder as-is, so a name like `../notes.txt` moved
+  the item out of its folder, and an absolute name on Windows replaced the
+  folder outright. Names carrying a separator, a parent step, or nothing at
+  all are refused now. A rename that only changes a name's case also works
+  on case-insensitive filesystems, where it used to report that an item with
+  that name already exists: the item it meant was itself.
+
+- **The folder watcher can no longer die at a poll deadline.** The fallback
+  poll slept for the smaller of a slice and the time left to its deadline,
+  computed from a second clock read after the check; a thread preempted
+  between the two woke past the deadline and panicked on the subtraction,
+  ending live refresh for that folder. The wait now saturates at zero.
+
+- **A delete that stops half way can be taken back.** Deleting several items
+  reported the first failure by discarding the outcome, including the trash
+  records of the items that already went, so those sat in the trash with no
+  way back through undo. A delete now reports what it did the way a paste
+  does: the records ride with the outcome, the status says how many went
+  before it stopped, and undo restores them.
+
+- **Taking a deletion back works across volumes.** The trash lives on the
+  home volume, and putting an item back renamed it, which the system refuses
+  across volumes; an item deleted from a stick, a second drive, or a tmpfs
+  could be trashed but never restored. The restore now moves the item the
+  same way the delete did, copying when a rename cannot cross.
+
+- **Files dragged out of mail clients and archivers arrive whole.** A virtual
+  file's final read reports a partial success rather than success, and the
+  staging loop stopped before writing those bytes, so a small attachment
+  landed empty and a larger one was cut at a 64 KB boundary. The bytes a
+  read delivers are written before its status decides whether to continue.
+
+- **A dragged member cannot name a path outside the staging folder.** Member
+  names come from the drag source, which is another application, and were
+  joined onto the staging folder nearly as given, so a name with parent steps
+  or a drive in it wrote wherever it named. Member paths are rebuilt from
+  plain name components now, and a name carrying anything else is refused.
+  A staged folder's links are also never walked through any more, the guard
+  the copy path already had.
+
+- **Undo and redo no longer write over a file that took the place.** Putting a
+  renamed or moved item back used a bare rename, which on Unix replaces
+  whatever now stands at the old path in silence, and the same applied to
+  copying a file again. The steps now refuse when the destination is occupied,
+  saying so and leaving both files as they are, and a step across volumes falls
+  back to copying instead of failing where a rename cannot cross.
+
+- **Redoing a delete keeps the new deletion's record.** Doing a delete again
+  after taking it back kept the first deletion's trash records for the undo
+  that follows. Those name a stay in the trash that has already ended, and on
+  Windows an old record stops matching its bin entry soon enough that the
+  next undo would report the item gone. The record the new deletion makes is
+  the one kept now.
+
+- **A Linux self-update replaces the `.AppImage` file.** The update replaced
+  the running executable, which inside an AppImage is AppRun on the read-only
+  mounted image, not the `.AppImage` file that gets launched. The file the
+  `APPIMAGE` variable names is replaced now, so an updated copy is the one
+  that opens next time.
+
+- **An update download is capped, and the installer is staged where nothing
+  can be planted.** The download grew in memory without a limit, so a broken
+  or hostile server could fill the machine; it now stops at a size no build
+  of this application approaches. The installer also landed at one fixed
+  name in the shared temporary folder, where a link planted at that name
+  ahead of time would be written through; it is staged at a name unique to
+  the run, created new, so the bytes that were verified are the bytes that
+  run.
+
+- **Deep search respects the hidden and system marks.** The recursive and
+  cached searches filtered hidden files by name alone, so on Windows a file
+  marked hidden or system in its attributes, with an ordinary name, was
+  offered as a result while "show hidden" was off. A match is now checked
+  against its attributes once described, under the same rule as the folder
+  on screen.
+
+- **On macOS, a file edited in place now refreshes the view.** The folder is
+  watched through its own vnode, which reports entries coming and going but
+  not a child file's contents changing, and the watcher blocked on it
+  without a timeout, so an in-place edit never showed. The watcher now
+  compares the folder's fingerprint at intervals while idle on macOS, the
+  same check the fallback for unwatchable volumes already made.
+
+- **Staged drag items no longer overwrite each other, and folders stage
+  whole or not at all.** Two dragged items with the same name from
+  different temp folders landed on the one staging path, so the drop pasted
+  the second item twice and lost the first. Each item stages in its own
+  subfolder now. A folder whose contents ran past the staging budget was
+  also reported as fully staged with the remainder silently missing; it is
+  left out now, like an item that cannot be read.
+
 - **A keep-both name is always found.** Finding a free "name (2)" style
   destination gave up after 9,999 taken names and returned the colliding
   path itself, so a keep-both paste would write over the item it was

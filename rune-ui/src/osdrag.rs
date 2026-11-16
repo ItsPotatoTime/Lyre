@@ -1565,7 +1565,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&src);
         std::fs::create_dir_all(src.join("sub")).unwrap();
         std::fs::write(src.join("sub/a.txt"), b"payload").unwrap();
-        let staged = stage(&[src.clone()]);
+        let staged = stage(std::slice::from_ref(&src));
         assert_eq!(staged.len(), 1);
         let _ = std::fs::remove_dir_all(&src);
         assert_eq!(std::fs::read(staged[0].join("sub/a.txt")).unwrap(), b"payload");
@@ -1608,7 +1608,7 @@ mod tests {
     #[test]
     fn paths_outside_temp_pass_through_unstaged() {
         let dir = std::env::current_dir().unwrap();
-        let staged = stage(&[dir.clone()]);
+        let staged = stage(std::slice::from_ref(&dir));
         assert_eq!(staged, vec![dir]);
     }
 

@@ -188,7 +188,6 @@ fn score_name(
 }
 
 /// Run a search, emitting results as they are known. `emit` returns false to stop.
-
 pub fn search<F: FnMut(Event) -> bool>(req: &Request, cancel: &AtomicBool, mut emit: F) {
     let started = Instant::now();
     let needle = req.query.trim();
@@ -415,6 +414,7 @@ fn worker_count() -> usize {
 /// own thread, so the interface sees one ordered stream of batches while the
 /// reading happens in parallel. Which batch arrives first is not defined, and
 /// does not matter: the caller ranks the whole result once the walk ends.
+#[allow(clippy::too_many_arguments)]
 fn walk<F: FnMut(Event) -> bool>(
     query: &str,
     root: &Path,

@@ -106,7 +106,10 @@ fn size_of(path: &Path, depth: usize) -> u64 {
         return meta.len();
     }
     fs::read_dir(path)
-        .map(|rd| rd.flatten().map(|e| size_of(&e.path(), depth + 1)).sum())
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .fold(0u64, |sum, e| sum.saturating_add(size_of(&e.path(), depth + 1)))
+        })
         .unwrap_or(0)
 }
 
@@ -145,7 +148,8 @@ fn copy_at(
     if meta.is_dir() {
         fs::create_dir_all(dst).map_err(|e| format!("{}: {e}", dst.display()))?;
         let entries = fs::read_dir(src).map_err(|e| format!("{}: {e}", src.display()))?;
-        for entry in entries.flatten() {
+        for item in entries {
+            let entry = item.map_err(|e| format!("{}: {e}", src.display()))?;
             let from = entry.path();
             let to = dst.join(entry.file_name());
             // A link is copied as what it is rather than walked through: a
@@ -179,20 +183,29 @@ fn copy_at(
 #[cfg(windows)]
 fn copy_link(src: &Path, dst: &Path) -> Result<(), String> {
     let target = fs::read_link(src).map_err(|e| format!("{}: {e}", src.display()))?;
-    if target.is_dir() {
-        // A junction needs no privilege, where a real symlink does.
+    // A junction target is resolved relative to the link's folder, not the
+    // process working directory, before deciding whether it is a directory.
+    let absolute = if target.is_absolute() {
+        target.clone()
+    } else {
+        src.parent().unwrap_or_else(|| Path::new(".")).join(&target)
+    };
+    if absolute.is_dir() {
+        // No shell: paths go straight to mklink, so spaces, `&` and `|` in a
+        // name cannot break the command or run a second one. Each argument is
+        // quoted only by CreateProcess's exact-argument rule.
         let made = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
             .arg(dst)
-            .arg(&target)
+            .arg(&absolute)
             .status();
         if made.is_ok_and(|status| status.success()) {
             return Ok(());
         }
     }
-    // A file link, or a junction this account may not make: the link is left
-    // out of the copy rather than failing the rest of it.
-    Ok(())
+    // A file link, or a junction this account may not make, is reported rather
+    // than silently left out of the copy with a success notice.
+    Err(format!("{}: could not recreate the link", src.display()))
 }
 
 #[cfg(unix)]
@@ -304,7 +317,13 @@ fn restore_one(_item: &Trashed) -> Result<(), String> {
 
 fn remove_item(path: &Path) -> Result<(), String> {
     let meta = fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if meta.is_dir() {
+    // On Windows a junction is a symlink to a directory and `is_dir()` on the
+    // symlink metadata is false; DeleteFile cannot remove a directory reparse
+    // point. Treat a link to a folder as the folder it stands for.
+    let folder_link = cfg!(windows)
+        && meta.file_type().is_symlink()
+        && fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
+    if meta.is_dir() || folder_link {
         fs::remove_dir_all(path).map_err(|e| format!("{}: {e}", path.display()))
     } else {
         fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()))
@@ -566,8 +585,7 @@ pub fn paste<F: FnMut(Progress) -> bool>(
         .iter()
         .enumerate()
         .filter(|&(i, _)| !covered[i])
-        .map(|(_, p)| item_size(p))
-        .sum();
+        .fold(0u64, |sum, (_, p)| sum.saturating_add(item_size(p)));
     let mut done_bytes = 0u64;
     let mut completed = 0u64;
     let mut landed: Vec<(PathBuf, PathBuf)> = Vec::new();
@@ -712,7 +730,7 @@ pub fn delete<F: FnMut(Progress) -> bool>(
     mut emit: F,
 ) -> Deleted {
     let total = paths.len();
-    let total_bytes: u64 = paths.iter().map(|p| item_size(p)).sum();
+    let total_bytes: u64 = paths.iter().fold(0u64, |sum, p| sum.saturating_add(item_size(p)));
     let mut done_bytes = 0u64;
     let mut deleted = 0usize;
     let mut trashed: Vec<Trashed> = Vec::new();
@@ -858,11 +876,17 @@ mod recycle {
             title: std::ptr::null(),
         };
         let result = unsafe { SHFileOperationW(&mut operation) };
-        if result == 0 {
-            Ok(())
-        } else {
-            Err(format!("Windows would not move it to the Recycle Bin (code {result})."))
+        if result != 0 {
+            return Err(format!("Windows would not move it to the Recycle Bin (code {result})."));
         }
+        // The shell can return success after silently skipping items (a file
+        // needing elevation, one too large for the bin). fAnyOperationsAborted
+        // is the only signal, and it was ignored, reporting skipped items as
+        // deleted with an undo record that could never be honoured.
+        if operation.aborted != 0 {
+            return Err("Windows skipped an item while moving it to the Recycle Bin.".into());
+        }
+        Ok(())
     }
 
     /// Put one item back where it came from, by finding its record in the bin.
@@ -875,10 +899,16 @@ mod recycle {
         let want = original.to_string_lossy().to_lowercase();
         // Only the bin of the drive it came from can hold it: a machine with
         // four drives would otherwise be searched four times over.
+        // Only a rooted drive path names a bin drive. A UNC path starts with
+        // `\\`, and treating its prefix as a drive letter looked for a folder
+        // called `\\:\$Recycle.Bin`, so network deletions could never be undone.
         let drive = original
             .components()
             .next()
-            .map(|part| part.as_os_str().to_string_lossy().trim_end_matches(':').to_string());
+            .and_then(|part| part.as_os_str().to_str())
+            .and_then(|s| s.strip_suffix(':'))
+            .filter(|s| s.len() == 1 && s.chars().all(|c| c.is_ascii_alphabetic()))
+            .map(str::to_string);
         let mut best: Option<(i64, std::path::PathBuf, std::path::PathBuf)> = None;
         for record in records(drive.as_deref()) {
             if record.original.to_string_lossy().to_lowercase() != want {
@@ -930,7 +960,9 @@ mod recycle {
         let mut out = Vec::new();
         let letters: Vec<char> = match drive.and_then(|d| d.chars().next()) {
             Some(letter) => vec![letter],
-            None => ('A'..='Z').collect(),
+            // With no drive letter there is no local bin to search — trying
+            // every drive was guesswork that could match a different item.
+            None => return Vec::new(),
         };
         for letter in letters {
             let bin = PathBuf::from(format!("{}:\\$Recycle.Bin", letter));

@@ -6912,7 +6912,7 @@ fn update_selection_detail(s: &mut App) {
             format!("1 item selected  {size}")
         };
     } else {
-        let total: u64 = selected.iter().map(|&i| entry_by_index(s, i).size).sum();
+        let total: u64 = selected.iter().fold(0u64, |sum, &i| sum.saturating_add(entry_by_index(s, i).size));
         s.selection_detail = if total == 0 {
             format!("{n} items selected")
         } else {

@@ -1710,6 +1710,34 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A cut's progress reaches the total: the size is read before the item
+    /// goes, not after the source has disappeared.
+    #[test]
+    fn a_cut_reports_all_its_bytes() {
+        let dir = scratch("cut-bytes");
+        let src = dir.join("payload.txt");
+        let out = dir.join("out");
+        fs::create_dir_all(&out).unwrap();
+        fs::write(&src, vec![b'x'; 5000]).unwrap();
+        let mut seen = Vec::new();
+        let pasted = paste(
+            Mode::Cut,
+            Conflict::Rename,
+            std::slice::from_ref(&src),
+            &out,
+            &AtomicBool::new(false),
+            |p| {
+                seen.push((p.done, p.done_bytes, p.total_bytes));
+                true
+            },
+        );
+        assert!(pasted.error.is_none());
+        let last = seen.last().unwrap();
+        assert_eq!(last.0, last.0, "done is reported");
+        assert_eq!(last.1, last.2, "cut progress reaches the total: {:?}", last);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn copying_again_refuses_a_destination_that_was_taken() {
         let dir = scratch("again");

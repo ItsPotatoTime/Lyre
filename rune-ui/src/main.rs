@@ -11946,6 +11946,23 @@ mod click_tests {
 mod undo_tests {
     use super::*;
 
+    /// Renaming a file to its own name records nothing, so undo is free to
+    /// reverse the previous real operation.
+    #[test]
+    fn a_rename_to_the_same_name_records_no_undo() {
+        let dir = scratch("same-rename");
+        let file = dir.join("a.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let mut s = open(&dir);
+        let mut edit = TextEdit::default();
+        edit.text = "a.txt".into();
+        s.dialog = Some(Dialog::Rename { path: file.clone(), edit });
+        commit_rename(&mut s);
+        assert!(s.undo.is_empty(), "a no-op rename adds no undo step");
+        assert!(file.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn drain_all(s: &mut App) {
         for _ in 0..250 {
             drain_op(s);

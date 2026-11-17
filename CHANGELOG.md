@@ -4,7 +4,23 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
-## [Unreleased]
+## [0.3.6]
+
+A stability release for file operations: moving, copying and deleting now keep
+the right bytes, undo keeps what it needs to put them back, and drops on the
+address bar land where they are shown. A new Custom appearance is **work in
+progress** and documented as such below.
+
+### Added
+
+- **Custom appearance (work in progress).** A fourth appearance choice opens a
+  panel to pick an accent color from swatches or hex, choose a light or dark
+  base, and toggle effects. Frosted panels, translucency and soft shadows are
+  implemented and can be turned on, but the mode is still experimental: window
+  transparency is not available on Windows or Linux because Rune cannot change
+  it while the app is running, and native backdrop materials are macOS-only.
+  Expect the palette and the effect controls to change. This is not the default
+  appearance; System, Light and Dark are unchanged.
 
 ### Fixed
 
@@ -105,6 +121,42 @@ release notes rather than a second copy of them.
   path itself, so a keep-both paste would write over the item it was
   keeping, and a delete would replace the copy already in the trash.
   Numbering now continues past that point instead of falling back.
+
+- **Moving a file that is in use no longer duplicates it.** A locked child made
+  the rename fail, so the move copied the whole tree and then could not remove
+  the source, leaving two copies and no undo record. The copy is now rolled
+  back when the source cannot be taken away.
+
+- **Replace keeps what it overwrote.** Undo of a Replace no longer deletes a
+  pre-existing destination along with the pasted copy: the earlier bytes are
+  kept and restored. This also applies to Cut, where the backup used to be
+  discarded, and a cancelled copy puts the original back rather than leaving
+  a partial tree.
+
+- **Multi-item undo and redo no longer strand the rest.** A single failed trash
+  restore or copy redo used to abort the remaining items and leave a stale
+  aggregate on the stack; each item is now attempted on its own.
+
+- **Nested selections are moved once.** A folder and a child inside it used to
+  move the folder, then fail on the vanished child, reporting a false error and
+  an incomplete undo record. A symlink chosen as a source is copied as a link
+  instead of being walked into its own target.
+
+- **Drops on folded address-bar crumbs land on the folder shown.** The displayed
+  crumb position was used against the full path, so with a repeated folder name
+  a drop on the deepest `Folder 1` landed in the shallow one. Files could end
+  up in the wrong place or prompt a false overwrite. Crumbs now carry the real
+  path index.
+
+- **The rubber-band selector starts at the cursor when scrolled.** The band's
+  origin had the scroll offset subtracted twice, putting the blue rectangle
+  and its selection one scroll above the pointer.
+
+- **Other interface fixes.** Renaming in search mode now targets the selected
+  result; a no-op rename no longer jams undo; a second operation cannot replace
+  the in-flight one; a completed cut consumes the clipboard; OS drags dropped
+  back on the window follow the volume rule; and self-paste through a hard link
+  is refused instead of truncating the file.
 
 ## [0.3.5]
 

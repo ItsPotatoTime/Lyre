@@ -1653,7 +1653,10 @@ mod tests {
         let outcome = delete(DeleteMode::Trash, &[first.clone(), second.clone()], &AtomicBool::new(false), noop);
         assert_eq!(outcome.trashed.len(), 2);
         fs::write(&first, b"recreated").unwrap(); // this restore will fail
-        let (left, _) = restore_each(&outcome.trashed).expect_err("one item cannot be restored");
+        let left = match restore_each(&outcome.trashed) {
+            Ok(_) => panic!("one item cannot be restored"),
+            Err((left, _)) => left,
+        };
         assert_eq!(left.len(), 1, "only the failed item is left for the next press");
         assert!(second.exists(), "the other item came back");
         let _ = fs::remove_dir_all(&dir);

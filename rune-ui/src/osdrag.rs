@@ -162,15 +162,33 @@ fn snapshot(src: &Path, dst: &Path, budget: &mut usize, depth: usize) -> bool {
     }
 }
 
+/// Whether a path is one of this module's staging roots. A name prefix alone is
+/// not enough: a person can have a real folder called `lyre-drop-...`, and it
+/// must never be removed. A root is created under the system temp directory
+/// with the exact `<prefix><pid>-<counter>` name below.
+fn is_staging_root(path: &Path) -> bool {
+    if !path.starts_with(std::env::temp_dir()) {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(rest) = name.strip_prefix(PREFIX) else {
+        return false;
+    };
+    let mut parts = rest.split('-');
+    let digits = |part: Option<&str>| {
+        part.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    };
+    digits(parts.next()) && digits(parts.next()) && parts.next().is_none()
+}
+
 /// Release a staging root once its paste finished; only folders this module
 /// created are ever removed.
 pub fn release(paths: &[PathBuf]) {
     for path in paths {
         for ancestor in path.ancestors() {
-            if ancestor
-                .file_name()
-                .is_some_and(|n| n.to_string_lossy().starts_with(PREFIX))
-            {
+            if is_staging_root(ancestor) {
                 let _ = std::fs::remove_dir_all(ancestor);
                 break;
             }
@@ -182,9 +200,7 @@ pub fn release(paths: &[PathBuf]) {
 pub fn sweep_stale() {
     let Ok(reader) = std::fs::read_dir(std::env::temp_dir()) else { return };
     for item in reader.flatten() {
-        let name = item.file_name();
-        let name = name.to_string_lossy();
-        if !name.starts_with(PREFIX) {
+        if !is_staging_root(&item.path()) {
             continue;
         }
         let old = item
@@ -1602,6 +1618,22 @@ mod tests {
         let out = stage(std::slice::from_ref(&folder));
         assert!(out.is_empty(), "a folder that cannot be staged whole is left out, not staged in part");
         release(&out);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A real user folder whose name starts with the staging prefix is passed
+    /// through by stage and must survive release untouched.
+    #[test]
+    fn a_user_folder_named_like_a_staging_root_is_never_released() {
+        let base = std::env::current_dir().unwrap().join("bughunt-userdata");
+        let victim = base.join("lyre-drop-victim");
+        let _ = std::fs::remove_dir_all(&base);
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("precious.txt"), b"do not delete").unwrap();
+        let staged = stage(std::slice::from_ref(&victim));
+        assert_eq!(staged, vec![victim.clone()], "a non-temp path passes through");
+        release(&staged);
+        assert!(victim.join("precious.txt").exists(), "user data must survive release");
         let _ = std::fs::remove_dir_all(&base);
     }
 

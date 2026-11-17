@@ -2128,10 +2128,10 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
         let next = (off + auto_scroll as f32 * 28.0).clamp(0.0, max);
         if next != off {
             tx.scroll_to_instant("viewport", 0.0, next);
-            if let Some(m) = s.marquee.as_mut() {
-                m.y1 += next - off;
-            }
-            apply_marquee_at(s, next);
+            // The band is held in viewport-local window points: the pointer does
+            // not move while the list scrolls under it, so its ends stay put and
+            // the moving rows are what enter the band.
+            apply_marquee(s);
             changed = true;
         }
         tx.wake_after(std::time::Duration::from_millis(16));
@@ -4325,12 +4325,16 @@ fn address_row(s: &App, p: Paint) -> El {
         let segments = crumb_segments(s);
         // Deep paths keep their head and tail and fold the middle, as Explorer
         // does; the fold opens the editor with the whole path.
-        let folded: Vec<Option<&(String, PathBuf)>> = if segments.len() > 5 {
-            let mut v = vec![Some(&segments[0]), None];
-            v.extend(segments[segments.len() - 3..].iter().map(Some));
+        // Keep each displayed crumb's index into the full segment list. The
+        // fold is not a segment, and dropping on a displayed crumb must resolve
+        // to that exact prefix — not to the same display position in the
+        // unfolded list, which lands on a different folder when names repeat.
+        let folded: Vec<Option<usize>> = if segments.len() > 5 {
+            let mut v = vec![Some(0), None];
+            v.extend((segments.len() - 3..segments.len()).map(Some));
             v
         } else {
-            segments.iter().map(Some).collect()
+            (0..segments.len()).map(Some).collect()
         };
         let mut bar = row()
             .key("breadcrumb")
@@ -4351,7 +4355,7 @@ fn address_row(s: &App, p: Paint) -> El {
                 View::Files => ico(p, Ico::ThisPc, 15.0, p.secondary),
                 _ => place_glyph(place_of(s.view, &s.root).index(), 15.0),
             });
-        for (i, segment) in folded.iter().enumerate() {
+        for &segment in folded.iter() {
             bar = bar.child(ico(p, Ico::ChevronRight, 10.0, p.tertiary));
             match segment {
                 None => {
@@ -4367,27 +4371,26 @@ fn address_row(s: &App, p: Paint) -> El {
                             .on_press(|s: &mut App| begin_address_edit(s)),
                     );
                 }
-                Some((label, path)) => {
+                Some(si) => {
+                    let (label, path) = &segments[si];
                     let tip = if path.as_os_str().is_empty() {
                         label.clone()
                     } else {
                         path.to_string_lossy().into_owned()
                     };
                     let path = path.clone();
+                    let drop_path = path.clone();
                     bar = bar.child(
-                        el().key(format!("crumb-{i}"))
+                        el().key(format!("crumb-{si}"))
                             .on_drop_files(move |s: &mut App, files, tx: &mut Tx| {
-                                let t = crumb_segments(s)
-                                    .get(i)
-                                    .map(|(_, p)| p.clone())
-                                    .filter(|p| !p.as_os_str().is_empty())
-                                    .map(DropTarget::Folder);
+                                let t = (!drop_path.as_os_str().is_empty())
+                                    .then(|| DropTarget::Folder(drop_path.clone()));
                                 take_drop(s, t, files, tx);
                             })
                             .h(22.0)
                             .px(4.0)
                             .radius(3.0)
-                            .fill(if drop_hot(s, &format!("crumb-{i}")) { p.hover } else { Color::TRANSPARENT })
+                            .fill(if drop_hot(s, &format!("crumb-{si}")) { p.hover } else { Color::TRANSPARENT })
                             .hover(p.hover)
                             .center()
                             .child(text(label.as_str()).font(UI_TEXT).color(p.text).truncate())
@@ -7101,16 +7104,18 @@ fn context_target_at(s: &App, x: f32, y: f32) -> (CtxScope, usize) {
     (CtxScope::Background, 0)
 }
 
-/// Select every visible row whose drawn rect the band crosses, at a given
-/// scroll offset (the live one, or the offset a poll is about to scroll to).
-fn apply_marquee_at(s: &mut App, off: f32) {
+/// Select every visible row whose drawn rect the band crosses. The drag point
+/// is already relative to the viewport's drawn frame, so adding the viewport
+/// origin gives a window point — the recorded row rects are window points too.
+/// Subtracting the scroll offset here would lift the band off the cursor.
+fn apply_marquee(s: &mut App) {
     let Some(m) = s.marquee.as_ref() else { return };
     let vp = s.viewport_rect.get();
     let [mx0, my0, mx1, my1] = [
         vp[0] + m.x0.min(m.x1),
-        vp[1] - off + m.y0.min(m.y1),
+        vp[1] + m.y0.min(m.y1),
         vp[0] + m.x0.max(m.x1),
-        vp[1] - off + m.y0.max(m.y1),
+        vp[1] + m.y0.max(m.y1),
     ];
     let base = m.base.clone();
     let len = display_len(s);
@@ -7129,12 +7134,6 @@ fn apply_marquee_at(s: &mut App, off: f32) {
     update_selection_detail(s);
 }
 
-/// Select every visible row whose drawn rect the band crosses.
-fn apply_marquee(s: &mut App) {
-    let off = s.scroll_off.get();
-    apply_marquee_at(s, off);
-}
-
 /// Which way the band should push the viewport: -1 up, 1 down, 0 none. The
 /// pointer's window y is compared with the viewport's edges.
 fn marquee_auto_scroll(s: &App, d: &rune::Drag) -> i8 {
@@ -7142,8 +7141,7 @@ fn marquee_auto_scroll(s: &App, d: &rune::Drag) -> i8 {
     if vp[3] <= 0.0 {
         return 0;
     }
-    let off = s.scroll_off.get();
-    let wy = vp[1] - off + d.y;
+    let wy = vp[1] + d.y;
     let edge = 48.0;
     if wy < vp[1] + edge {
         -1
@@ -7509,12 +7507,13 @@ fn drag_overlay(s: &App, p: Paint) -> El {
         )
 }
 
-/// The blue rubber-band rectangle. The drag is recorded in content coordinates;
-/// subtract the scroll offset to place it in the list area's own coordinates.
+/// The blue rubber-band rectangle. The drag is recorded relative to the
+/// viewport's drawn frame, which is the same origin this overlay is placed in,
+/// so no scroll conversion is needed.
 fn marquee_overlay(s: &App, p: Paint) -> El {
     let Some(m) = &s.marquee else { return el().key("marquee-none") };
     let x = m.x0.min(m.x1);
-    let y = m.y0.min(m.y1) - s.scroll_off.get();
+    let y = m.y0.min(m.y1);
     let w = (m.x0 - m.x1).abs().max(1.0);
     let h = (m.y0 - m.y1).abs().max(1.0);
     el().key("marquee")
@@ -9516,7 +9515,7 @@ fn quick_access_content(s: &App, p: Paint) -> El {
                     .child(text("No recent files yet").font(CAPTION).color(p.tertiary)),
             );
         }
-        for &ei in s.visible.iter() {
+        for (row_idx, &ei) in s.visible.iter().enumerate() {
             let e = &s.entries[ei];
             let selected = is_selected(s, ei);
             let mut row = row()
@@ -9575,7 +9574,7 @@ fn quick_access_content(s: &App, p: Paint) -> El {
                     }
                     st.menu = Some(Menu::Context { scope: CtxScope::Item, target: ei, x: at.x, y: at.y });
                 });
-            table = table.child(os_drag_source(marquee_track(row, ei), ei));
+            table = table.child(os_drag_source(marquee_track(row, row_idx), ei));
         }
     } else if s.favorites.is_empty() {
         table = table.child(
@@ -11556,6 +11555,26 @@ mod tests {
         assert_eq!(crumb_segments(&s)[0].0, "Gallery");
     }
 
+    /// A folded breadcrumb's key carries the full segment index, so a drop on
+    /// the displayed deepest folder resolves to that folder even when an
+    /// earlier folder has the same name.
+    #[test]
+    fn a_folded_crumb_drop_resolves_to_the_displayed_folder() {
+        let mut s = init();
+        s.view = View::Files;
+        s.root = if cfg!(windows) {
+            PathBuf::from("C:\\Users\\bob\\Downloads\\Folder 1\\Folder 2\\Folder 1")
+        } else {
+            PathBuf::from("/home/bob/Downloads/Folder 1/Folder 2/Folder 1")
+        };
+        let segs = crumb_segments(&s);
+        assert!(segs.len() > 5, "this path folds");
+        let deepest = segs.len() - 1;
+        assert_eq!(segs[deepest].0, segs[deepest - 2].0, "the name repeats");
+        let (_, target) = parse_drop_target(&s, &format!("window/breadcrumb/crumb-{deepest}"));
+        assert_eq!(target, Some(DropTarget::Folder(segs[deepest].1.clone())));
+    }
+
     /// The reported bug: This PC was left selected beside the pinned folder
     /// that had replaced it, because the rail lit whichever row was last
     /// pressed and nothing cleared it. Selection now comes from the location,
@@ -11828,6 +11847,44 @@ mod tests {
 #[cfg(test)]
 mod click_tests {
     use super::*;
+
+    /// A band drawn while scrolled must start at the pointer, not one scroll
+    /// offset above it, and must select the rows it visually covers.
+    #[test]
+    fn a_marquee_on_a_scrolled_list_selects_the_rows_under_it() {
+        let mut s = init();
+        s.view = View::Files;
+        s.viewport_rect.set([0.0, 100.0, 800.0, 400.0]);
+        // The list is scrolled down; the row under the pointer is drawn at y=130.
+        s.scroll_off.set(120.0);
+        s.marquee_rects.replace(vec![[0.0, 130.0, 100.0, 150.0]]);
+        s.entries = vec![crate::Entry {
+            name: "one.txt".into(),
+            path: "/x/one.txt".into(),
+            is_dir: false,
+            size: 0,
+            modified: String::new(),
+            modified_at: None,
+            type_label: "Text".into(),
+            kind: crate::Kind::Text,
+            hidden: false,
+            system: false,
+            fixture: false,
+            fixture_size: String::new(),
+        }];
+        refresh_visible(&mut s);
+        // Pointer at window y=140 -> viewport-local y=40.
+        s.marquee = Some(Marquee {
+            x0: 10.0,
+            y0: 40.0,
+            x1: 60.0,
+            y1: 80.0,
+            base: Vec::new(),
+            auto_scroll: 0,
+        });
+        apply_marquee(&mut s);
+        assert_eq!(s.selected, vec![0], "the row under the band is selected");
+    }
 
     /// What hangs past the right edge of a window this size.
     fn past_the_edge(width: f32, height: f32, prepare: impl Fn(&mut App)) -> Vec<(String, [f32; 4])> {

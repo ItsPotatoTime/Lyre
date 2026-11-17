@@ -660,6 +660,7 @@ fn apply_osdrop(tx: &mut Tx, at: (f32, f32), paths: Vec<PathBuf>) {
         // volume rule as an internal drag; a drop from outside always copies.
         let labels: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
         let own = s.os_drag.as_ref().is_some_and(|p| *p == labels);
+        s.os_drag = None;
         let mode = if own {
             drop_mode(s, &labels, target.as_ref(), shift)
         } else {
@@ -682,6 +683,7 @@ fn take_drop(s: &mut App, target: Option<DropTarget>, files: &[PathBuf], tx: &mu
     let Some(tp) = drop_target_path(s, target.as_ref()) else { return };
     let paths: Vec<String> = files.iter().map(|p| p.to_string_lossy().into_owned()).collect();
     let own = s.os_drag.as_ref().is_some_and(|p| *p == paths);
+    s.os_drag = None;
     let mode = if own {
         drop_mode(s, &paths, target.as_ref(), tx.mods().shift)
     } else {
@@ -7367,6 +7369,9 @@ fn row_drag(s: &mut App, rect_i: usize, ei: usize, d: &mut rune::Drag, tx: &mut 
                     let paths: Vec<PathBuf> = dr.paths.iter().map(PathBuf::from).collect();
                     s.drag = None;
                     s.drag_press = None;
+                    // Remember what is being dragged so a drop back on our own
+                    // window follows the same volume rule as an internal drag.
+                    s.os_drag = Some(paths.iter().map(|p| p.to_string_lossy().into_owned()).collect());
                     // Hand over on the next frame, so this one paints without
                     // the ghost before the OS takes the pointer over.
                     s.pending_os_drag = Some((paths, drag_preview(s, ei)));
@@ -7380,6 +7385,7 @@ fn row_drag(s: &mut App, rect_i: usize, ei: usize, d: &mut rune::Drag, tx: &mut 
                     let paths: Vec<PathBuf> = dr.paths.iter().map(PathBuf::from).collect();
                     s.drag = None;
                     s.drag_press = None;
+                    s.os_drag = Some(paths.iter().map(|p| p.to_string_lossy().into_owned()).collect());
                     osdrag::linux::start_drag_out(&paths);
                     return;
                 }

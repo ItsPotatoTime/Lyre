@@ -247,6 +247,7 @@ pub struct Deleted {
 
 /// Put deleted items back where they came from, newest first, so a folder is
 /// restored before anything that was inside it.
+#[allow(dead_code)]
 pub fn restore(items: &[Trashed]) -> Result<(), String> {
     for item in items.iter().rev() {
         restore_one(item)?;
@@ -681,6 +682,7 @@ pub fn paste<F: FnMut(Progress) -> bool>(
 /// destination that has been taken since is refused rather than written
 /// over: the redo recreates what the copy made, it does not replace what
 /// is there now.
+#[allow(dead_code)]
 pub fn copy_again(pairs: &[(PathBuf, PathBuf)]) -> Result<(), String> {
     let cancel = AtomicBool::new(false);
     for (from, to) in pairs {
@@ -695,7 +697,9 @@ pub fn copy_again(pairs: &[(PathBuf, PathBuf)]) -> Result<(), String> {
 /// Redo a multi-item copy one item at a time, leaving only what failed for
 /// the next press. The all-or-nothing version retried from the start and was
 /// blocked forever by the copies that had already landed.
-pub fn copy_again_each(pairs: &[(PathBuf, PathBuf)]) -> Result<Vec<(PathBuf, PathBuf)>, (Vec<(PathBuf, PathBuf)>, String)> {
+type CopiedPairs = Vec<(PathBuf, PathBuf)>;
+
+pub fn copy_again_each(pairs: &[(PathBuf, PathBuf)]) -> Result<CopiedPairs, (CopiedPairs, String)> {
     let cancel = AtomicBool::new(false);
     let mut left = Vec::new();
     let mut error = None;

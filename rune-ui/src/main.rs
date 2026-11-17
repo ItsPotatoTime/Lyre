@@ -7986,7 +7986,7 @@ fn take_back(action: &Undo) -> Stepped {
                 } else {
                     Some(action.clone())
                 },
-                left: (!left.is_empty()).then(|| Undo::Trashed { items: left }),
+                left: (!left.is_empty()).then_some(Undo::Trashed { items: left }),
                 error: Some(format!("Could not take it out of the trash: {e}")),
             },
         },

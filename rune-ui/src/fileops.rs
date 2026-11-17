@@ -330,8 +330,29 @@ fn move_item(
     if fs::rename(src, dst).is_ok() {
         return Ok(());
     }
-    copy_item(src, dst, cancel, report)?;
-    remove_item(src)
+    // A copy fallback can succeed while the source cannot be removed (a locked
+    // file, a deny-delete ACL). Leaving both behind silently duplicated the
+    // item, and because the step returned Err nothing reached the undo stack.
+    // Roll the copy back so a failed move leaves the original state intact.
+    let dst_existed = fs::symlink_metadata(dst).is_ok();
+    if let Err(e) = copy_item(src, dst, cancel, report) {
+        if !dst_existed {
+            let _ = remove_item(dst);
+        }
+        return Err(e);
+    }
+    if let Err(e) = remove_item(src) {
+        if !dst_existed {
+            if let Err(rollback) = remove_item(dst) {
+                return Err(format!(
+                    "Could not remove the original: {e}; the copy at {} could not be removed either: {rollback}",
+                    dst.display()
+                ));
+            }
+        }
+        return Err(format!("Could not remove the original: {e}"));
+    }
+    Ok(())
 }
 
 /// Move one item to a full destination path, for the steps of undo and
@@ -1260,6 +1281,41 @@ mod tests {
         assert_eq!(outcome.trashed.len(), 1, "its record survived the failure");
         assert!(outcome.error.is_some(), "the failure is reported");
         assert!(!gone.exists(), "the first item still went to the trash");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A locked child makes rename fail. The copy fallback must not leave two
+    /// copies behind when the source then refuses to be removed.
+    #[cfg(windows)]
+    #[test]
+    fn a_move_that_cannot_remove_the_source_leaves_no_duplicate() {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = scratch("locked-move");
+        let src = dir.join("folder");
+        fs::create_dir_all(&src).unwrap();
+        let locked = src.join("inuse.txt");
+        fs::write(&locked, b"payload").unwrap();
+        let out = dir.join("out");
+        fs::create_dir_all(&out).unwrap();
+        let holder = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(3) // FILE_SHARE_READ | FILE_SHARE_WRITE, not DELETE
+            .open(&locked)
+            .unwrap();
+
+        let pasted = paste(
+            Mode::Cut,
+            Conflict::Rename,
+            std::slice::from_ref(&src),
+            &out,
+            &AtomicBool::new(false),
+            noop,
+        );
+        drop(holder);
+        assert!(pasted.error.is_some(), "the move reports why it stopped");
+        assert!(locked.exists(), "the original stays");
+        assert!(!out.join("folder").exists(), "and no duplicate was left behind");
         let _ = fs::remove_dir_all(&dir);
     }
 

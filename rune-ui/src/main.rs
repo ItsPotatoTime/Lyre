@@ -516,9 +516,6 @@ enum Undo {
         pairs: Vec<(PathBuf, PathBuf)>,
         replaced: Vec<fileops::Replaced>,
     },
-    /// A Replace that has been undone: the new bytes are gone and the old ones
-    /// are back. Redo swaps them the other way again.
-    Replaced { items: Vec<fileops::Replaced> },
     /// Items were moved away, so taking it back puts each one back.
     Moved { pairs: Vec<(PathBuf, PathBuf)> },
     /// Items went to the trash, so taking it back brings them out again.
@@ -7953,19 +7950,6 @@ impl Stepped {
 /// Reverse one operation on disk.
 fn take_back(action: &Undo) -> Stepped {
     match action {
-        Undo::Replaced { items } => {
-            let mut failed = None;
-            for r in items.iter().rev() {
-                if let Err(e) = fileops::swap_back(r) {
-                    failed = Some(format!("Could not restore what was replaced: {e}"));
-                    break;
-                }
-            }
-            match failed {
-                None => Stepped::whole(action),
-                Some(e) => Stepped::stopped(action, e),
-            }
-        },
         Undo::Rename { from, to } => match fileops::relocate(to, from) {
             Ok(()) => Stepped::whole(action),
             Err(e) => Stepped::stopped(action, format!("Could not put the name back: {e}")),
@@ -8078,21 +8062,6 @@ fn put_back(action: &Undo) -> Stepped {
                 }
             }
             step
-        },
-        // Older stacks may still hold a bare backup step; applying it in the
-        // original order recreates the replaced bytes.
-        Undo::Replaced { items } => {
-            let mut failed = None;
-            for r in items.iter() {
-                if let Err(e) = fileops::swap_forward(r) {
-                    failed = Some(format!("Could not replace it again: {e}"));
-                    break;
-                }
-            }
-            match failed {
-                None => Stepped::whole(action),
-                Some(e) => Stepped::stopped(action, e),
-            }
         },
         Undo::Moved { pairs } => step_moved(pairs.clone(), false),
         Undo::Trashed { items } => {

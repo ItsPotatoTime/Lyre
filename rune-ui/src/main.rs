@@ -929,8 +929,9 @@ struct App {
     transfer: Option<Transfer>,
     op_rx: Option<std::sync::mpsc::Receiver<OpMsg>>,
     op_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
-    /// Whether the in-flight operation is a cut-move that consumed the clipboard.
-    op_was_cut: bool,
+    /// The cut sources the in-flight paste consumed, so a different cut made
+    /// while it runs is not accidentally cleared from the clipboard.
+    op_cut_paths: Option<Vec<PathBuf>>,
     /// Handler items for the open menu, memoised by the selection they were read
     /// for: building them instantiates a third-party DLL, which is far too much
     /// to repeat on every frame the menu is drawn.
@@ -2828,7 +2829,7 @@ fn init() -> App {
         transfer: None,
         op_rx: None,
         op_cancel: None,
-        op_was_cut: false,
+        op_cut_paths: None,
         menu_handler_rows: RefCell::new(None),
         preview_facts: RefCell::new(None),
         rail_open: Vec::new(),
@@ -8238,7 +8239,11 @@ fn start_paste(s: &mut App, mode: fileops::Mode, conflict: fileops::Conflict, so
     let worker_cancel = cancel.clone();
     s.op_rx = Some(rx);
     s.op_cancel = Some(cancel);
-    s.op_was_cut = mode == fileops::Mode::Cut;
+    s.op_cut_paths = if mode == fileops::Mode::Cut {
+        s.clipboard.as_ref().filter(|(_, m)| *m == fileops::Mode::Cut).map(|(p, _)| p.clone())
+    } else {
+        None
+    };
     s.transfer = Some(Transfer { label, name: String::new(), done: 0, total, done_bytes: 0, total_bytes: 0, stopping: false });
     std::thread::spawn(move || {
         let progress_tx = tx.clone();
@@ -8284,7 +8289,7 @@ fn start_delete(s: &mut App, mode: fileops::DeleteMode, paths: Vec<PathBuf>) {
     let worker_cancel = cancel.clone();
     s.op_rx = Some(rx);
     s.op_cancel = Some(cancel);
-    s.op_was_cut = false;
+    s.op_cut_paths = None;
     s.transfer = Some(Transfer { label: "Deleting", name: String::new(), done: 0, total, done_bytes: 0, total_bytes: 0, stopping: false });
     std::thread::spawn(move || {
         let progress_tx = tx.clone();
@@ -8478,10 +8483,14 @@ fn drain_op(s: &mut App) -> bool {
         // otherwise use paths that no longer exist. Only the cut paste that
         // actually ran does this — deleting an unrelated item must not drop a
         // different cut waiting to be pasted.
-        if s.op_was_cut && s.clipboard.as_ref().is_some_and(|(_, mode)| *mode == fileops::Mode::Cut) {
+        let cut = s.op_cut_paths.take();
+        if cut.is_some()
+            && s.clipboard.as_ref().is_some_and(|(paths, mode)| {
+                *mode == fileops::Mode::Cut && Some(paths) == cut.as_ref()
+            })
+        {
             s.clipboard = None;
         }
-        s.op_was_cut = false;
         let staged = std::mem::take(&mut s.drop_staged);
         osdrag::release(&staged);
         clear_selection(s);

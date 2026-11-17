@@ -1780,6 +1780,28 @@ mod tests {
 
     /// A hard link to the source is the same file; pasting onto it must not
     /// truncate the bytes through the alias.
+    #[cfg(windows)]
+    #[test]
+    fn a_paste_onto_a_hard_link_is_refused() {
+        let dir = scratch("hardlink-win");
+        let target = dir.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let src = dir.join("source.txt");
+        fs::write(&src, b"precious").unwrap();
+        fs::hard_link(&src, target.join("source.txt")).unwrap();
+        let pasted = paste(
+            Mode::Copy,
+            Conflict::Overwrite,
+            std::slice::from_ref(&src),
+            &target,
+            &AtomicBool::new(false),
+            noop,
+        );
+        assert!(pasted.error.is_some(), "the self-paste is refused: {:?}", pasted.error);
+        assert_eq!(fs::read_to_string(&src).unwrap(), "precious", "the bytes survive");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_paste_onto_a_hard_link_is_refused() {
@@ -1788,7 +1810,7 @@ mod tests {
         fs::create_dir_all(&target).unwrap();
         let src = dir.join("source.txt");
         fs::write(&src, b"precious").unwrap();
-        fs::hard_link(&src, target.join("alias.txt")).unwrap();
+        fs::hard_link(&src, target.join("source.txt")).unwrap();
         let pasted = paste(
             Mode::Copy,
             Conflict::Overwrite,

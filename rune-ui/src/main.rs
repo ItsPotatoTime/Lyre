@@ -990,6 +990,8 @@ struct App {
     bin_rx: Option<std::sync::mpsc::Receiver<Vec<fileops::BinItem>>>,
     /// A recent listing, reused when the place is reopened at once.
     bin_cache: Option<(Instant, Vec<fileops::BinItem>)>,
+    /// Emptying the bin is irreversible, so the first press only arms it.
+    bin_confirm: bool,
     /// How many entries the running scan has reached, for the status bar.
     scan_seen: usize,
     /// The open modal dialog (delete confirm, paste conflict, rename, new folder).
@@ -2499,6 +2501,7 @@ fn open_this_pc(s: &mut App) {
 /// rather than showing an empty folder that looks like the whole trash.
 fn open_recycle_bin(s: &mut App) {
     s.menu = None;
+    s.bin_confirm = false;
     // Lyre's Unix trash is freedesktop's, not Finder's ~/.Trash, so an in-app
     // listing here would show only Lyre's own deletions. Open the real one.
     #[cfg(target_os = "macos")]
@@ -3047,6 +3050,7 @@ fn init() -> App {
         scan_cancel: None,
         bin_rx: None,
         bin_cache: None,
+        bin_confirm: false,
         scan_seen: 0,
         dialog: None,
         dialog_focus: 0,
@@ -4817,6 +4821,26 @@ fn command_bar(s: &App, p: Paint) -> El {
                 }
             }));
         }
+    }
+    if s.view == View::RecycleBin {
+        bar = bar.child(
+            label_button(Ico::Delete, "Empty", false)
+                .key("cmd-empty-bin")
+                .help("Empty the Recycle Bin")
+                .on_press(|s: &mut App| {
+                    if !s.bin_confirm {
+                        s.bin_confirm = true;
+                        s.notice = "Press Empty again to delete everything in the bin permanently".into();
+                        return;
+                    }
+                    s.bin_confirm = false;
+                    match fileops::bin_empty() {
+                        Ok(()) => s.notice = "Recycle Bin emptied".into(),
+                        Err(e) => s.notice = e,
+                    }
+                    spawn_bin_scan(s);
+                }),
+        );
     }
     bar = bar
         .child(el().w(p.hair).h(20.0).fill(p.line).mx(6.0))

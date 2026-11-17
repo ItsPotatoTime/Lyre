@@ -232,6 +232,30 @@ pub fn restore(items: &[Trashed]) -> Result<(), String> {
     Ok(())
 }
 
+/// Restore as many as can be brought back, reporting the first error after
+/// trying all of them. A single bad record must not strand every other item
+/// in the trash with no way back.
+pub fn restore_each(items: &[Trashed]) -> Result<Vec<Trashed>, (Vec<Trashed>, String)> {
+    let mut left = Vec::new();
+    let mut error = None;
+    for item in items.iter().rev() {
+        match restore_one(item) {
+            Ok(()) => {}
+            Err(e) => {
+                if error.is_none() {
+                    error = Some(e);
+                }
+                left.push(item.clone());
+            }
+        }
+    }
+    left.reverse();
+    match error {
+        None => Ok(Vec::new()),
+        Some(e) => Err((left, e)),
+    }
+}
+
 /// Bring one item back out of the trash.
 #[cfg(windows)]
 fn restore_one(item: &Trashed) -> Result<(), String> {
@@ -621,6 +645,32 @@ pub fn copy_again(pairs: &[(PathBuf, PathBuf)]) -> Result<(), String> {
         copy_item(from, to, &cancel, &mut |_| {})?;
     }
     Ok(())
+}
+
+/// Redo a multi-item copy one item at a time, leaving only what failed for
+/// the next press. The all-or-nothing version retried from the start and was
+/// blocked forever by the copies that had already landed.
+pub fn copy_again_each(pairs: &[(PathBuf, PathBuf)]) -> Result<Vec<(PathBuf, PathBuf)>, (Vec<(PathBuf, PathBuf)>, String)> {
+    let cancel = AtomicBool::new(false);
+    let mut left = Vec::new();
+    let mut error = None;
+    for (from, to) in pairs {
+        let result = if fs::symlink_metadata(to).is_ok() {
+            Err(format!("{} is there already.", to.display()))
+        } else {
+            copy_item(from, to, &cancel, &mut |_| {})
+        };
+        if let Err(e) = result {
+            if error.is_none() {
+                error = Some(e);
+            }
+            left.push((from.clone(), to.clone()));
+        }
+    }
+    match error {
+        None => Ok(Vec::new()),
+        Some(e) => Err((left, e)),
+    }
 }
 
 /// Delete `paths` to the trash or permanently, reporting progress. Like
@@ -1515,6 +1565,24 @@ mod tests {
             Some("precious"),
             "the replaced file was restored"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// One bad trash record must not strand the rest of a multi-delete undo.
+    #[cfg(unix)]
+    #[test]
+    fn restoring_a_multi_delete_brings_back_every_item_it_can() {
+        let dir = scratch("restore-each");
+        let first = dir.join("one.txt");
+        let second = dir.join("two.txt");
+        fs::write(&first, b"one").unwrap();
+        fs::write(&second, b"two").unwrap();
+        let outcome = delete(DeleteMode::Trash, &[first.clone(), second.clone()], &AtomicBool::new(false), noop);
+        assert_eq!(outcome.trashed.len(), 2);
+        fs::write(&first, b"recreated").unwrap(); // this restore will fail
+        let (left, _) = restore_each(&outcome.trashed).expect_err("one item cannot be restored");
+        assert_eq!(left.len(), 1, "only the failed item is left for the next press");
+        assert!(second.exists(), "the other item came back");
         let _ = fs::remove_dir_all(&dir);
     }
 

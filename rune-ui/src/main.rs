@@ -7950,9 +7950,17 @@ fn take_back(action: &Undo) -> Stepped {
             step
         },
         Undo::Moved { pairs } => step_moved(pairs.clone(), true),
-        Undo::Trashed { items } => match fileops::restore(items) {
-            Ok(()) => Stepped::whole(action),
-            Err(e) => Stepped::stopped(action, format!("Could not take it out of the trash: {e}")),
+        Undo::Trashed { items } => match fileops::restore_each(items) {
+            Ok(_) => Stepped::whole(action),
+            Err((left, e)) => Stepped {
+                went: if left.len() == items.len() {
+                    None
+                } else {
+                    Some(action.clone())
+                },
+                left: (!left.is_empty()).then(|| Undo::Trashed { items: left }),
+                error: Some(format!("Could not take it out of the trash: {e}")),
+            },
         },
     }
 }
@@ -7968,9 +7976,17 @@ fn put_back(action: &Undo) -> Stepped {
             Ok(()) => Stepped::whole(action),
             Err(e) => Stepped::stopped(action, format!("Could not make the folder again: {e}")),
         },
-        Undo::Copied { pairs, .. } => match fileops::copy_again(pairs) {
-            Ok(()) => Stepped::whole(action),
-            Err(e) => Stepped::stopped(action, format!("Could not copy it again: {e}")),
+        Undo::Copied { pairs, replaced } => match fileops::copy_again_each(pairs) {
+            Ok(_) => Stepped::whole(action),
+            Err((left, e)) => Stepped {
+                went: if left.len() == pairs.len() {
+                    None
+                } else {
+                    Some(Undo::Copied { pairs: pairs.clone(), replaced: replaced.clone() })
+                },
+                left: (!left.is_empty()).then(|| Undo::Copied { pairs: left, replaced: Vec::new() }),
+                error: Some(format!("Could not copy it again: {e}")),
+            },
         },
         Undo::Replaced { items } => {
             let mut failed = None;

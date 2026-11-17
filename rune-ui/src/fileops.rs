@@ -586,7 +586,10 @@ pub fn paste<F: FnMut(Progress) -> bool>(
             });
         }
     }
-    let total = sources.len();
+    // Only sources that are actually attempted count toward the item total;
+    // covered descendants are skipped below and must not leave the bar short.
+    let total = covered.iter().filter(|&&skipped| !skipped).count();
+    let mut shown = 0usize;
     let total_bytes: u64 = sources
         .iter()
         .enumerate()
@@ -603,17 +606,18 @@ pub fn paste<F: FnMut(Progress) -> bool>(
     let mut last_emit = std::time::Instant::now();
     let mut last_bytes = 0u64;
     let step = (total_bytes / 16).max(1);
-    for (i, src) in sources.iter().enumerate() {
-        if covered[i] {
+    for (src, &is_covered) in sources.iter().zip(covered.iter()) {
+        if is_covered {
             continue;
         }
         if cancel.load(Ordering::Relaxed) {
             break;
         }
         let name = name_of(src);
-        if !emit(Progress { done: i, total, name: name.clone(), done_bytes, total_bytes }) {
+        if !emit(Progress { done: shown, total, name: name.clone(), done_bytes, total_bytes }) {
             break;
         }
+        shown += 1;
         // Measured before the item goes: after a cut the source is gone and
         // reads as zero, so a move's progress never reached the total.
         let size_before = item_size(src);
@@ -625,7 +629,7 @@ pub fn paste<F: FnMut(Progress) -> bool>(
                 {
                     last_emit = std::time::Instant::now();
                     last_bytes = done_bytes;
-                    emit(Progress { done: i, total, name: name.clone(), done_bytes, total_bytes });
+                    emit(Progress { done: shown, total, name: name.clone(), done_bytes, total_bytes });
                 }
             };
             paste_one(mode, conflict, src, target, cancel, &mut report, &mut replaced)
@@ -650,7 +654,7 @@ pub fn paste<F: FnMut(Progress) -> bool>(
                 if error.is_some() {
                     break;
                 }
-                emit(Progress { done: i + 1, total, name, done_bytes, total_bytes });
+                emit(Progress { done: shown, total, name, done_bytes, total_bytes });
             }
             Err(e) => {
                 // Anything set aside for this item goes back rather than

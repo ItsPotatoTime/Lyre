@@ -703,7 +703,7 @@ fn drag_paths(s: &App, ei: usize) -> Vec<PathBuf> {
     if s.selected.contains(&ei) {
         selected_paths(s)
     } else {
-        vec![PathBuf::from(&s.entries[ei].path)]
+        vec![PathBuf::from(&entry_by_index(s, ei).path)]
     }
 }
 
@@ -711,8 +711,17 @@ fn drag_paths(s: &App, ei: usize) -> Vec<PathBuf> {
 /// Lyre's own ghost is a window overlay and cannot follow it out there.
 #[cfg(target_os = "windows")]
 fn drag_preview(s: &App, ei: usize) -> Option<osdrag::DragPreview> {
-    let entry = s.entries.get(ei)?;
-    let (width, height, rgba) = imagery::icon_rgba(&entry.path, entry.is_dir, 48)?;
+    let path = if s.searching {
+        s.search_hits.get(ei).map(|h| h.entry.path.clone())
+    } else {
+        s.entries.get(ei).map(|e| e.path.clone())
+    }?;
+    let is_dir = if s.searching {
+        s.search_hits[ei].entry.is_dir
+    } else {
+        s.entries[ei].is_dir
+    };
+    let (width, height, rgba) = imagery::icon_rgba(&path, is_dir, 48)?;
     Some(osdrag::DragPreview { width, height, rgba })
 }
 
@@ -740,11 +749,18 @@ fn os_drag_source(el: El, ei: usize) -> El {
     })
     .on_drag_end(|s: &mut App, _outcome, _tx: &mut Tx| s.os_drag = None)
     .on_drop_files(move |s: &mut App, files, tx: &mut Tx| {
-        let target = if s.entries.get(ei).is_some_and(|e| e.is_dir) {
-            Some(DropTarget::Folder(PathBuf::from(&s.entries[ei].path)))
+        let target = if s.searching {
+            s.search_hits
+                .get(ei)
+                .filter(|h| h.entry.is_dir)
+                .map(|h| DropTarget::Folder(PathBuf::from(&h.entry.path)))
         } else {
-            Some(DropTarget::Background)
-        };
+            s.entries
+                .get(ei)
+                .filter(|e| e.is_dir)
+                .map(|e| DropTarget::Folder(PathBuf::from(&e.path)))
+        }
+        .or(Some(DropTarget::Background));
         take_drop(s, target, files, tx);
     })
 }

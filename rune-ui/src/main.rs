@@ -7180,9 +7180,8 @@ fn volume_of(s: &App, path: &Path) -> String {
 
 fn same_volume(s: &App, paths: &[String], target: &Path) -> bool {
     paths
-        .first()
-        .map(|p| volume_of(s, Path::new(p)) == volume_of(s, target))
-        .unwrap_or(true)
+        .iter()
+        .all(|p| volume_of(s, Path::new(p)) == volume_of(s, target))
 }
 
 fn drop_target_path(s: &App, target: Option<&DropTarget>) -> Option<PathBuf> {

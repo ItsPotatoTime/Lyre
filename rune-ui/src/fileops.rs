@@ -780,6 +780,16 @@ fn check_new_name(name: &str) -> Result<(), String> {
     {
         return Err("That name cannot be used here.".into());
     }
+    // Windows device names are reserved even with an extension; creating one
+    // fails at the OS with a raw error. Refuse them here with a clear reason.
+    if cfg!(windows) {
+        let stem = name.split('.').next().unwrap_or(name);
+        let stem = stem.trim_end_matches([' ', '.']);
+        let reserved = ["CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"];
+        if reserved.iter().any(|r| stem.eq_ignore_ascii_case(r)) {
+            return Err("That name is reserved by Windows.".into());
+        }
+    }
     Ok(())
 }
 

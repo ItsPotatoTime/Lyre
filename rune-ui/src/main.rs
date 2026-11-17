@@ -510,8 +510,15 @@ enum Undo {
     Rename { from: PathBuf, to: PathBuf },
     /// A folder was made.
     Made { path: PathBuf },
-    /// Items were copied here, so taking it back deletes the copies.
-    Copied { pairs: Vec<(PathBuf, PathBuf)> },
+    /// Items were copied here, so taking it back deletes the copies. `replaced`
+    /// holds what a Replace set aside, so undo can put the earlier state back.
+    Copied {
+        pairs: Vec<(PathBuf, PathBuf)>,
+        replaced: Vec<fileops::Replaced>,
+    },
+    /// A Replace that has been undone: the new bytes are gone and the old ones
+    /// are back. Redo swaps them the other way again.
+    Replaced { items: Vec<fileops::Replaced> },
     /// Items were moved away, so taking it back puts each one back.
     Moved { pairs: Vec<(PathBuf, PathBuf)> },
     /// Items went to the trash, so taking it back brings them out again.
@@ -2684,6 +2691,7 @@ fn init() -> App {
     let (osdrop_tx, osdrop_rx) = std::sync::mpsc::channel::<osdrag::OsDragMsg>();
     osdrag::set_sender(osdrop_tx);
     osdrag::sweep_stale();
+    fileops::sweep_stale_backups();
     std::thread::spawn(move || {
         imagery::prepare_thread();
         while let Ok(job) = icon_jobs.recv() {
@@ -7890,6 +7898,19 @@ impl Stepped {
 /// Reverse one operation on disk.
 fn take_back(action: &Undo) -> Stepped {
     match action {
+        Undo::Replaced { items } => {
+            let mut failed = None;
+            for r in items.iter().rev() {
+                if let Err(e) = fileops::swap_back(r) {
+                    failed = Some(format!("Could not restore what was replaced: {e}"));
+                    break;
+                }
+            }
+            match failed {
+                None => Stepped::whole(action),
+                Some(e) => Stepped::stopped(action, e),
+            }
+        },
         Undo::Rename { from, to } => match fileops::relocate(to, from) {
             Ok(()) => Stepped::whole(action),
             Err(e) => Stepped::stopped(action, format!("Could not put the name back: {e}")),
@@ -7907,13 +7928,27 @@ fn take_back(action: &Undo) -> Stepped {
                 Stepped::stopped(action, format!("Could not remove the folder again: {e}"))
             }
         },
-        Undo::Copied { pairs } => Stepped::each(
-            pairs.clone(),
-            |(_, copy)| {
-                fileops::remove(copy).map_err(|e| format!("Could not remove the copy: {e}"))
-            },
-            |pairs| Undo::Copied { pairs },
-        ),
+        Undo::Copied { pairs, replaced } => {
+            let mut step = Stepped::each(
+                pairs.clone(),
+                |(_, copy)| {
+                    fileops::remove(copy).map_err(|e| format!("Could not remove the copy: {e}"))
+                },
+                |pairs| Undo::Copied { pairs, replaced: Vec::new() },
+            );
+            // Restore what Replace had set aside only once the new copies are
+            // out of the way, so the earlier bytes land where they used to be.
+            for r in replaced.iter().rev() {
+                if let Err(e) = fileops::swap_back(r) {
+                    step.error = Some(format!("Could not restore what was replaced: {e}"));
+                    return step;
+                }
+            }
+            if !replaced.is_empty() {
+                step.went = Some(Undo::Replaced { items: replaced.clone() });
+            }
+            step
+        },
         Undo::Moved { pairs } => step_moved(pairs.clone(), true),
         Undo::Trashed { items } => match fileops::restore(items) {
             Ok(()) => Stepped::whole(action),
@@ -7933,9 +7968,22 @@ fn put_back(action: &Undo) -> Stepped {
             Ok(()) => Stepped::whole(action),
             Err(e) => Stepped::stopped(action, format!("Could not make the folder again: {e}")),
         },
-        Undo::Copied { pairs } => match fileops::copy_again(pairs) {
+        Undo::Copied { pairs, .. } => match fileops::copy_again(pairs) {
             Ok(()) => Stepped::whole(action),
             Err(e) => Stepped::stopped(action, format!("Could not copy it again: {e}")),
+        },
+        Undo::Replaced { items } => {
+            let mut failed = None;
+            for r in items.iter().rev() {
+                if let Err(e) = fileops::swap_forward(r) {
+                    failed = Some(format!("Could not replace it again: {e}"));
+                    break;
+                }
+            }
+            match failed {
+                None => Stepped::whole(action),
+                Some(e) => Stepped::stopped(action, e),
+            }
         },
         Undo::Moved { pairs } => step_moved(pairs.clone(), false),
         Undo::Trashed { items } => {
@@ -8029,7 +8077,7 @@ fn start_paste(s: &mut App, mode: fileops::Mode, conflict: fileops::Conflict, so
             if mode == fileops::Mode::Cut {
                 Undo::Moved { pairs: pasted.landed }
             } else {
-                Undo::Copied { pairs: pasted.landed }
+                Undo::Copied { pairs: pasted.landed, replaced: pasted.replaced }
             }
         });
         let outcome = match pasted.error {

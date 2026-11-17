@@ -375,11 +375,71 @@ pub fn relocate(src: &Path, dst: &Path) -> Result<(), String> {
 pub struct Pasted {
     pub landed: Vec<(PathBuf, PathBuf)>,
     pub error: Option<String>,
+    /// Existing items a Replace had to set aside. Both the old bytes and the
+    /// bytes that replaced them are kept so undo and redo can swap them back
+    /// without losing anything the folder already had.
+    pub replaced: Vec<Replaced>,
+}
+
+#[derive(Clone)]
+pub struct Replaced {
+    pub source: PathBuf,
+    pub old: PathBuf,
+    pub new: PathBuf,
+    pub target: PathBuf,
+}
+
+static REPLACE_NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A private copy of an item about to be replaced, so undo can put it back.
+fn replace_backup(src: &Path) -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join(format!("lyre-replace-{}", std::process::id()));
+    fs::create_dir_all(&dir).map_err(|e| format!("Could not keep a copy for undo: {e}"))?;
+    let n = REPLACE_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let leaf = name_of(src);
+    let dst = dir.join(format!("{n:016x}-{leaf}"));
+    let cancel = AtomicBool::new(false);
+    copy_item(src, &dst, &cancel, &mut |_| {})?;
+    Ok(dst)
+}
+
+/// Undo a Replace: remove the copy that was put in place, then restore the old
+/// bytes to their original path.
+pub fn swap_back(item: &Replaced) -> Result<(), String> {
+    if item.target.exists() || fs::symlink_metadata(&item.target).is_ok() {
+        remove_item(&item.target)?;
+    }
+    // Copy, not move: both backups stay available for any number of
+    // undo/redo presses.
+    copy_item(&item.old, &item.target, &AtomicBool::new(false), &mut |_| {})
+}
+
+/// Redo a Replace: put the new bytes back, keeping the restored old ones for a
+/// further undo.
+pub fn swap_forward(item: &Replaced) -> Result<(), String> {
+    if item.target.exists() || fs::symlink_metadata(&item.target).is_ok() {
+        remove_item(&item.target)?;
+    }
+    copy_item(&item.new, &item.target, &AtomicBool::new(false), &mut |_| {})
+}
+
+/// Sweep backups left behind by an earlier run; their undo entries died with
+/// the process, so nothing can refer to them any more.
+pub fn sweep_stale_backups() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let Ok(reader) = fs::read_dir(std::env::temp_dir()) else { return };
+        for item in reader.flatten() {
+            if item.file_name().to_string_lossy().starts_with("lyre-replace-") {
+                let _ = remove_item(&item.path());
+            }
+        }
+    });
 }
 
 impl Pasted {
     fn refused(reason: &str) -> Self {
-        Pasted { landed: Vec::new(), error: Some(reason.into()) }
+        Pasted { landed: Vec::new(), error: Some(reason.into()), replaced: Vec::new() }
     }
 }
 
@@ -391,6 +451,7 @@ fn paste_one(
     target: &Path,
     cancel: &AtomicBool,
     report: &mut dyn FnMut(u64),
+    replaced: &mut Vec<Replaced>,
 ) -> Result<PathBuf, String> {
     let name = name_of(src);
     let mut dst = target.join(&name);
@@ -402,6 +463,12 @@ fn paste_one(
         match conflict {
             Conflict::Rename => dst = free_path(&dst),
             Conflict::Overwrite => {
+                // Keep the old bytes before anything is written over. The copy
+                // is separate from the destination, so a folder merge can still
+                // happen below and undo has the complete earlier state to put
+                // back. On failure the caller restores it.
+                let old = replace_backup(&dst)?;
+                replaced.push(Replaced { source: src.to_path_buf(), old, new: PathBuf::new(), target: dst.clone() });
                 // A file and a folder cannot stand in for one another in place.
                 // Everything else merges, so what is only in the destination
                 // survives and only the names in both are written over.
@@ -456,6 +523,7 @@ pub fn paste<F: FnMut(Progress) -> bool>(
     let mut done_bytes = 0u64;
     let mut completed = 0u64;
     let mut landed: Vec<(PathBuf, PathBuf)> = Vec::new();
+    let mut replaced: Vec<Replaced> = Vec::new();
     let mut error = None;
     // Bytes land inside the recursive copy, so a folder of ten thousand files
     // climbs smoothly instead of jumping from 0 to 100 at the end. Throttled
@@ -471,6 +539,9 @@ pub fn paste<F: FnMut(Progress) -> bool>(
         if !emit(Progress { done: i, total, name: name.clone(), done_bytes, total_bytes }) {
             break;
         }
+        // Measured before the item goes: after a cut the source is gone and
+        // reads as zero, so a move's progress never reached the total.
+        let size_before = item_size(src);
         let outcome = {
             let mut report = |add: u64| {
                 done_bytes += add;
@@ -482,23 +553,59 @@ pub fn paste<F: FnMut(Progress) -> bool>(
                     emit(Progress { done: i, total, name: name.clone(), done_bytes, total_bytes });
                 }
             };
-            paste_one(mode, conflict, src, target, cancel, &mut report)
+            paste_one(mode, conflict, src, target, cancel, &mut report, &mut replaced)
         };
         match outcome {
             Ok(dst) => {
                 // A rename moves bytes without copying them; credit them at the end.
-                completed += item_size(src);
+                completed += size_before;
                 done_bytes = done_bytes.max(completed);
-                landed.push((src.clone(), dst));
+                landed.push((src.clone(), dst.clone()));
+                for r in replaced.iter_mut().rev() {
+                    if r.source == *src && r.new.as_os_str().is_empty() {
+                        match replace_backup(&dst) {
+                            Ok(new) => r.new = new,
+                            Err(e) => {
+                                error = Some(e);
+                                break;
+                            }
+                        }
+                    }
+                }
+                if error.is_some() {
+                    break;
+                }
                 emit(Progress { done: i + 1, total, name, done_bytes, total_bytes });
             }
             Err(e) => {
-                error = Some(e);
+                // Anything set aside for this item goes back rather than
+                // stranding the old contents in a backup folder. A custom
+                // destination from Conflict::Rename is not in `name`, so match
+                // every entry belonging to the source that just failed.
+                let failing: Vec<usize> = (0..replaced.len())
+                    .rev()
+                    .filter(|&k| replaced[k].source == *src)
+                    .collect();
+                for k in failing {
+                    let r = replaced.remove(k);
+                    let _ = remove_item(&r.target);
+                    // Put the earlier contents back where they were, then
+                    // drop the now-redundant backup.
+                    let restore = copy_item(&r.old, &r.target, &AtomicBool::new(false), &mut |_| {});
+                    let _ = remove_item(&r.old);
+                    if let Err(back) = restore {
+                        error = Some(format!("{e}; the replaced item could not be restored: {back}"));
+                        break;
+                    }
+                }
+                if error.is_none() {
+                    error = Some(e);
+                }
                 break;
             }
         }
     }
-    Pasted { landed, error }
+    Pasted { landed, error, replaced }
 }
 
 /// Copy `pairs` again, source to destination, for a redo of a copy. A
@@ -1316,6 +1423,98 @@ mod tests {
         assert!(pasted.error.is_some(), "the move reports why it stopped");
         assert!(locked.exists(), "the original stays");
         assert!(!out.join("folder").exists(), "and no duplicate was left behind");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Replace keeps the old bytes so undo can restore them instead of
+    /// deleting the destination wholesale, and a failed copy puts them back.
+    #[test]
+    fn a_replace_preserves_what_it_replaced() {
+        let dir = scratch("replace-undo");
+        let target = dir.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let existing = target.join("notes");
+        fs::create_dir_all(&existing).unwrap();
+        fs::write(existing.join("keep.txt"), b"precious").unwrap();
+        let source = dir.join("incoming").join("notes");
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join("new.txt"), b"new").unwrap();
+
+        let pasted = paste(Mode::Copy, Conflict::Overwrite, std::slice::from_ref(&source), &target, &AtomicBool::new(false), noop);
+        assert!(pasted.error.is_none());
+        assert_eq!(pasted.replaced.len(), 1, "the old folder was kept for undo");
+        assert!(existing.join("keep.txt").exists(), "the merge kept the old file");
+
+        for r in pasted.replaced.iter().rev() {
+            swap_back(r).unwrap();
+        }
+        assert!(existing.join("keep.txt").exists(), "undo restores the old content");
+
+        for r in pasted.replaced.iter() {
+            swap_forward(r).unwrap();
+        }
+        assert!(existing.join("new.txt").exists(), "redo puts the new content back");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A file replaced by another file: undo restores the earlier contents
+    /// rather than deleting the file.
+    #[test]
+    fn undoing_a_file_replace_restores_the_old_contents() {
+        let dir = scratch("replace-file");
+        let target = dir.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let existing = target.join("report.txt");
+        fs::write(&existing, b"old").unwrap();
+        let source = dir.join("incoming").join("report.txt");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, b"new").unwrap();
+
+        let pasted = paste(Mode::Copy, Conflict::Overwrite, std::slice::from_ref(&source), &target, &AtomicBool::new(false), noop);
+        assert!(pasted.error.is_none());
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "new");
+        for r in pasted.replaced.iter().rev() {
+            swap_back(r).unwrap();
+        }
+        assert_eq!(fs::read_to_string(&existing).unwrap(), "old", "undo restores the old bytes");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A cancelled Replace puts the destination back instead of leaving it gone.
+    #[test]
+    fn a_cancelled_replace_restores_the_destination() {
+        let dir = scratch("replace-cancel");
+        let dst = dir.join("target");
+        fs::create_dir_all(&dst).unwrap();
+        fs::write(dst.join("report"), b"precious").unwrap();
+        let src = dir.join("incoming").join("report");
+        fs::create_dir_all(&src).unwrap();
+        for i in 0..20 {
+            fs::write(src.join(format!("f{i}.txt")), vec![b'x'; 1000]).unwrap();
+        }
+        let cancel = std::sync::Arc::new(AtomicBool::new(false));
+        let stop = cancel.clone();
+        let mut first = true;
+        let pasted = paste(
+            Mode::Copy,
+            Conflict::Overwrite,
+            std::slice::from_ref(&src),
+            &dst,
+            &cancel,
+            |_| {
+                if first {
+                    first = false;
+                    stop.store(true, Ordering::Relaxed);
+                }
+                true
+            },
+        );
+        assert!(pasted.error.is_some(), "the copy stopped");
+        assert_eq!(
+            fs::read_to_string(dst.join("report")).ok().as_deref(),
+            Some("precious"),
+            "the replaced file was restored"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

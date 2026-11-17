@@ -122,17 +122,25 @@ pub fn stage_with_skipped(paths: &[PathBuf]) -> (Vec<PathBuf>, usize) {
 pub fn release_virtual(paths: &[PathBuf]) {
     for path in paths {
         for ancestor in path.ancestors() {
-            let virtual_root = ancestor.starts_with(std::env::temp_dir())
-                && ancestor
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n.starts_with("lyre-virtual-"));
-            if virtual_root {
+            if is_virtual_root(ancestor) {
                 let _ = std::fs::remove_dir_all(ancestor);
                 break;
             }
         }
     }
+}
+
+fn is_virtual_root(path: &Path) -> bool {
+    if !path.starts_with(std::env::temp_dir()) {
+        return false;
+    }
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(rest) = name.strip_prefix("lyre-virtual-") else {
+        return false;
+    };
+    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
 }
 
 fn snapshot(src: &Path, dst: &Path, budget: &mut usize, depth: usize) -> bool {
@@ -652,7 +660,8 @@ pub mod win {
             let count_bytes = GlobalSize(group.data);
             let names = descriptor_names(std::slice::from_raw_parts(ptr as *const u8, count_bytes));
             let root = std::env::temp_dir().join(format!(
-                "lyre-virtual-{}",
+                "lyre-virtual-{}-{}",
+                std::process::id(),
                 super::NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
             ));
             let mut out = Vec::new();
@@ -1662,6 +1671,21 @@ mod tests {
         release(&staged);
         assert!(victim.join("precious.txt").exists(), "user data must survive release");
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A user folder in temp whose name merely starts with the virtual prefix
+    /// must survive cleanup, just like the `lyre-drop-` case.
+    #[test]
+    fn a_user_virtual_named_folder_is_never_released() {
+        let victim = std::env::temp_dir().join("lyre-virtual-personal");
+        let _ = std::fs::remove_dir_all(&victim);
+        std::fs::create_dir_all(&victim).unwrap();
+        std::fs::write(victim.join("precious.txt"), b"keep").unwrap();
+        let dragged = victim.join("drag-me.txt");
+        std::fs::write(&dragged, b"x").unwrap();
+        release_virtual(std::slice::from_ref(&dragged));
+        assert!(victim.join("precious.txt").exists(), "user data survives");
+        let _ = std::fs::remove_dir_all(&victim);
     }
 
     #[test]

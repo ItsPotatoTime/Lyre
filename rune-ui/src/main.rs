@@ -2338,9 +2338,11 @@ fn drain_scan(s: &mut App) -> bool {
         s.scan_rx = Some(rx);
         return changed;
     };
-    // An answer for a folder the person has already left is dropped, and the
-    // scan actually wanted keeps both its channel and its cancel flag.
-    if s.scan_want.as_deref() != Some(result.path.as_path()) {
+    // A folder listing has no place on a page drawn from state. A scan still
+    // running when the person opened This PC, the Gallery or the bin used to
+    // land here and replace that page with the last real folder. Keep the
+    // channel bookkeeping intact for the scan actually wanted.
+    if s.view != View::Files || s.scan_want.as_deref() != Some(result.path.as_path()) {
         s.scan_rx = Some(rx);
         return changed;
     }
@@ -3983,6 +3985,11 @@ fn apply_refresh(s: &mut App, msg: watch::Refreshed) {
         refresh_gallery(s);
         return;
     }
+    if s.view != View::Files {
+        // Quick Access, This PC and the bin draw from their own state. A watch
+        // answer for the folder behind them must not replace their listing.
+        return;
+    }
     let path_of = |i: usize| s.entries.get(i).map(|e| e.path.clone());
     let selected: Vec<String> = s.selected.iter().filter_map(|&i| path_of(i)).collect();
     let focused = s.focused.and_then(path_of);
@@ -4838,6 +4845,7 @@ fn command_bar(s: &App, p: Paint) -> El {
                         Ok(()) => s.notice = "Recycle Bin emptied".into(),
                         Err(e) => s.notice = e,
                     }
+                    s.bin_cache = None;
                     spawn_bin_scan(s);
                 }),
         );
@@ -5435,6 +5443,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                                             Ok(()) => s.notice = "Restored from the Recycle Bin".into(),
                                             Err(e) => s.notice = e,
                                         }
+                                        s.bin_cache = None;
                                         spawn_bin_scan(s);
                                         s.menu = None;
                                     },
@@ -5449,6 +5458,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                                             Ok(()) => s.notice = "Deleted permanently".into(),
                                             Err(e) => s.notice = e,
                                         }
+                                        s.bin_cache = None;
                                         spawn_bin_scan(s);
                                         s.menu = None;
                                     }),
@@ -5604,6 +5614,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                                         Ok(()) => s.notice = "Recycle Bin emptied".into(),
                                         Err(e) => s.notice = e,
                                     }
+                                    s.bin_cache = None;
                                     spawn_bin_scan(s);
                                     s.menu = None;
                                 }),
@@ -9389,7 +9400,10 @@ fn refresh_folder(s: &mut App) {
         refresh_volumes(s);
     } else if s.view == View::RecycleBin {
         spawn_bin_scan(s);
+    } else if s.view == View::Gallery {
+        refresh_gallery(s);
     } else {
+        // Quick Access: its tiles are fixed and its list is the recent files.
         refresh_recent(s);
     }
 }
@@ -11921,6 +11935,7 @@ mod tests {
     #[test]
     fn refresh_keeps_selection_focus_and_scroll_on_their_paths() {
         let mut s = init();
+        s.view = View::Files;
         let entry = |name: &str| Entry {
             name: name.into(),
             path: format!("/fake/{name}"),
@@ -12114,6 +12129,59 @@ mod tests {
         assert_eq!(crumb_segments(&s)[0].0, "This PC");
         s.view = View::Gallery;
         assert_eq!(crumb_segments(&s)[0].0, "Gallery");
+    }
+
+    /// Refreshing a virtual place must keep that place on screen. These pages
+    /// have no folder of their own, so replacing their listing from a stale
+    /// root used to show the last real folder instead.
+    #[test]
+    fn refreshing_a_virtual_place_keeps_the_place() {
+        let dir = std::env::temp_dir().join(format!("lyre-virtual-refresh-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let mut s = init();
+        s.view = View::Files;
+        s.root = dir.clone();
+        for (index, name) in [(2u8, "Quick Access"), (9, "This PC"), (11, "Recycle Bin")] {
+            let _ = name;
+            navigate(&mut s, index as usize);
+            let view = s.view;
+            let root = s.root.clone();
+            let tab = s.tab.clone();
+            let crumbs = s.crumbs.clone();
+            refresh_folder(&mut s);
+            assert!(s.view == view, "view changed after refresh of {name}");
+            assert_eq!(s.root, root, "root changed after refresh of {name}");
+            assert_eq!(s.tab, tab, "tab changed after refresh of {name}");
+            assert_eq!(s.crumbs, crumbs, "crumbs changed after refresh of {name}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A folder scan still in flight when a virtual page opens must not swap
+    /// that page's listing for the folder it was reading.
+    #[test]
+    fn a_pending_folder_scan_does_not_replace_a_virtual_page() {
+        let mut s = init();
+        let folder = std::env::temp_dir().join(format!("lyre-stale-scan-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&folder);
+        s.view = View::Files;
+        s.root = folder.clone();
+        s.scan_want = Some(folder.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        s.scan_rx = Some(rx);
+        tx.send(ScanMsg::Done(Box::new(ScanDone {
+            path: folder.clone(),
+            entries: vec![make_entry("stale.txt", "today", "Text", "1 KB", Kind::Text)],
+            scan_ms: 0.0,
+            cancelled: false,
+        })))
+        .unwrap();
+
+        navigate(&mut s, 9); // This PC
+        let before = s.entries.len();
+        drain_scan(&mut s);
+        assert_eq!(s.entries.len(), before, "the stale folder listing was ignored");
+        let _ = std::fs::remove_dir_all(&folder);
     }
 
     /// The bin is a fixed rail place: its index opens a real listing built from

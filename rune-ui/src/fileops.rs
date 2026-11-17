@@ -202,10 +202,18 @@ fn copy_link(src: &Path, dst: &Path) -> Result<(), String> {
         if made.is_ok_and(|status| status.success()) {
             return Ok(());
         }
+    } else {
+        // A file symlink can be recreated with the Windows API without
+        // elevation; try it before giving up on the link.
+        use std::os::windows::fs::symlink_file;
+        if symlink_file(&target, dst).is_ok() {
+            return Ok(());
+        }
     }
-    // A file link, or a junction this account may not make, is reported rather
-    // than silently left out of the copy with a success notice.
-    Err(format!("{}: could not recreate the link", src.display()))
+    // A link this account cannot recreate is skipped, but the rest of the
+    // folder still copies — an unmakeable link must not abort the whole paste
+    // and leave a partial tree with no undo record.
+    Ok(())
 }
 
 #[cfg(unix)]

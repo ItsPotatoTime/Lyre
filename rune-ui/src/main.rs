@@ -8075,6 +8075,14 @@ fn cut_selection(s: &mut App) {
 
 /// Spawn the worker for a paste, wiring progress into the status bar.
 fn start_paste(s: &mut App, mode: fileops::Mode, conflict: fileops::Conflict, sources: Vec<PathBuf>, target: PathBuf) {
+    // Only one operation can own the status bar and its undo result at a time.
+    // Starting a second one used to drop the first worker's receiver, losing
+    // its undo record, and released staged files while it was still reading
+    // them.
+    if s.op_rx.is_some() {
+        s.notice = "Wait for the current operation to finish".into();
+        return;
+    }
     if std::env::var_os("LYRE_TRACE").is_some() {
         eprintln!("[paste] mode={mode:?} sources={sources:?} target={target:?}");
     }
@@ -8120,6 +8128,10 @@ fn start_paste(s: &mut App, mode: fileops::Mode, conflict: fileops::Conflict, so
 }
 
 fn start_delete(s: &mut App, mode: fileops::DeleteMode, paths: Vec<PathBuf>) {
+    if s.op_rx.is_some() {
+        s.notice = "Wait for the current operation to finish".into();
+        return;
+    }
     use std::sync::atomic::Ordering;
     let total = paths.len();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -8316,6 +8328,11 @@ fn drain_op(s: &mut App) -> bool {
         s.op_rx = None;
         s.op_cancel = None;
         s.transfer = None;
+        // A completed cut-move consumes the clipboard; a second paste would
+        // otherwise use paths that no longer exist.
+        if s.clipboard.as_ref().is_some_and(|(_, mode)| *mode == fileops::Mode::Cut) {
+            s.clipboard = None;
+        }
         osdrag::release(&std::mem::take(&mut s.drop_staged));
         clear_selection(s);
         if s.view == View::Files {

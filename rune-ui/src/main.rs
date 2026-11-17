@@ -8368,7 +8368,14 @@ fn begin_delete(s: &mut App, permanent: bool) {
 }
 
 fn begin_rename(s: &mut App) {
-    let Some(e) = s.selected.first().map(|&i| entry_by_index(s, i)) else { return };
+    let Some(e) = s
+        .selected
+        .first()
+        .filter(|&&i| i < display_len(s))
+        .map(|&i| entry_by_index(s, i))
+    else {
+        return;
+    };
     let mut edit = TextEdit::default();
     edit.text = e.name.clone();
     let path = PathBuf::from(&e.path);

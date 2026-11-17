@@ -5015,7 +5015,11 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                         ),
                     );
                     h += MENU_ROW_H;
-                    let path = s.selected.first().map(|&i| s.entries[i].path.clone()).unwrap_or_default();
+                    let path = s
+                        .selected
+                        .first()
+                        .map(|&i| entry_by_index(s, i).path.clone())
+                        .unwrap_or_default();
                     let has_sel = !s.selected.is_empty();
                     let copy = path.clone();
                     rows.push(
@@ -8195,11 +8199,12 @@ fn begin_delete(s: &mut App, permanent: bool) {
 }
 
 fn begin_rename(s: &mut App) {
-    let Some(e) = s.selected.first().and_then(|&i| s.entries.get(i)) else { return };
+    let Some(e) = s.selected.first().map(|&i| entry_by_index(s, i)) else { return };
     let mut edit = TextEdit::default();
     edit.text = e.name.clone();
+    let path = PathBuf::from(&e.path);
     s.menu = None;
-    open_dialog(s, Dialog::Rename { path: PathBuf::from(&e.path), edit });
+    open_dialog(s, Dialog::Rename { path, edit });
 }
 
 fn begin_new_folder(s: &mut App) {
@@ -8220,13 +8225,16 @@ fn commit_rename(s: &mut App) {
         return;
     }
     match fileops::rename(&path, &name) {
-        Ok(target) => {
+        Ok(target) if target != path => {
             record_undo(s, Undo::Rename { from: path, to: target });
             if s.view == View::Files {
                 let root = s.root.clone();
                 set_location(s, root);
             }
         }
+        // A rename to the same name changed nothing; recording it would jam
+        // the undo stack with a step that always refuses to reverse.
+        Ok(_) => {}
         Err(e) => s.notice = e,
     }
 }

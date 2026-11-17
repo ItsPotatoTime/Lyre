@@ -543,7 +543,7 @@ pub fn paste<F: FnMut(Progress) -> bool>(
         .enumerate()
         .map(|(i, src)| sources[..i].iter().any(|earlier| src.starts_with(earlier)))
         .collect();
-    for (i, src) in sources.iter().enumerate() {
+    for src in sources.iter() {
         let dst = target.join(name_of(src));
         if !src.is_dir() {
             continue;

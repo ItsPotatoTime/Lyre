@@ -341,6 +341,8 @@ enum View {
     ThisPc,
     /// The Pictures library as a date-grouped photo grid.
     Gallery,
+    /// The platform's Recycle Bin, listed from its own records.
+    RecycleBin,
 }
 
 /// Which place a window is showing.
@@ -362,6 +364,7 @@ enum Place {
     Videos,
     ThisPc,
     Network,
+    RecycleBin,
     /// A folder that is none of the built-in places: a pinned folder, or any
     /// folder reached through one.
     Folder,
@@ -382,6 +385,8 @@ impl Place {
             Place::Videos => 8,
             Place::ThisPc => 9,
             Place::Network => 10,
+            // Appended: stored hidden_places are raw indices and must not shift.
+            Place::RecycleBin => 11,
             Place::Folder => usize::MAX,
         }
     }
@@ -839,6 +844,8 @@ struct App {
     search: String,
     tab: String,
     entries: Vec<Entry>,
+    /// The Recycle Bin records behind `entries`, in the same order.
+    bin_items: Vec<fileops::BinItem>,
     /// (row index where the group starts, label).
     groups: Vec<(usize, String)>,
     /// Row indices into `entries` after search and sort. Never built rows.
@@ -1484,6 +1491,7 @@ fn place_of(view: View, root: &Path) -> Place {
         View::QuickAccess => Place::QuickAccess,
         View::ThisPc => Place::ThisPc,
         View::Gallery => Place::Gallery,
+        View::RecycleBin => Place::RecycleBin,
         View::Files => {
             let Some(home) = home_dir() else { return Place::Folder };
             if same_path(root, &home) {
@@ -2364,6 +2372,7 @@ fn restore(s: &mut App, spot: Spot) {
             }
         }
         View::QuickAccess => load(s, Fixture::QuickAccess),
+        View::RecycleBin => open_recycle_bin(s),
         View::ThisPc => {
             load(s, Fixture::ThisPc);
             refresh_volumes(s);
@@ -2466,6 +2475,78 @@ fn open_this_pc(s: &mut App) {
     refresh_volumes(s);
 }
 
+/// Open the Recycle Bin as a folder of its own records. macOS uses the same
+/// freedesktop-style store Lyre deletes into, which is not Finder's bin; say so
+/// rather than showing an empty folder that looks like the whole trash.
+fn open_recycle_bin(s: &mut App) {
+    s.menu = None;
+    // Lyre's Unix trash is freedesktop's, not Finder's ~/.Trash, so an in-app
+    // listing here would show only Lyre's own deletions. Open the real one.
+    #[cfg(target_os = "macos")]
+    {
+        if let Some(trash) = home_dir().map(|h| h.join(".Trash")) {
+            let _ = std::process::Command::new("open").arg(&trash).spawn();
+            s.notice = "Opened Finder's Trash. Lyre's in-app bin lists its own deletions only.".into();
+        } else {
+            s.notice = "Finder's Trash is not available here.".into();
+        }
+        return;
+    }
+    if s.view != View::RecycleBin {
+        s.history.push(spot_of(s));
+        s.forward.clear();
+    }
+    s.view = View::RecycleBin;
+    s.root = PathBuf::new();
+    s.tab = "Recycle Bin".into();
+    s.crumbs = vec!["Recycle Bin".into()];
+    s.search = "Search Recycle Bin".into();
+    s.search_edit.text.clear();
+    s.searching = false;
+    s.search_hits.clear();
+    clear_search(s);
+    clear_selection(s);
+    refresh_bin(s);
+}
+
+/// Rebuild the bin listing from the platform's records.
+fn refresh_bin(s: &mut App) {
+    let items = fileops::bin_list();
+    let mut entries = Vec::with_capacity(items.len());
+    for item in &items {
+        let name = Path::new(&item.original)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| item.original.to_string_lossy().into_owned());
+        let is_dir = fs::metadata(&item.content).map(|m| m.is_dir()).unwrap_or(false);
+        let kind = classify(&name, is_dir);
+        let modified_at = Some(item.when);
+        let modified = modified_at
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| format_time(d.as_secs()))
+            .unwrap_or_default();
+        entries.push(Entry {
+            name,
+            path: item.content.to_string_lossy().into_owned(),
+            is_dir,
+            size: item.size,
+            modified,
+            modified_at,
+            type_label: kind_label(kind).to_string(),
+            kind,
+            hidden: false,
+            system: false,
+            fixture: false,
+            fixture_size: String::new(),
+        });
+    }
+    s.count = entries.len();
+    s.entries = entries;
+    s.bin_items = items;
+    s.visible = (0..s.entries.len()).collect();
+    s.groups.clear();
+}
+
 /// Step back, reporting whether the window has something new to draw: `poll`
 /// asks for a frame only when it is told so, and a step back to a page starts no
 /// scan whose answer would mark the frame instead.
@@ -2519,6 +2600,7 @@ fn navigate(s: &mut App, index: usize) {
         2 => open_quick_access(s),
         9 => open_this_pc(s),
         10 => s.notice = "Network browsing is not implemented in this slice".into(),
+        11 => open_recycle_bin(s),
         1 => go_gallery(s),
         i => {
             match place_path(i) {
@@ -2835,6 +2917,7 @@ fn init() -> App {
         search: format!("Search {tab}"),
         tab,
         entries,
+        bin_items: Vec::new(),
         groups: Vec::new(),
         visible: Vec::new(),
         selected: Vec::new(),
@@ -4016,6 +4099,13 @@ fn place_glyph(index: usize, size: f32) -> El {
             .fill(circle(9.0, 16.0, 2.4), Color::WHITE)
             .line([11.4, 16.0], [11.4, 7.0], 1.6, LineCap::Round, Color::WHITE)
             .line([11.4, 7.0], [17.0, 8.8], 1.6, LineCap::Round, Color::WHITE),
+        // Recycle Bin: a lidded bin with a small mark above it.
+        11 => Shape::new()
+            .line([5.0, 7.0], [19.0, 7.0], 1.8, LineCap::Round, c("#8a939e"))
+            .stroke(vec![[7.0, 7.0], [8.5, 20.0], [15.5, 20.0], [17.0, 7.0]], 1.8, c("#8a939e"))
+            .line([10.0, 11.0], [10.0, 17.0], 1.4, LineCap::Round, c("#8a939e"))
+            .line([14.0, 11.0], [14.0, 17.0], 1.4, LineCap::Round, c("#8a939e"))
+            .line([12.0, 3.0], [12.0, 6.0], 1.6, LineCap::Round, c("#3b9bdd")),
         8 => Shape::new()
             .fill(vec![[2.0, 4.0], [22.0, 4.0], [22.0, 20.0], [2.0, 20.0]], c("#8b5cf6"))
             .fill(vec![[4.0, 6.0], [7.0, 6.0], [7.0, 8.0], [4.0, 8.0]], c("#c4a8f8"))
@@ -4277,6 +4367,7 @@ fn crumb_segments(s: &App) -> Vec<(String, PathBuf)> {
         View::QuickAccess => return vec![("Quick Access".into(), PathBuf::new())],
         View::ThisPc => return vec![("This PC".into(), PathBuf::new())],
         View::Gallery => return vec![("Gallery".into(), s.root.clone())],
+        View::RecycleBin => return vec![("Recycle Bin".into(), PathBuf::new())],
         View::Files => {}
     }
     use std::path::Component;
@@ -4314,6 +4405,7 @@ fn open_crumb(s: &mut App, path: PathBuf) {
         View::QuickAccess => open_quick_access(s),
         View::ThisPc => navigate(s, 9),
         View::Gallery => go_gallery(s),
+        View::RecycleBin => open_recycle_bin(s),
         View::Files => go(s, path),
     }
 }
@@ -5261,6 +5353,37 @@ fn menu_overlay(s: &App, p: Paint) -> El {
             let target = *target;
             match scope {
                 CtxScope::Item => {
+                    if s.view == View::RecycleBin
+                        && let Some(item) = s.bin_items.get(target).cloned()
+                    {
+                        let restore_item = item.clone();
+                            rows.push(
+                                menu_item(p, "Restore", Some(Ico::Restore), None, false).on_press(
+                                    move |s: &mut App| {
+                                        match fileops::bin_restore(&restore_item) {
+                                            Ok(()) => s.notice = "Restored from the Recycle Bin".into(),
+                                            Err(e) => s.notice = e,
+                                        }
+                                        refresh_bin(s);
+                                        s.menu = None;
+                                    },
+                                ),
+                            );
+                            h += MENU_ROW_H;
+                            let victim = item;
+                            rows.push(
+                                menu_item(p, "Delete permanently", Some(Ico::Delete), None, false)
+                                    .on_press(move |s: &mut App| {
+                                        match fileops::bin_delete_forever(&victim) {
+                                            Ok(()) => s.notice = "Deleted permanently".into(),
+                                            Err(e) => s.notice = e,
+                                        }
+                                        refresh_bin(s);
+                                        s.menu = None;
+                                    }),
+                            );
+                        h += MENU_ROW_H;
+                    }
                     let entry = if s.searching {
                         s.search_hits.get(target).map(|h| &h.entry)
                     } else {
@@ -5402,6 +5525,20 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                     h += MENU_ROW_H;
                 }
                 CtxScope::Background => {
+                    if s.view == View::RecycleBin {
+                        rows.push(
+                            menu_item(p, "Empty Recycle Bin", Some(Ico::Delete), None, s.bin_items.is_empty())
+                                .on_press(|s: &mut App| {
+                                    match fileops::bin_empty() {
+                                        Ok(()) => s.notice = "Recycle Bin emptied".into(),
+                                        Err(e) => s.notice = e,
+                                    }
+                                    refresh_bin(s);
+                                    s.menu = None;
+                                }),
+                        );
+                        h += MENU_ROW_H;
+                    }
                     if menu_visible(s, "new-folder") {
                         rows.push(
                             menu_item(p, "New folder", Some(Ico::New), None, false)
@@ -7066,6 +7203,9 @@ fn nav_rail(s: &App, p: Paint) -> El {
     if s.rail_open.contains(&10) {
         rail = rail.child(rail_leaf(p, "Network browsing is not implemented", None, None));
     }
+    // The bin is a permanent place, like Quick Access: it has no folder on disk
+    // and cannot be hidden away with the six ordinary folders.
+    rail = rail.child(rail_item(s, p, current, Place::RecycleBin.index(), "Recycle Bin", false, false));
     let rail = rail.child(el().grow(1.0));
     row().key("rail-wrap")
         .h_full()
@@ -9176,6 +9316,8 @@ fn refresh_folder(s: &mut App) {
         set_location(s, root);
     } else if s.view == View::ThisPc {
         refresh_volumes(s);
+    } else if s.view == View::RecycleBin {
+        refresh_bin(s);
     } else {
         refresh_recent(s);
     }
@@ -10465,6 +10607,7 @@ fn content(s: &App, p: Paint) -> El {
             View::QuickAccess => quick_access_content(s, p),
             View::ThisPc => this_pc_content(s, p),
             View::Gallery => gallery_content(s, p),
+            View::RecycleBin => files_list(s, p),
             View::Files => files_list(s, p),
         }
     };
@@ -10785,6 +10928,7 @@ fn main() {
                 // person's setting, and turning it on for them was the bug.
                 s.preview = true;
             }),
+            ("recyclebin", |s| open_recycle_bin(s)),
             ("list", |s| {
                 load(s, Fixture::Downloads);
                 s.mode = Mode::List;
@@ -11899,6 +12043,18 @@ mod tests {
         assert_eq!(crumb_segments(&s)[0].0, "This PC");
         s.view = View::Gallery;
         assert_eq!(crumb_segments(&s)[0].0, "Gallery");
+    }
+
+    /// The bin is a fixed rail place: its index opens a real listing built from
+    /// the platform's bin records, and it is not one of the hideable folders.
+    #[test]
+    fn the_recycle_bin_is_a_permanent_rail_place() {
+        let mut s = init();
+        navigate(&mut s, Place::RecycleBin.index());
+        assert!(s.view == View::RecycleBin, "the rail index opens the bin");
+        assert_eq!(s.tab, "Recycle Bin");
+        assert_eq!(s.entries.len(), s.bin_items.len(), "one row per bin record");
+        assert!(!(3..=8).contains(&Place::RecycleBin.index()), "not a hideable folder");
     }
 
     /// A folded breadcrumb's key carries the full segment index, so a drop on

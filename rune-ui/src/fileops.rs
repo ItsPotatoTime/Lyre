@@ -1018,14 +1018,13 @@ mod recycle {
     }
 
     /// Every record in every bin this account can read.
-    fn records(drive: Option<&str>) -> Vec<Record> {
+    pub(super) fn records(drive: Option<&str>) -> Vec<Record> {
         use std::path::PathBuf;
         let mut out = Vec::new();
         let letters: Vec<char> = match drive.and_then(|d| d.chars().next()) {
             Some(letter) => vec![letter],
-            // With no drive letter there is no local bin to search — trying
-            // every drive was guesswork that could match a different item.
-            None => return Vec::new(),
+            // No drive means the whole bin: every volume this account can read.
+            None => ('A'..='Z').collect(),
         };
         for letter in letters {
             let bin = PathBuf::from(format!("{}:\\$Recycle.Bin", letter));
@@ -1052,7 +1051,7 @@ mod recycle {
     }
 
     /// A `$I` record's deletion time as a clock time: 100ns steps from 1601.
-    fn from_filetime(stamp: u64) -> Option<std::time::SystemTime> {
+    pub(super) fn from_filetime(stamp: u64) -> Option<std::time::SystemTime> {
         const EPOCH: u64 = 11_644_473_600;
         let secs = stamp / 10_000_000;
         if secs < EPOCH {
@@ -1142,6 +1141,174 @@ fn civil(z: i64) -> (i64, i64, i64) {
 #[cfg(not(any(windows, unix)))]
 fn trash_one(_path: &Path) -> Result<Trashed, String> {
     Err("Deleting to the trash is not available on this system.".into())
+}
+
+// ---------------------------------------------------------------------------
+// The Recycle Bin as a folder: list, restore, delete forever, empty.
+// ---------------------------------------------------------------------------
+
+/// One item the platform's Recycle Bin is holding. `content` is the bytes on
+/// disk (a `$R` file on Windows, a file under `Trash/files` on Unix) and `info`
+/// is the record that names where it came from.
+#[derive(Clone)]
+pub struct BinItem {
+    pub original: PathBuf,
+    pub when: std::time::SystemTime,
+    pub content: PathBuf,
+    pub info: PathBuf,
+    pub size: u64,
+}
+
+#[cfg(windows)]
+pub fn bin_list() -> Vec<BinItem> {
+    recycle::records(None)
+        .into_iter()
+        .filter_map(|r| {
+            let when = recycle::from_filetime(r.deleted)?;
+            let size = item_size(&r.content);
+            Some(BinItem { original: r.original, when, content: r.content, info: r.info, size })
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+pub fn bin_list() -> Vec<BinItem> {
+    let Some(base) = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
+    else {
+        return Vec::new();
+    };
+    bin_list_in(&base)
+}
+
+#[cfg(unix)]
+fn bin_list_in(base: &Path) -> Vec<BinItem> {
+    let info_dir = base.join("Trash").join("info");
+    let files_dir = base.join("Trash").join("files");
+    let mut out = Vec::new();
+    for item in fs::read_dir(info_dir).into_iter().flatten().flatten() {
+        let path = item.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("trashinfo") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else { continue };
+        let mut original = None;
+        let mut when = None;
+        for line in text.lines() {
+            if let Some(v) = line.strip_prefix("Path=") {
+                original = Some(PathBuf::from(percent_decode(v.trim())));
+            } else if let Some(v) = line.strip_prefix("DeletionDate=") {
+                when = parse_trash_date(v.trim());
+            }
+        }
+        let (Some(original), Some(when)) = (original, when) else { continue };
+        let leaf = path.file_stem().unwrap_or_default().to_os_string();
+        let content = files_dir.join(&leaf);
+        if !content.exists() {
+            continue;
+        }
+        let size = item_size(&content);
+        out.push(BinItem { original, when, content, info: path, size });
+    }
+    out.sort_by(|a, b| b.when.cmp(&a.when));
+    out
+}
+
+#[cfg(not(any(windows, unix)))]
+pub fn bin_list() -> Vec<BinItem> {
+    Vec::new()
+}
+
+#[cfg(unix)]
+fn percent_decode(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(a), Some(b)) = (
+                (bytes[i + 1] as char).to_digit(16),
+                (bytes[i + 2] as char).to_digit(16),
+            ) {
+                out.push((a * 16 + b) as u8);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(unix)]
+fn parse_trash_date(text: &str) -> Option<std::time::SystemTime> {
+    use std::time::{Duration, UNIX_EPOCH};
+    let date = text.get(0..10)?;
+    let time = text.get(11..19)?;
+    let y: i64 = date.get(0..4)?.parse().ok()?;
+    let m: i64 = date.get(5..7)?.parse().ok()?;
+    let d: i64 = date.get(8..10)?.parse().ok()?;
+    let h: u64 = time.get(0..2)?.parse().ok()?;
+    let mi: u64 = time.get(3..5)?.parse().ok()?;
+    let s: u64 = time.get(6..8)?.parse().ok()?;
+    let days = days_from_civil(y, m, d);
+    let secs = (days * 86_400) as u64 + h * 3600 + mi * 60 + s;
+    Some(UNIX_EPOCH + Duration::from_secs(secs))
+}
+
+#[cfg(unix)]
+fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Put one bin item back where it came from.
+pub fn bin_restore(item: &BinItem) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        recycle::restore(&item.original, item.when)
+    }
+    #[cfg(unix)]
+    {
+        restore_one(&Trashed {
+            original: item.original.clone(),
+            when: item.when,
+            trashed: Some(item.content.clone()),
+            info: Some(item.info.clone()),
+        })
+    }
+    #[cfg(not(any(windows, unix)))]
+    {
+        let _ = item;
+        Err("Taking an item out of the bin is not available on this system.".into())
+    }
+}
+
+/// Delete one bin item forever. This bypasses the trash on purpose.
+pub fn bin_delete_forever(item: &BinItem) -> Result<(), String> {
+    remove_item(&item.content)?;
+    let _ = remove_item(&item.info);
+    Ok(())
+}
+
+pub fn bin_empty() -> Result<(), String> {
+    let mut first = None;
+    for item in bin_list() {
+        if let Err(e) = bin_delete_forever(&item) && first.is_none() {
+            first = Some(e);
+        }
+    }
+    match first {
+        None => Ok(()),
+        Some(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
@@ -1822,6 +1989,48 @@ mod tests {
         assert!(pasted.error.is_some(), "the self-paste is refused");
         assert_eq!(fs::read_to_string(&src).unwrap(), "precious", "the bytes survive");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A bin listing recovers the original path, date and bytes, and restoring
+    /// puts them back while deleting forever bypasses the trash.
+    #[cfg(unix)]
+    #[test]
+    fn a_freedesktop_bin_lists_and_restores_items() {
+        let base = scratch("binlist");
+        let info = base.join("Trash").join("info");
+        let files = base.join("Trash").join("files");
+        fs::create_dir_all(&info).unwrap();
+        fs::create_dir_all(&files).unwrap();
+        let original = base.join("gone.txt");
+        let content = files.join("gone.txt");
+        fs::write(&content, b"precious").unwrap();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let record = info.join("gone.txt.trashinfo");
+        fs::write(
+            &record,
+            format!(
+                "[Trash Info]\nPath={}\nDeletionDate={}\n",
+                percent_encode(&original.to_string_lossy()),
+                trash_date(stamp)
+            ),
+        )
+        .unwrap();
+
+        let items = bin_list_in(&base);
+        assert_eq!(items.len(), 1, "the bin lists the item");
+        assert_eq!(items[0].original, original);
+        assert_eq!(fs::read_to_string(&items[0].content).unwrap(), "precious");
+
+        let restored = bin_restore(&items[0]);
+        assert!(restored.is_ok(), "restore works: {restored:?}");
+        assert_eq!(fs::read_to_string(&original).unwrap(), "precious");
+        assert!(!content.exists());
+        assert!(!record.exists());
+
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

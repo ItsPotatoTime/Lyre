@@ -687,8 +687,12 @@ fn take_drop(s: &mut App, target: Option<DropTarget>, files: &[PathBuf], tx: &mu
     } else {
         fileops::Mode::Copy
     };
-    let staged = osdrag::stage(files);
+    let (staged, skipped) = osdrag::stage_with_skipped(files);
     s.drop_staged.extend(staged.iter().cloned());
+    s.drop_staged.extend(files.iter().cloned());
+    if skipped > 0 {
+        s.notice = format!("{skipped} dragged item{} could not be prepared and were left out", if skipped == 1 { "" } else { "s" });
+    }
     paste_into(s, staged, mode, tp);
 }
 
@@ -3953,8 +3957,12 @@ fn view(s: &App, cx: &mut Cx<App>) -> El {
             if !matches!(s.view, View::Files | View::Gallery) {
                 return;
             }
-            let staged = osdrag::stage(files);
+            let (staged, skipped) = osdrag::stage_with_skipped(files);
             s.drop_staged.extend(staged.iter().cloned());
+            s.drop_staged.extend(files.iter().cloned());
+            if skipped > 0 {
+                s.notice = format!("{skipped} dragged item{} could not be prepared and were left out", if skipped == 1 { "" } else { "s" });
+            }
             let target = s.root.clone();
             paste_into(s, staged, fileops::Mode::Copy, target);
         })
@@ -8344,7 +8352,9 @@ fn drain_op(s: &mut App) -> bool {
         if s.clipboard.as_ref().is_some_and(|(_, mode)| *mode == fileops::Mode::Cut) {
             s.clipboard = None;
         }
-        osdrag::release(&std::mem::take(&mut s.drop_staged));
+        let staged = std::mem::take(&mut s.drop_staged);
+        osdrag::release_virtual(&staged);
+        osdrag::release(&staged);
         clear_selection(s);
         if s.view == View::Files {
             let root = s.root.clone();

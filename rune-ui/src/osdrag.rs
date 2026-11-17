@@ -74,10 +74,17 @@ pub fn ephemeral(path: &Path) -> bool {
 /// alive after the source unlinks its own name without copying data; volumes
 /// that cannot link fall back to a byte copy.
 pub fn stage(paths: &[PathBuf]) -> Vec<PathBuf> {
+    stage_with_skipped(paths).0
+}
+
+/// Stage ephemeral paths, also reporting how many could not be staged and were
+/// left out, so the caller can say so instead of pasting fewer items silently.
+pub fn stage_with_skipped(paths: &[PathBuf]) -> (Vec<PathBuf>, usize) {
     let mut out = Vec::new();
     let mut root: Option<PathBuf> = None;
     let mut budget = MAX_STAGED_ITEMS;
     let mut staged = 0usize;
+    let mut skipped = 0usize;
     for path in paths {
         if !ephemeral(path) {
             out.push(path.clone());
@@ -103,9 +110,29 @@ pub fn stage(paths: &[PathBuf]) -> Vec<PathBuf> {
         staged += 1;
         if snapshot(path, &dst, &mut budget, 0) {
             out.push(dst);
+        } else {
+            skipped += 1;
         }
     }
-    out
+    (out, skipped)
+}
+
+/// Remove the extracted virtual-file folders a drop left behind. They are
+/// separate from the `lyre-drop-*` snapshot roots and were never cleaned up.
+pub fn release_virtual(paths: &[PathBuf]) {
+    for path in paths {
+        for ancestor in path.ancestors() {
+            let virtual_root = ancestor.starts_with(std::env::temp_dir())
+                && ancestor
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("lyre-virtual-"));
+            if virtual_root {
+                let _ = std::fs::remove_dir_all(ancestor);
+                break;
+            }
+        }
+    }
 }
 
 fn snapshot(src: &Path, dst: &Path, budget: &mut usize, depth: usize) -> bool {

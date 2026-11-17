@@ -6879,8 +6879,14 @@ fn is_selected(s: &App, ei: usize) -> bool {
 /// the number selected and their total.
 fn update_selection_detail(s: &mut App) {
     // A selection can outlive the row it named, when a refresh lands between the
-    // press and this: only the rows that are still there are counted.
-    let len = display_len(s);
+    // press and this: only indices still in the underlying list are counted.
+    // The visible-row count is not the right bound — with a filter active it
+    // is smaller than the entry list and would hide selected items.
+    let len = if s.searching {
+        s.search_hits.len()
+    } else {
+        s.entries.len()
+    };
     let selected: Vec<usize> = s.selected.iter().copied().filter(|&i| i < len).collect();
     let n = selected.len();
     if n == 0 {
@@ -8762,7 +8768,7 @@ fn toggle_focused(s: &mut App) {
     let Some(index) = s.focused else { return };
     if s.selected.contains(&index) {
         s.selected.retain(|&selected| selected != index);
-        s.selection_detail.clear();
+        update_selection_detail(s);
     } else {
         select_entry(s, index);
     }

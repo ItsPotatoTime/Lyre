@@ -516,8 +516,12 @@ enum Undo {
         pairs: Vec<(PathBuf, PathBuf)>,
         replaced: Vec<fileops::Replaced>,
     },
-    /// Items were moved away, so taking it back puts each one back.
-    Moved { pairs: Vec<(PathBuf, PathBuf)> },
+    /// Items were moved away, so taking it back puts each one back. `replaced`
+    /// keeps what a Cut+Replace overwrote, which must also come back on undo.
+    Moved {
+        pairs: Vec<(PathBuf, PathBuf)>,
+        replaced: Vec<fileops::Replaced>,
+    },
     /// Items went to the trash, so taking it back brings them out again.
     Trashed { items: Vec<fileops::Trashed> },
 }
@@ -7947,6 +7951,72 @@ impl Stepped {
     }
 }
 
+/// Apply a step to each replacement, keeping the ones that succeeded and the
+/// ones that failed so neither set is silently dropped from the undo stack.
+fn apply_replaced(
+    items: &[fileops::Replaced],
+    reverse: bool,
+    mut step: impl FnMut(&fileops::Replaced) -> Result<(), String>,
+) -> (Vec<fileops::Replaced>, Vec<fileops::Replaced>, Option<String>) {
+    let mut error = None;
+    let indices: Vec<usize> = if reverse {
+        (0..items.len()).rev().collect()
+    } else {
+        (0..items.len()).collect()
+    };
+    let mut ok: Vec<usize> = Vec::new();
+    let mut failed_idx: Vec<usize> = Vec::new();
+    for i in indices {
+        match step(&items[i]) {
+            Ok(()) => ok.push(i),
+            Err(e) => {
+                if error.is_none() {
+                    error = Some(e);
+                }
+                failed_idx.push(i);
+            }
+        }
+    }
+    // Return results in the original order so a reversed undo does not hand
+    // the redo stack a reordered set of backups.
+    ok.sort_unstable();
+    failed_idx.sort_unstable();
+    let done = ok.into_iter().map(|i| items[i].clone()).collect();
+    let left = failed_idx.into_iter().map(|i| items[i].clone()).collect();
+    (done, left, error)
+}
+
+/// Attach the replacement results to the plain-pair part of a stepped action.
+fn attach_replaced(action: Option<Undo>, items: &[fileops::Replaced], moved: bool) -> Option<Undo> {
+    if items.is_empty() {
+        return action;
+    }
+    match action {
+        Some(Undo::Copied { pairs, .. }) => Some(Undo::Copied { pairs, replaced: items.to_vec() }),
+        Some(Undo::Moved { pairs, .. }) => Some(Undo::Moved { pairs, replaced: items.to_vec() }),
+        None if moved => Some(Undo::Moved { pairs: Vec::new(), replaced: items.to_vec() }),
+        None => Some(Undo::Copied { pairs: Vec::new(), replaced: items.to_vec() }),
+        other => other,
+    }
+}
+
+/// Undo a Cut+Replace: the moved item is at the destination, so put it back
+/// where it was cut from, then restore the bytes the destination had before.
+fn undo_cut_replace(r: &fileops::Replaced) -> Result<(), String> {
+    if r.target.exists() || fs::symlink_metadata(&r.target).is_ok() {
+        fileops::relocate(&r.target, &r.source)?;
+    }
+    fileops::swap_back(r)
+}
+
+/// Redo a Cut+Replace: move the item back to the destination that was replaced.
+fn redo_cut_replace(r: &fileops::Replaced) -> Result<(), String> {
+    if r.target.exists() || fs::symlink_metadata(&r.target).is_ok() {
+        fileops::remove(&r.target)?;
+    }
+    fileops::relocate(&r.source, &r.target)
+}
+
 /// Reverse one operation on disk.
 fn take_back(action: &Undo) -> Stepped {
     match action {
@@ -7984,21 +8054,30 @@ fn take_back(action: &Undo) -> Stepped {
                 |pairs| Undo::Copied { pairs, replaced: Vec::new() },
             );
             // Restore what Replace had set aside, newest first.
-            for r in replaced.iter().rev() {
-                if let Err(e) = fileops::swap_back(r) {
-                    step.error = Some(format!("Could not restore what was replaced: {e}"));
-                    return step;
-                }
-            }
+            let (done, failed, swap_error) = apply_replaced(replaced, true, fileops::swap_back);
+            step.went = attach_replaced(step.went.take(), &done, false);
+            step.left = attach_replaced(step.left.take(), &failed, false);
             if step.error.is_none() {
-                // Keep the whole action for redo, including copies that were
-                // not replacements. Replacing it with only the backup step
-                // lost those copies from the redo stack.
-                step.went = Some(Undo::Copied { pairs: pairs.clone(), replaced: replaced.clone() });
+                step.error = swap_error;
             }
             step
         },
-        Undo::Moved { pairs } => step_moved(pairs.clone(), true),
+        Undo::Moved { pairs, replaced } => {
+            let targets: Vec<&PathBuf> = replaced.iter().map(|r| &r.target).collect();
+            let plain: Vec<(PathBuf, PathBuf)> = pairs
+                .iter()
+                .filter(|(_, to)| !targets.iter().any(|t| *t == to))
+                .cloned()
+                .collect();
+            let mut step = step_moved(plain, true);
+            let (done, failed, swap_error) = apply_replaced(replaced, true, undo_cut_replace);
+            step.went = attach_replaced(step.went.take(), &done, true);
+            step.left = attach_replaced(step.left.take(), &failed, true);
+            if step.error.is_none() {
+                step.error = swap_error;
+            }
+            step
+        },
         Undo::Trashed { items } => match fileops::restore_each(items) {
             Ok(_) => Stepped::whole(action),
             Err((left, e)) => {
@@ -8053,17 +8132,30 @@ fn put_back(action: &Undo) -> Stepped {
                     error: Some(format!("Could not copy it again: {e}")),
                 },
             };
+            let (done, failed, swap_error) = apply_replaced(replaced, false, fileops::swap_forward);
+            step.went = attach_replaced(step.went.take(), &done, false);
+            step.left = attach_replaced(step.left.take(), &failed, false);
             if step.error.is_none() {
-                for r in replaced.iter() {
-                    if let Err(e) = fileops::swap_forward(r) {
-                        step.error = Some(format!("Could not replace it again: {e}"));
-                        break;
-                    }
-                }
+                step.error = swap_error;
             }
             step
         },
-        Undo::Moved { pairs } => step_moved(pairs.clone(), false),
+        Undo::Moved { pairs, replaced } => {
+            let targets: Vec<&PathBuf> = replaced.iter().map(|r| &r.target).collect();
+            let plain: Vec<(PathBuf, PathBuf)> = pairs
+                .iter()
+                .filter(|(_, to)| !targets.iter().any(|t| *t == to))
+                .cloned()
+                .collect();
+            let mut step = step_moved(plain, false);
+            let (done, failed, swap_error) = apply_replaced(replaced, false, redo_cut_replace);
+            step.went = attach_replaced(step.went.take(), &done, true);
+            step.left = attach_replaced(step.left.take(), &failed, true);
+            if step.error.is_none() {
+                step.error = swap_error;
+            }
+            step
+        },
         Undo::Trashed { items } => {
             // Deleting again: the originals are what the trash recorded. What
             // answers for this deletion afterwards is the record the new
@@ -8105,7 +8197,7 @@ fn step_moved(pairs: Vec<(PathBuf, PathBuf)>, back: bool) -> Stepped {
             let said = if back { "Could not move it back" } else { "Could not move it again" };
             fileops::relocate(src, dst).map_err(|e| format!("{said}: {e}"))
         },
-        |pairs| Undo::Moved { pairs },
+        |pairs| Undo::Moved { pairs, replaced: Vec::new() },
     )
 }
 
@@ -8162,7 +8254,7 @@ fn start_paste(s: &mut App, mode: fileops::Mode, conflict: fileops::Conflict, so
         // instead, taking the moved items away with it.
         let undo = (!pasted.landed.is_empty()).then(|| {
             if mode == fileops::Mode::Cut {
-                Undo::Moved { pairs: pasted.landed }
+                Undo::Moved { pairs: pasted.landed, replaced: pasted.replaced }
             } else {
                 Undo::Copied { pairs: pasted.landed, replaced: pasted.replaced }
             }
@@ -11946,6 +12038,40 @@ mod click_tests {
 mod undo_tests {
     use super::*;
 
+    /// A Cut that replaces an item must keep the overwritten bytes so undo
+    /// restores them while also putting the cut item back where it came from.
+    #[test]
+    fn undo_of_cut_replace_restores_the_overwritten_item() {
+        let dir = scratch("cut-replace");
+        let target = dir.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("a.txt"), b"precious").unwrap();
+        let src = dir.join("in").join("a.txt");
+        std::fs::create_dir_all(src.parent().unwrap()).unwrap();
+        std::fs::write(&src, b"incoming").unwrap();
+
+        let mut s = open(&dir);
+        start_paste(&mut s, fileops::Mode::Cut, fileops::Conflict::Overwrite, vec![src.clone()], target.clone());
+        drain_all(&mut s);
+        assert_eq!(std::fs::read_to_string(target.join("a.txt")).unwrap(), "incoming");
+        assert!(!src.exists(), "the cut source went away");
+
+        undo_last(&mut s);
+        assert_eq!(
+            std::fs::read_to_string(target.join("a.txt")).ok().as_deref(),
+            Some("precious"),
+            "undo restores what the replace overwrote"
+        );
+        assert_eq!(std::fs::read_to_string(&src).ok().as_deref(), Some("incoming"), "and returns the cut item");
+
+        redo_last(&mut s);
+        assert_eq!(std::fs::read_to_string(target.join("a.txt")).unwrap(), "incoming");
+        assert!(!src.exists(), "redo moves it back again");
+        undo_last(&mut s);
+        assert_eq!(std::fs::read_to_string(target.join("a.txt")).unwrap(), "precious", "a second undo still works");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Renaming a file to its own name records nothing, so undo is free to
     /// reverse the previous real operation.
     #[test]
@@ -12103,7 +12229,7 @@ mod undo_tests {
         let to = dir.join("b.txt");
         std::fs::write(&to, b"moved").unwrap();
         std::fs::write(&from, b"newer").unwrap();
-        let action = Undo::Moved { pairs: vec![(from.clone(), to.clone())] };
+        let action = Undo::Moved { pairs: vec![(from.clone(), to.clone())], replaced: Vec::new() };
         let stepped = take_back(&action);
         assert!(stepped.error.is_some(), "the step refuses rather than overwriting");
         assert_eq!(std::fs::read_to_string(&from).unwrap(), "newer", "the newer file is untouched");

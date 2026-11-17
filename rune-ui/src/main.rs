@@ -147,7 +147,7 @@ struct Paint {
     hair: f32,
 }
 
-fn paint(dark: bool, scale: f32) -> Paint {
+fn paint_base(dark: bool, scale: f32) -> Paint {
     let hair = 1.0 / scale;
     if dark {
         Paint {
@@ -216,6 +216,28 @@ fn paint(dark: bool, scale: f32) -> Paint {
             hair,
         }
     }
+}
+
+/// The palette for this frame. Built-ins are unchanged; Custom keeps the
+/// chosen base palette and overrides the accent-derived colors with the
+/// person's accent. A malformed stored hex falls back to the base accent.
+fn paint(s: &App, scale: f32) -> Paint {
+    let mut p = paint_base(s.dark, scale);
+    if s.theme == theme::Theme::Custom {
+        let accent = rune::color::hex(&s.custom_accent).unwrap_or(p.accent);
+        let ink_base = if s.dark { Color::BLACK } else { Color::WHITE };
+        p.accent = accent;
+        p.accent_fill = accent.mix(ink_base, if s.dark { 0.28 } else { 0.08 });
+        p.accent_ink = if s.dark {
+            accent.mix(Color::BLACK, 0.72)
+        } else {
+            Color::WHITE
+        };
+        p.row_sel = accent.mix(p.content, if s.dark { 0.86 } else { 0.90 });
+        p.sel_line = accent.mix(p.content, if s.dark { 0.62 } else { 0.68 });
+        p.rail_sel = accent.mix(p.content, if s.dark { 0.88 } else { 0.92 });
+    }
+    p
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -797,6 +819,16 @@ struct App {
     theme: theme::Theme,
     /// When the desktop was last asked, for following it while running.
     theme_at: Instant,
+    /// Custom appearance: an accent hex string and the light/dark base it sits
+    /// on. Hex is stored, not `Color`, because `Color` has no serde derives.
+    custom_accent: String,
+    custom_dark: bool,
+    custom_open: bool,
+    custom_hex: TextEdit,
+    /// Cross-platform visual effects, enabled only in Custom mode.
+    fx_enabled: bool,
+    fx_frosted: bool,
+    fx_shadows: bool,
     view: View,
     mode: Mode,
     preview: bool,
@@ -1607,12 +1639,33 @@ fn load_prefs_from(s: &mut App, id: &str) {
         s.dark = dark;
         stored_dark = Some(dark);
     }
+    // The custom appearance, loaded before the theme so a Custom choice can
+    // resolve its base instead of asking the desktop.
+    if let Some(v) = prefs.get::<String>("custom_accent") {
+        s.custom_accent = v;
+    }
+    if let Some(v) = prefs.get::<bool>("custom_dark") {
+        s.custom_dark = v;
+    }
+    if let Some(v) = prefs.get::<bool>("fx_enabled") {
+        s.fx_enabled = v;
+    }
+    if let Some(v) = prefs.get::<bool>("fx_frosted") {
+        s.fx_frosted = v;
+    }
+    if let Some(v) = prefs.get::<bool>("fx_shadows") {
+        s.fx_shadows = v;
+    }
     // The appearance preference. A save from before it existed carries only the
     // old boolean, which is taken as the choice it was.
     match prefs.get::<u8>("theme") {
         Some(stored) => {
             s.theme = theme::Theme::from_u8(stored);
-            s.dark = s.theme.is_dark();
+            s.dark = if s.theme == theme::Theme::Custom {
+                s.custom_dark
+            } else {
+                s.theme.is_dark()
+            };
         }
         None => {
             if let Some(dark) = stored_dark {
@@ -1693,6 +1746,11 @@ fn persist_to(s: &App, id: &str) {
     );
     let _ = prefs.set("settings", &settings);
     let _ = prefs.set("theme", &s.theme.to_u8());
+    let _ = prefs.set("custom_accent", &s.custom_accent);
+    let _ = prefs.set("custom_dark", &s.custom_dark);
+    let _ = prefs.set("fx_enabled", &s.fx_enabled);
+    let _ = prefs.set("fx_frosted", &s.fx_frosted);
+    let _ = prefs.set("fx_shadows", &s.fx_shadows);
     let _ = prefs.set("window_size", &s.window_settled);
     let _ = prefs.set("favorites", &s.favorites);
     let _ = prefs.set("recent", &s.recent);
@@ -1712,7 +1770,7 @@ fn persist_to(s: &App, id: &str) {
 /// A cheap fingerprint of everything persisted, so poll saves only on change.
 fn prefs_signature(s: &App) -> String {
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{:?}|{}|{}|{:?}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{:?}|{}|{}|{:?}|{}|{}|{}|{}|{}",
         s.sort,
         s.sort_desc,
         s.preview,
@@ -1737,7 +1795,12 @@ fn prefs_signature(s: &App) -> String {
         s.col_w,
         s.rail_w,
         s.theme.to_u8(),
-        s.window_settled
+        s.window_settled,
+        s.custom_accent,
+        s.custom_dark,
+        s.fx_enabled,
+        s.fx_frosted,
+        s.fx_shadows
     )
 }
 
@@ -1836,7 +1899,11 @@ fn unique_paths(paths: Vec<String>) -> Vec<String> {
 /// right one.
 fn set_theme(s: &mut App, theme: theme::Theme) {
     s.theme = theme;
-    s.dark = theme.is_dark();
+    s.dark = if theme == theme::Theme::Custom {
+        s.custom_dark
+    } else {
+        theme.is_dark()
+    };
     s.theme_at = Instant::now();
 }
 
@@ -2745,6 +2812,13 @@ fn init() -> App {
         dark: true,
         theme: theme::Theme::System,
         theme_at: Instant::now(),
+        custom_accent: "#4cc2ff".into(),
+        custom_dark: true,
+        custom_open: false,
+        custom_hex: TextEdit::default(),
+        fx_enabled: true,
+        fx_frosted: true,
+        fx_shadows: true,
         view: View::Files,
         mode: Mode::Details,
         preview: false,
@@ -3962,7 +4036,7 @@ fn view(s: &App, cx: &mut Cx<App>) -> El {
             timing("first view (since launch)", *start);
         }
     }
-    let p = paint(s.dark, cx.env().scale);
+    let p = paint(s, cx.env().scale);
     s.scale.set(cx.env().scale);
     // The thumb is a window-level overlay driven by the Files viewport; when
     // that viewport is not mounted nothing refreshes it, so hide it here.
@@ -3999,6 +4073,7 @@ fn view(s: &App, cx: &mut Cx<App>) -> El {
         .child(scroll_thumb(s, p))
         .child(drag_overlay(s, p))
         .child(menu_overlay(s, p))
+        .child(custom_colors_overlay(s, p))
         .child(customize_dialog(s, p))
         .child(dialog_overlay(s, p))
 }
@@ -5150,6 +5225,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                         (theme::Theme::System, "Follow system"),
                         (theme::Theme::Light, "Light"),
                         (theme::Theme::Dark, "Dark"),
+                        (theme::Theme::Custom, "Custom…"),
                     ] {
                         rows.push(
                             menu_item(
@@ -5160,6 +5236,11 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                                 false,
                             )
                             .on_press(move |s: &mut App| {
+                                if choice == theme::Theme::Custom {
+                                    s.custom_dark = s.dark;
+                                    s.custom_hex.text = s.custom_accent.clone();
+                                    s.custom_open = true;
+                                }
                                 set_theme(s, choice);
                                 s.menu = None;
                             }),
@@ -5561,7 +5642,8 @@ fn menu_overlay(s: &App, p: Paint) -> El {
     // The panel swallows a press on its own padding so a near miss neither
     // picks an item nor dismisses. Outside it, the body scrim (see `content`)
     // closes the menu and keeps the press from the rows behind.
-    col()
+    let fx = s.theme == theme::Theme::Custom && s.fx_enabled;
+    let mut panel = col()
         .key("menu-panel")
         .absolute(x, y)
         .w(mw)
@@ -5569,10 +5651,16 @@ fn menu_overlay(s: &App, p: Paint) -> El {
         .px(4.0)
         .fill(p.menu)
         .border(p.hair, p.menu_line)
-        .radius(8.0)
-        .shadow(6.0, 18.0, Color::BLACK.alpha(0.45))
-        .on_press(|_s: &mut App| {})
-        .children(rows)
+        .radius(8.0);
+    if fx && s.fx_frosted {
+        panel = panel.backdrop_blur(10.0);
+    }
+    if fx && s.fx_shadows {
+        panel = panel.shadow(8.0, 30.0, Color::BLACK.alpha(0.55));
+    } else {
+        panel = panel.shadow(6.0, 18.0, Color::BLACK.alpha(0.45));
+    }
+    panel.on_press(|_s: &mut App| {}).children(rows)
 }
 
 /// One row of the customize list.
@@ -5886,6 +5974,165 @@ fn customize_group(s: &App, p: Paint, group: &CustomGroup) -> El {
 }
 
 /// A modal dialog toggling which context-menu items appear; choices persist.
+/// Apply a stored custom accent, if it parses. Shared by the swatch buttons,
+/// the hex field's Apply button and Done so all three behave the same.
+fn apply_custom_hex(s: &mut App) {
+    let value = s.custom_hex.text.trim().to_string();
+    if rune::color::hex(&value).is_some() {
+        s.custom_accent = value;
+    }
+}
+
+/// The Custom appearance panel: a light/dark base, an accent color chosen from
+/// swatches or a hex field, and the cross-platform effects toggles.
+fn custom_colors_overlay(s: &App, p: Paint) -> El {
+    if !s.custom_open {
+        return el().key("custom-none");
+    }
+    let presets = [
+        "#4cc2ff", "#0078d4", "#7b68ee", "#e81123", "#ff8c00", "#107c10", "#c239b3", "#000000",
+    ];
+    let mut swatches = row().w_full().gap(8.0);
+    for hex in presets {
+        let chosen = s.custom_accent.eq_ignore_ascii_case(hex);
+        swatches = swatches.child(
+            el()
+                .key(format!("custom-swatch-{hex}"))
+                .w(28.0)
+                .h(28.0)
+                .radius(4.0)
+                .fill(c(hex))
+                .border(
+                    p.hair * if chosen { 3.0 } else { 1.0 },
+                    if chosen { p.text } else { p.field_line },
+                )
+                .on_press(move |s: &mut App| {
+                    s.custom_accent = hex.to_string();
+                    s.custom_hex.text = hex.to_string();
+                }),
+        );
+    }
+
+    let toggle_row = |label: &'static str, on: bool, key: &'static str, mutate: fn(&mut App)| {
+        row()
+            .key(key)
+            .w_full()
+            .h(30.0)
+            .gap(10.0)
+            .items_center()
+            .child(check_box(p, on))
+            .child(text(label).font(UI_TEXT).color(p.text))
+            .on_press(move |s: &mut App| mutate(s))
+    };
+
+    let mut panel = col()
+        .key("custom-panel")
+        .w(440.0)
+        .px(16.0)
+        .py(16.0)
+        .gap(12.0)
+        .fill(p.menu)
+        .border(p.hair, p.menu_line)
+        .radius(8.0);
+    if s.fx_enabled && s.fx_frosted {
+        panel = panel.backdrop_blur(10.0);
+    }
+    if s.fx_enabled && s.fx_shadows {
+        panel = panel.shadow(8.0, 30.0, Color::BLACK.alpha(0.55));
+    }
+    panel = panel
+        .child(text("Custom appearance").font(TILE_TEXT).color(p.text))
+        .child(text("Accent").font(CAPTION).color(p.secondary))
+        .child(swatches)
+        .child(
+            row()
+                .w_full()
+                .h(FIELD_H)
+                .radius(4.0)
+                .fill(p.field)
+                .border(p.hair, p.field_line)
+                .px(10.0)
+                .items_center()
+                .child(
+                    text_input(&s.custom_hex, UI_TEXT)
+                        .key("custom-hex")
+                        .grow(1.0)
+                        .min_w(0.0)
+                        .single_line()
+                        .color(p.text)
+                        .on_edit(|s: &mut App| &mut s.custom_hex),
+                )
+                .child(
+                    text("Apply")
+                        .font(UI_TEXT)
+                        .color(p.secondary)
+                        .on_press(|s: &mut App| apply_custom_hex(s)),
+                ),
+        )
+        .child(text("Base").font(CAPTION).color(p.secondary))
+        .child(
+            row()
+                .w_full()
+                .gap(16.0)
+                .items_center()
+                .child(radio_dot(p, !s.custom_dark))
+                .child(
+                    text("Light")
+                        .font(UI_TEXT)
+                        .color(p.text)
+                        .on_press(|s: &mut App| {
+                            s.custom_dark = false;
+                            set_theme(s, theme::Theme::Custom);
+                        }),
+                )
+                .child(radio_dot(p, s.custom_dark))
+                .child(
+                    text("Dark")
+                        .font(UI_TEXT)
+                        .color(p.text)
+                        .on_press(|s: &mut App| {
+                            s.custom_dark = true;
+                            set_theme(s, theme::Theme::Custom);
+                        }),
+                ),
+        )
+        .child(text("Effects").font(CAPTION).color(p.secondary))
+        .child(toggle_row("Effects on", s.fx_enabled, "custom-fx-on", |s| {
+            s.fx_enabled = !s.fx_enabled;
+        }))
+        .child(toggle_row("Frosted panels", s.fx_frosted, "custom-fx-frost", |s| {
+            s.fx_frosted = !s.fx_frosted;
+        }))
+        .child(toggle_row("Soft shadows", s.fx_shadows, "custom-fx-shadow", |s| {
+            s.fx_shadows = !s.fx_shadows;
+        }))
+        .child(
+            row().w_full().items_center().child(el().grow(1.0)).child(
+                row()
+                    .key("custom-done")
+                    .h(30.0)
+                    .px(18.0)
+                    .radius(4.0)
+                    .fill(p.accent_fill)
+                    .hover(p.hover)
+                    .center()
+                    .child(text("Done").font(UI_TEXT).color(Color::WHITE))
+                    .on_press(|s: &mut App| {
+                        apply_custom_hex(s);
+                        s.custom_open = false;
+                    }),
+            ),
+        );
+
+    el()
+        .key("custom-overlay")
+        .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
+        .fill(Color::BLACK.alpha(0.45))
+        .on_press(|s: &mut App| s.custom_open = false)
+        .center()
+        .child(panel)
+}
+
 fn customize_dialog(s: &App, p: Paint) -> El {
     if !s.customize_open {
         return el().key("customize-none");
@@ -8682,6 +8929,10 @@ fn handle_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
         return true;
     }
     if ev.key == Key::Escape {
+        if s.custom_open {
+            s.custom_open = false;
+            return true;
+        }
         if s.dialog.is_some() {
             s.dialog = None;
             return true;
@@ -8702,8 +8953,10 @@ fn handle_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
         }
         return false;
     }
-    if s.dialog.is_some() {
-        return dialog_key(s, &ev.key);
+    if s.custom_open || s.dialog.is_some() {
+        // The custom panel owns the keyboard while it is open, so shortcuts
+        // cannot fire a file operation from inside a color field.
+        return s.custom_open || dialog_key(s, &ev.key);
     }
     if s.search_edit.focused {
         return false;
@@ -10483,6 +10736,22 @@ fn main() {
                 s.dark = false;
                 load(s, Fixture::Downloads);
             }),
+            ("custom", |s| {
+                s.theme = theme::Theme::Custom;
+                s.custom_dark = true;
+                s.dark = true;
+                s.custom_accent = "#e81123".into();
+                load(s, Fixture::Downloads);
+            }),
+            ("custompanel", |s| {
+                s.theme = theme::Theme::Custom;
+                s.custom_dark = true;
+                s.dark = true;
+                s.custom_accent = "#e81123".into();
+                s.custom_hex.text = s.custom_accent.clone();
+                s.custom_open = true;
+                load(s, Fixture::Downloads);
+            }),
             ("quickaccess", |s| load(s, Fixture::QuickAccess)),
             // The home folder itself, with its own listing and breadcrumbs.
             ("home", |s| open_home(s)),
@@ -10744,6 +11013,59 @@ fn main() {
 #[cfg(all(test, target_os = "windows"))]
 mod customize_tests {
     use super::*;
+
+    /// A Custom choice survives a restart, including its base, accent and the
+    /// effect switches, and resolves `dark` from the stored base.
+    #[test]
+    fn a_custom_appearance_survives_a_restart() {
+        let store = "lyre-rune-custom-test";
+        let mut before = init();
+        before.theme = theme::Theme::Custom;
+        before.custom_dark = false;
+        before.custom_accent = "#7b68ee".into();
+        before.fx_frosted = false;
+        before.fx_shadows = false;
+        before.fx_enabled = true;
+        before.dark = true;
+        persist_to(&before, store);
+
+        let mut after = init();
+        after.theme = theme::Theme::System;
+        after.custom_dark = true;
+        after.custom_accent.clear();
+        after.fx_frosted = true;
+        after.fx_shadows = true;
+        load_prefs_from(&mut after, store);
+        assert_eq!(after.theme, theme::Theme::Custom);
+        assert!(!after.dark, "a light base resolves to light, not the desktop");
+        assert_eq!(after.custom_accent, "#7b68ee");
+        assert!(!after.fx_frosted && !after.fx_shadows);
+
+        let mut prefs = rune::prefs::Prefs::open(store);
+        let _ = prefs.remove("theme");
+        let _ = prefs.remove("custom_accent");
+        let _ = prefs.remove("custom_dark");
+        let _ = prefs.remove("fx_enabled");
+        let _ = prefs.remove("fx_frosted");
+        let _ = prefs.remove("fx_shadows");
+    }
+
+    /// Changing any custom color or effect must mark the state as changed so
+    /// poll writes it; a saved accent must also reach the palette.
+    #[test]
+    fn custom_colors_change_the_palette_and_the_saved_state() {
+        let mut s = init();
+        let base = prefs_signature(&s);
+        s.theme = theme::Theme::Custom;
+        s.dark = true;
+        s.custom_accent = "#ff8c00".into();
+        assert_ne!(prefs_signature(&s), base, "the accent is part of the saved state");
+        let accent = paint(&s, 1.0).accent;
+        assert_eq!(accent, rune::color::hex("#ff8c00").unwrap());
+
+        s.fx_frosted = !s.fx_frosted;
+        assert_ne!(prefs_signature(&s), base, "effects are part of the saved state");
+    }
 
     /// The reported bug: an extension had to be allowed again after every
     /// restart. This round-trips the real save and restore through a store of its
@@ -11303,7 +11625,7 @@ mod tests {
             fixture_size: String::new(),
         };
         let key = icon_key(&e);
-        let _ = entry_icon(&s, &e, paint(true, 1.0), 16.0);
+        let _ = entry_icon(&s, &e, paint(&s, 1.0), 16.0);
         assert_eq!(s.icons_pending.get(), 1, "the miss must queue exactly one job");
         assert_eq!(
             s.icon_cache.borrow().get(&key).unwrap().size(),
@@ -11332,7 +11654,7 @@ mod tests {
                     break;
                 }
                 s.icon_cache.borrow_mut().remove(&key);
-                let _ = entry_icon(&s, &e, paint(true, 1.0), 16.0);
+                let _ = entry_icon(&s, &e, paint(&s, 1.0), 16.0);
                 while s.icons_pending.get() > 0 {
                     drain_icons(&s);
                     if s.icons_pending.get() > 0 {
@@ -11351,7 +11673,7 @@ mod tests {
             );
         }
         // A second render is a pure cache hit: no new job.
-        let _ = entry_icon(&s, &e, paint(true, 1.0), 16.0);
+        let _ = entry_icon(&s, &e, paint(&s, 1.0), 16.0);
         assert_eq!(s.icons_pending.get(), 0);
     }
 

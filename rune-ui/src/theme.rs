@@ -12,6 +12,10 @@ pub enum Theme {
     System,
     Light,
     Dark,
+    /// An accent and a light/dark base the person picked themselves. The
+    /// resolved base lives in `App::custom_dark`; `is_dark` cannot answer for
+    /// this variant on its own.
+    Custom,
 }
 
 impl Theme {
@@ -20,6 +24,7 @@ impl Theme {
             Theme::System => 0,
             Theme::Light => 1,
             Theme::Dark => 2,
+            Theme::Custom => 3,
         }
     }
 
@@ -27,6 +32,7 @@ impl Theme {
         match value {
             1 => Theme::Light,
             2 => Theme::Dark,
+            3 => Theme::Custom,
             _ => Theme::System,
         }
     }
@@ -37,6 +43,8 @@ impl Theme {
             Theme::Light => false,
             Theme::Dark => true,
             Theme::System => system_is_dark(),
+            // Resolved by App from custom_dark; never call this for Custom.
+            Theme::Custom => false,
         }
     }
 }
@@ -133,7 +141,7 @@ mod tests {
 
     #[test]
     fn the_preference_round_trips() {
-        for theme in [Theme::System, Theme::Light, Theme::Dark] {
+        for theme in [Theme::System, Theme::Light, Theme::Dark, Theme::Custom] {
             assert_eq!(Theme::from_u8(theme.to_u8()), theme);
         }
         // An older save that stored nothing at all still reads as following.

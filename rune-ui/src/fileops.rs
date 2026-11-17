@@ -132,6 +132,15 @@ fn copy_at(
     if depth > MAX_DEPTH {
         return Err(format!("{}: the folders nest too deeply to copy", src.display()));
     }
+    // A link chosen as the source is copied as a link, like the ones inside a
+    // folder. Following it here walked into its target, which could include
+    // the destination being built and recurse until the depth limit.
+    if fs::symlink_metadata(src)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return copy_link(src, dst);
+    }
     let meta = fs::metadata(src).map_err(|e| format!("{}: {e}", src.display()))?;
     if meta.is_dir() {
         fs::create_dir_all(dst).map_err(|e| format!("{}: {e}", dst.display()))?;
@@ -524,7 +533,17 @@ pub fn paste<F: FnMut(Progress) -> bool>(
 ) -> Pasted {
     // A selection that names the destination itself is refused before anything
     // moves: stopping half way leaves the person to work out which half went.
-    for src in sources {
+    // A folder and something inside it are the same operation twice: keeping
+    // both made the second source vanish after the first moved, reporting a
+    // false failure and recording an undo that could not cover the child.
+    // Sources nested inside an earlier source go with it; they are not
+    // separate operations to attempt once the ancestor has moved.
+    let covered: Vec<bool> = sources
+        .iter()
+        .enumerate()
+        .map(|(i, src)| sources[..i].iter().any(|earlier| src.starts_with(earlier)))
+        .collect();
+    for (i, src) in sources.iter().enumerate() {
         let dst = target.join(name_of(src));
         if !src.is_dir() {
             continue;
@@ -543,7 +562,12 @@ pub fn paste<F: FnMut(Progress) -> bool>(
         }
     }
     let total = sources.len();
-    let total_bytes: u64 = sources.iter().map(|p| item_size(p)).sum();
+    let total_bytes: u64 = sources
+        .iter()
+        .enumerate()
+        .filter(|&(i, _)| !covered[i])
+        .map(|(_, p)| item_size(p))
+        .sum();
     let mut done_bytes = 0u64;
     let mut completed = 0u64;
     let mut landed: Vec<(PathBuf, PathBuf)> = Vec::new();
@@ -556,6 +580,9 @@ pub fn paste<F: FnMut(Progress) -> bool>(
     let mut last_bytes = 0u64;
     let step = (total_bytes / 16).max(1);
     for (i, src) in sources.iter().enumerate() {
+        if covered[i] {
+            continue;
+        }
         if cancel.load(Ordering::Relaxed) {
             break;
         }
@@ -1583,6 +1610,45 @@ mod tests {
         let (left, _) = restore_each(&outcome.trashed).expect_err("one item cannot be restored");
         assert_eq!(left.len(), 1, "only the failed item is left for the next press");
         assert!(second.exists(), "the other item came back");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A folder and a child inside it are one operation, not two, and a link
+    /// chosen as the source is not walked into its own target.
+    #[test]
+    fn a_nested_selection_is_moved_once() {
+        let dir = scratch("nested-once");
+        let folder = dir.join("folder");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("child.txt"), b"child").unwrap();
+        let out = dir.join("out");
+        fs::create_dir_all(&out).unwrap();
+        let pasted = paste(
+            Mode::Cut,
+            Conflict::Rename,
+            &[folder.clone(), folder.join("child.txt")],
+            &out,
+            &AtomicBool::new(false),
+            noop,
+        );
+        assert!(pasted.error.is_none(), "no false failure: {:?}", pasted.error);
+        assert_eq!(pasted.landed.len(), 1, "the ancestor covers the child");
+        assert!(out.join("folder").join("child.txt").exists());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_pasted_into_its_target_is_not_walked() {
+        let dir = scratch("link-self");
+        let folder = dir.join("folder");
+        fs::create_dir_all(&folder).unwrap();
+        fs::write(folder.join("payload.txt"), b"x").unwrap();
+        let link = dir.join("shortcut");
+        std::os::unix::fs::symlink(&folder, &link).unwrap();
+        let pasted = paste(Mode::Copy, Conflict::Rename, std::slice::from_ref(&link), &folder, &AtomicBool::new(false), noop);
+        assert!(pasted.error.is_none(), "the link is copied as a link: {:?}", pasted.error);
+        assert!(fs::symlink_metadata(folder.join("shortcut")).unwrap().file_type().is_symlink());
         let _ = fs::remove_dir_all(&dir);
     }
 

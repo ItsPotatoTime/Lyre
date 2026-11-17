@@ -689,7 +689,9 @@ fn take_drop(s: &mut App, target: Option<DropTarget>, files: &[PathBuf], tx: &mu
     };
     let (staged, skipped) = osdrag::stage_with_skipped(files);
     s.drop_staged.extend(staged.iter().cloned());
-    s.drop_staged.extend(files.iter().cloned());
+    // The extracted virtual files have been snapshotted into staging; clean
+    // them now rather than storing the originals for later release.
+    osdrag::release_virtual(files);
     if skipped > 0 {
         s.notice = format!("{skipped} dragged item{} could not be prepared and were left out", if skipped == 1 { "" } else { "s" });
     }
@@ -908,6 +910,8 @@ struct App {
     transfer: Option<Transfer>,
     op_rx: Option<std::sync::mpsc::Receiver<OpMsg>>,
     op_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Whether the in-flight operation is a cut-move that consumed the clipboard.
+    op_was_cut: bool,
     /// Handler items for the open menu, memoised by the selection they were read
     /// for: building them instantiates a third-party DLL, which is far too much
     /// to repeat on every frame the menu is drawn.
@@ -2805,6 +2809,7 @@ fn init() -> App {
         transfer: None,
         op_rx: None,
         op_cancel: None,
+        op_was_cut: false,
         menu_handler_rows: RefCell::new(None),
         preview_facts: RefCell::new(None),
         rail_open: Vec::new(),
@@ -3959,7 +3964,7 @@ fn view(s: &App, cx: &mut Cx<App>) -> El {
             }
             let (staged, skipped) = osdrag::stage_with_skipped(files);
             s.drop_staged.extend(staged.iter().cloned());
-            s.drop_staged.extend(files.iter().cloned());
+            osdrag::release_virtual(files);
             if skipped > 0 {
                 s.notice = format!("{skipped} dragged item{} could not be prepared and were left out", if skipped == 1 { "" } else { "s" });
             }
@@ -7990,15 +7995,21 @@ fn take_back(action: &Undo) -> Stepped {
         Undo::Moved { pairs } => step_moved(pairs.clone(), true),
         Undo::Trashed { items } => match fileops::restore_each(items) {
             Ok(_) => Stepped::whole(action),
-            Err((left, e)) => Stepped {
-                went: if left.len() == items.len() {
-                    None
-                } else {
-                    Some(action.clone())
-                },
-                left: (!left.is_empty()).then_some(Undo::Trashed { items: left }),
-                error: Some(format!("Could not take it out of the trash: {e}")),
-            },
+            Err((left, e)) => {
+                // Only the items that actually came back go on the redo stack;
+                // re-deleting the ones still in the trash would trash an
+                // unrelated file that took their old path in the meantime.
+                let restored: Vec<_> = items
+                    .iter()
+                    .filter(|item| !left.iter().any(|failed| failed.original == item.original && failed.when == item.when))
+                    .cloned()
+                    .collect();
+                Stepped {
+                    went: (!restored.is_empty()).then_some(Undo::Trashed { items: restored }),
+                    left: (!left.is_empty()).then_some(Undo::Trashed { items: left }),
+                    error: Some(format!("Could not take it out of the trash: {e}")),
+                }
+            }
         },
     }
 }
@@ -8144,6 +8155,7 @@ fn start_paste(s: &mut App, mode: fileops::Mode, conflict: fileops::Conflict, so
     let worker_cancel = cancel.clone();
     s.op_rx = Some(rx);
     s.op_cancel = Some(cancel);
+    s.op_was_cut = mode == fileops::Mode::Cut;
     s.transfer = Some(Transfer { label, name: String::new(), done: 0, total, done_bytes: 0, total_bytes: 0, stopping: false });
     std::thread::spawn(move || {
         let progress_tx = tx.clone();
@@ -8189,6 +8201,7 @@ fn start_delete(s: &mut App, mode: fileops::DeleteMode, paths: Vec<PathBuf>) {
     let worker_cancel = cancel.clone();
     s.op_rx = Some(rx);
     s.op_cancel = Some(cancel);
+    s.op_was_cut = false;
     s.transfer = Some(Transfer { label: "Deleting", name: String::new(), done: 0, total, done_bytes: 0, total_bytes: 0, stopping: false });
     std::thread::spawn(move || {
         let progress_tx = tx.clone();
@@ -8379,12 +8392,14 @@ fn drain_op(s: &mut App) -> bool {
         s.op_cancel = None;
         s.transfer = None;
         // A completed cut-move consumes the clipboard; a second paste would
-        // otherwise use paths that no longer exist.
-        if s.clipboard.as_ref().is_some_and(|(_, mode)| *mode == fileops::Mode::Cut) {
+        // otherwise use paths that no longer exist. Only the cut paste that
+        // actually ran does this — deleting an unrelated item must not drop a
+        // different cut waiting to be pasted.
+        if s.op_was_cut && s.clipboard.as_ref().is_some_and(|(_, mode)| *mode == fileops::Mode::Cut) {
             s.clipboard = None;
         }
+        s.op_was_cut = false;
         let staged = std::mem::take(&mut s.drop_staged);
-        osdrag::release_virtual(&staged);
         osdrag::release(&staged);
         clear_selection(s);
         if s.view == View::Files {

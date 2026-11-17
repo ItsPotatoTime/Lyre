@@ -4410,10 +4410,10 @@ fn nav_button(p: Paint, which: Ico, key: &str, action: usize, enabled: bool, tip
                 go_forward(s);
             }
             2 => go_up(s),
-            _ => {
-                let path = s.root.clone();
-                set_location(s, path);
-            }
+            // The address-bar refresh must take the same path as F5 and the
+            // context menus; calling set_location directly sent virtual pages
+            // to whatever folder was last on screen.
+            _ => refresh_folder(s),
         })
 }
 
@@ -5295,12 +5295,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                     rows.push(
                         menu_item(p, "Refresh", Some(Ico::Refresh), Some("F5"), false).on_press(
                             |s: &mut App| {
-                                if s.view == View::Files {
-                                    let r = s.root.clone();
-                                    set_location(s, r);
-                                } else {
-                                    refresh_visible(s);
-                                }
+                                refresh_folder(s);
                                 s.menu = None;
                             },
                         ),
@@ -5670,12 +5665,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                     if menu_visible(s, "refresh") {
                         rows.push(
                             menu_item(p, "Refresh", Some(Ico::Refresh), Some("F5"), false).on_press(|s: &mut App| {
-                                if s.view == View::Files {
-                                    let r = s.root.clone();
-                                    set_location(s, r);
-                                } else {
-                                    refresh_visible(s);
-                                }
+                                refresh_folder(s);
                                 s.menu = None;
                             }),
                         );
@@ -12644,6 +12634,21 @@ mod click_tests {
         let mut rt = rune::Runtime::new(init(), view, (1076.0, 600.0), rune::Env::new(true, 1.0));
         rt.frame(0.0);
         rt
+    }
+
+    /// The address-bar refresh button takes the same path as F5: refreshing a
+    /// virtual page keeps that page instead of jumping to the last folder.
+    #[test]
+    fn the_refresh_button_keeps_a_virtual_page() {
+        let mut rt = runtime();
+        rt.update(|s, _| navigate(s, 9)); // This PC
+        rt.frame(0.0);
+        let r = rect_of(&rt, "refresh");
+        click_at(&mut rt, r[0] + r[2] / 2.0, r[1] + r[3] / 2.0);
+        assert!(
+            rt.state.view == View::ThisPc,
+            "the toolbar refresh must not replace This PC with a folder"
+        );
     }
 
     /// An element's rect as `ElementInfo` reports it: x, y, width, height.

@@ -828,6 +828,7 @@ struct App {
     /// Cross-platform visual effects, enabled only in Custom mode.
     fx_enabled: bool,
     fx_frosted: bool,
+    fx_translucent: bool,
     fx_shadows: bool,
     view: View,
     mode: Mode,
@@ -1653,6 +1654,9 @@ fn load_prefs_from(s: &mut App, id: &str) {
     if let Some(v) = prefs.get::<bool>("fx_frosted") {
         s.fx_frosted = v;
     }
+    if let Some(v) = prefs.get::<bool>("fx_translucent") {
+        s.fx_translucent = v;
+    }
     if let Some(v) = prefs.get::<bool>("fx_shadows") {
         s.fx_shadows = v;
     }
@@ -1750,6 +1754,7 @@ fn persist_to(s: &App, id: &str) {
     let _ = prefs.set("custom_dark", &s.custom_dark);
     let _ = prefs.set("fx_enabled", &s.fx_enabled);
     let _ = prefs.set("fx_frosted", &s.fx_frosted);
+    let _ = prefs.set("fx_translucent", &s.fx_translucent);
     let _ = prefs.set("fx_shadows", &s.fx_shadows);
     let _ = prefs.set("window_size", &s.window_settled);
     let _ = prefs.set("favorites", &s.favorites);
@@ -1770,7 +1775,7 @@ fn persist_to(s: &App, id: &str) {
 /// A cheap fingerprint of everything persisted, so poll saves only on change.
 fn prefs_signature(s: &App) -> String {
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{:?}|{}|{}|{:?}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{:?}|{}|{}|{:?}|{}|{}|{}|{}|{}|{}",
         s.sort,
         s.sort_desc,
         s.preview,
@@ -1800,6 +1805,7 @@ fn prefs_signature(s: &App) -> String {
         s.custom_dark,
         s.fx_enabled,
         s.fx_frosted,
+        s.fx_translucent,
         s.fx_shadows
     )
 }
@@ -2818,6 +2824,7 @@ fn init() -> App {
         custom_hex: TextEdit::default(),
         fx_enabled: true,
         fx_frosted: true,
+        fx_translucent: true,
         fx_shadows: true,
         view: View::Files,
         mode: Mode::Details,
@@ -5649,7 +5656,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
         .w(mw)
         .py(4.0)
         .px(4.0)
-        .fill(p.menu)
+        .fill(panel_fill(s, p))
         .border(p.hair, p.menu_line)
         .radius(8.0);
     if fx && s.fx_frosted {
@@ -5974,6 +5981,17 @@ fn customize_group(s: &App, p: Paint, group: &CustomGroup) -> El {
 }
 
 /// A modal dialog toggling which context-menu items appear; choices persist.
+/// Floating panels need a translucent fill for `backdrop_blur` to show: the
+/// blur is drawn first and the fill laid over it, so an opaque fill hides it.
+fn panel_fill(s: &App, p: Paint) -> Color {
+    // Frosting needs a translucent fill too, or the blur is hidden by paint.
+    if s.theme == theme::Theme::Custom && s.fx_enabled && (s.fx_frosted || s.fx_translucent) {
+        p.menu.alpha(0.72)
+    } else {
+        p.menu
+    }
+}
+
 /// Apply a stored custom accent, if it parses. Shared by the swatch buttons,
 /// the hex field's Apply button and Done so all three behave the same.
 fn apply_custom_hex(s: &mut App) {
@@ -6031,7 +6049,7 @@ fn custom_colors_overlay(s: &App, p: Paint) -> El {
         .px(16.0)
         .py(16.0)
         .gap(12.0)
-        .fill(p.menu)
+        .fill(panel_fill(s, p))
         .border(p.hair, p.menu_line)
         .radius(8.0);
     if s.fx_enabled && s.fx_frosted {
@@ -6103,6 +6121,9 @@ fn custom_colors_overlay(s: &App, p: Paint) -> El {
         .child(toggle_row("Frosted panels", s.fx_frosted, "custom-fx-frost", |s| {
             s.fx_frosted = !s.fx_frosted;
         }))
+        .child(toggle_row("Translucent panels", s.fx_translucent, "custom-fx-translucent", |s| {
+            s.fx_translucent = !s.fx_translucent;
+        }))
         .child(toggle_row("Soft shadows", s.fx_shadows, "custom-fx-shadow", |s| {
             s.fx_shadows = !s.fx_shadows;
         }))
@@ -6155,7 +6176,7 @@ fn customize_dialog(s: &App, p: Paint) -> El {
                 .px(16.0)
                 .py(16.0)
                 .gap(12.0)
-                .fill(p.menu)
+                .fill(panel_fill(s, p))
                 .border(p.hair, p.menu_line)
                 .radius(8.0)
                 .shadow(6.0, 24.0, Color::BLACK.alpha(0.5))
@@ -6453,7 +6474,7 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
             .px(20.0)
             .py(18.0)
             .gap(14.0)
-            .fill(p.menu)
+            .fill(panel_fill(s, p))
             .border(p.hair, p.menu_line)
             .radius(8.0)
             .shadow(6.0, 24.0, Color::BLACK.alpha(0.5))
@@ -11024,6 +11045,7 @@ mod customize_tests {
         before.custom_dark = false;
         before.custom_accent = "#7b68ee".into();
         before.fx_frosted = false;
+        before.fx_translucent = false;
         before.fx_shadows = false;
         before.fx_enabled = true;
         before.dark = true;
@@ -11034,12 +11056,13 @@ mod customize_tests {
         after.custom_dark = true;
         after.custom_accent.clear();
         after.fx_frosted = true;
+        after.fx_translucent = true;
         after.fx_shadows = true;
         load_prefs_from(&mut after, store);
         assert_eq!(after.theme, theme::Theme::Custom);
         assert!(!after.dark, "a light base resolves to light, not the desktop");
         assert_eq!(after.custom_accent, "#7b68ee");
-        assert!(!after.fx_frosted && !after.fx_shadows);
+        assert!(!after.fx_frosted && !after.fx_translucent && !after.fx_shadows);
 
         let mut prefs = rune::prefs::Prefs::open(store);
         let _ = prefs.remove("theme");
@@ -11047,6 +11070,7 @@ mod customize_tests {
         let _ = prefs.remove("custom_dark");
         let _ = prefs.remove("fx_enabled");
         let _ = prefs.remove("fx_frosted");
+        let _ = prefs.remove("fx_translucent");
         let _ = prefs.remove("fx_shadows");
     }
 

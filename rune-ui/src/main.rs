@@ -643,6 +643,7 @@ fn apply_osdrop(tx: &mut Tx, at: (f32, f32), paths: Vec<PathBuf>) {
     if std::env::var_os("LYRE_TRACE").is_some() {
         eprintln!("[drop] apply at={at:?} paths={}", paths.len());
     }
+    let shift = tx.mods().shift;
     tx.element_at(at.0, at.1, move |s: &mut App, picked, _tx: &mut Tx| {
         let picked_path = picked.as_ref().map(|p| p.path().to_string());
         let (_, target) = picked
@@ -655,8 +656,18 @@ fn apply_osdrop(tx: &mut Tx, at: (f32, f32), paths: Vec<PathBuf>) {
             eprintln!("[drop] pick path={picked_path:?} target={target:?}");
         }
         let Some(tp) = drop_target_path(s, target.as_ref()) else { return };
+        // A drag that came from this window and is dropped back uses the same
+        // volume rule as an internal drag; a drop from outside always copies.
+        let labels: Vec<String> = paths.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+        let own = s.os_drag.as_ref().is_some_and(|p| *p == labels);
+        let mode = if own {
+            drop_mode(s, &labels, target.as_ref(), shift)
+        } else {
+            fileops::Mode::Copy
+        };
+        s.os_hover = None;
         s.drop_staged.extend(paths.iter().cloned());
-        paste_into(s, paths.clone(), fileops::Mode::Copy, tp);
+        paste_into(s, paths.clone(), mode, tp);
     });
 }
 

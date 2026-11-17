@@ -986,6 +986,10 @@ struct App {
     scan_rx: Option<std::sync::mpsc::Receiver<ScanMsg>>,
     scan_want: Option<PathBuf>,
     scan_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// The Recycle Bin listing being read off the UI thread.
+    bin_rx: Option<std::sync::mpsc::Receiver<Vec<fileops::BinItem>>>,
+    /// A recent listing, reused when the place is reopened at once.
+    bin_cache: Option<(Instant, Vec<fileops::BinItem>)>,
     /// How many entries the running scan has reached, for the status bar.
     scan_seen: usize,
     /// The open modal dialog (delete confirm, paste conflict, rename, new folder).
@@ -2165,6 +2169,21 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
         tx.wake_after(std::time::Duration::from_millis(60));
     }
     changed |= drain_scan(s);
+    let mut bin_answer = None;
+    if let Some(rx) = &s.bin_rx {
+        while let Ok(items) = rx.try_recv() {
+            bin_answer = Some(items);
+        }
+        if let Some(items) = bin_answer.take() {
+            s.bin_cache = Some((Instant::now(), items.clone()));
+            apply_bin_items(s, items);
+            s.bin_rx = None;
+            s.notice = "Recycle Bin".into();
+            changed = true;
+        } else {
+            tx.wake_after(std::time::Duration::from_millis(30));
+        }
+    }
     if s.scan_rx.is_some() {
         // Keep frames coming so the count climbing is visible and the answer is
         // picked up promptly.
@@ -2506,19 +2525,45 @@ fn open_recycle_bin(s: &mut App) {
     s.search_hits.clear();
     clear_search(s);
     clear_selection(s);
-    refresh_bin(s);
+    spawn_bin_scan(s);
 }
 
-/// Rebuild the bin listing from the platform's records.
-fn refresh_bin(s: &mut App) {
-    let items = fileops::bin_list();
+/// Read the bin's records off the UI thread. A full bin holds thousands of
+/// items; doing this on the window thread froze it for seconds.
+fn spawn_bin_scan(s: &mut App) {
+    s.bin_rx = None;
+    if let Some((at, items)) = &s.bin_cache
+        && at.elapsed() < std::time::Duration::from_secs(15)
+    {
+        apply_bin_items(s, items.clone());
+        return;
+    }
+    s.entries.clear();
+    s.bin_items.clear();
+    s.visible.clear();
+    s.count = 0;
+    s.notice = "Reading the Recycle Bin…".into();
+    let (tx, rx) = std::sync::mpsc::channel();
+    s.bin_rx = Some(rx);
+    let waker = s.waker.clone();
+    std::thread::spawn(move || {
+        let items = fileops::bin_list();
+        let _ = tx.send(items);
+        if let Some(wake) = waker {
+            wake();
+        }
+    });
+}
+
+/// Rebuild the bin listing from a scan answered on the worker thread.
+fn apply_bin_items(s: &mut App, items: Vec<fileops::BinItem>) {
     let mut entries = Vec::with_capacity(items.len());
     for item in &items {
         let name = Path::new(&item.original)
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| item.original.to_string_lossy().into_owned());
-        let is_dir = fs::metadata(&item.content).map(|m| m.is_dir()).unwrap_or(false);
+        let is_dir = item.is_dir;
         let kind = classify(&name, is_dir);
         let modified_at = Some(item.when);
         let modified = modified_at
@@ -3000,6 +3045,8 @@ fn init() -> App {
         scan_rx: None,
         scan_want: None,
         scan_cancel: None,
+        bin_rx: None,
+        bin_cache: None,
         scan_seen: 0,
         dialog: None,
         dialog_focus: 0,
@@ -5364,7 +5411,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                                             Ok(()) => s.notice = "Restored from the Recycle Bin".into(),
                                             Err(e) => s.notice = e,
                                         }
-                                        refresh_bin(s);
+                                        spawn_bin_scan(s);
                                         s.menu = None;
                                     },
                                 ),
@@ -5378,7 +5425,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                                             Ok(()) => s.notice = "Deleted permanently".into(),
                                             Err(e) => s.notice = e,
                                         }
-                                        refresh_bin(s);
+                                        spawn_bin_scan(s);
                                         s.menu = None;
                                     }),
                             );
@@ -5533,7 +5580,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                                         Ok(()) => s.notice = "Recycle Bin emptied".into(),
                                         Err(e) => s.notice = e,
                                     }
-                                    refresh_bin(s);
+                                    spawn_bin_scan(s);
                                     s.menu = None;
                                 }),
                         );
@@ -9317,7 +9364,7 @@ fn refresh_folder(s: &mut App) {
     } else if s.view == View::ThisPc {
         refresh_volumes(s);
     } else if s.view == View::RecycleBin {
-        refresh_bin(s);
+        spawn_bin_scan(s);
     } else {
         refresh_recent(s);
     }

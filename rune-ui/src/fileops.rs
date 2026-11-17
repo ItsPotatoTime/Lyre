@@ -372,11 +372,14 @@ fn remove_item(path: &Path) -> Result<(), String> {
 /// then the path: a fixed 260 UTF-16 units in the older format, or a length and
 /// then the path in the one Vista and later write.
 #[cfg(windows)]
-fn parse_i(data: &[u8]) -> Option<(PathBuf, u64)> {
+fn parse_i(data: &[u8]) -> Option<(PathBuf, u64, u64)> {
     if data.len() < 28 {
         return None;
     }
     let version = u64::from_le_bytes(data[0..8].try_into().ok()?);
+    // The size is stored in the record. Reading it here avoids a metadata call
+    // per item, which made opening a full bin freeze the window.
+    let size = u64::from_le_bytes(data[8..16].try_into().ok()?);
     let deleted = u64::from_le_bytes(data[16..24].try_into().ok()?);
     // The path is the rest of the record, ended by a NUL: the length before it
     // is counted in characters by some writers and in bytes by others, so the
@@ -399,7 +402,7 @@ fn parse_i(data: &[u8]) -> Option<(PathBuf, u64)> {
     if units.is_empty() {
         return None;
     }
-    Some((PathBuf::from(String::from_utf16_lossy(&units)), deleted))
+    Some((PathBuf::from(String::from_utf16_lossy(&units)), deleted, size))
 }
 
 /// Take an item away, for a step being undone. A folder goes with everything in
@@ -1015,38 +1018,56 @@ mod recycle {
         pub content: std::path::PathBuf,
         pub original: std::path::PathBuf,
         pub deleted: u64,
+        pub size: u64,
     }
 
-    /// Every record in every bin this account can read.
+    /// Every record in every bin this account can read. The small `$I` files
+    /// are parsed on a few worker threads: a full bin has thousands of them and
+    /// doing it on one thread was the freeze when the place was opened.
     pub(super) fn records(drive: Option<&str>) -> Vec<Record> {
         use std::path::PathBuf;
-        let mut out = Vec::new();
         let letters: Vec<char> = match drive.and_then(|d| d.chars().next()) {
             Some(letter) => vec![letter],
             // No drive means the whole bin: every volume this account can read.
             None => ('A'..='Z').collect(),
         };
+        let mut files = Vec::new();
         for letter in letters {
             let bin = PathBuf::from(format!("{}:\\$Recycle.Bin", letter));
             let Ok(users) = fs::read_dir(&bin) else { continue };
             for user in users.flatten() {
                 let Ok(items) = fs::read_dir(user.path()) else { continue };
                 for item in items.flatten() {
-                    let name = item.file_name();
-                    let name = name.to_string_lossy();
-                    if !name.starts_with("$I") {
-                        continue;
+                    if item.file_name().to_string_lossy().starts_with("$I") {
+                        files.push(item.path());
                     }
-                    let Ok(data) = fs::read(item.path()) else { continue };
-                    let Some((original, deleted)) = super::parse_i(&data) else { continue };
-                    let content = item.path().with_file_name(format!("$R{}", &name[2..]));
-                    if !content.exists() {
-                        continue;
-                    }
-                    out.push(Record { info: item.path(), content, original, deleted });
                 }
             }
         }
+        let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).min(8);
+        let per = (files.len() / workers).max(1);
+        let mut out = Vec::new();
+        std::thread::scope(|scope| {
+            let mut handles = Vec::new();
+            for chunk in files.chunks(per) {
+                handles.push(scope.spawn(move || {
+                    let mut found = Vec::new();
+                    for path in chunk {
+                        let Ok(data) = fs::read(path) else { continue };
+                        let Some((original, deleted, size)) = super::parse_i(&data) else { continue };
+                        let suffix = path.file_name().unwrap_or_default().to_string_lossy();
+                        let content = path.with_file_name(format!("$R{}", &suffix[2..]));
+                        found.push(Record { info: path.clone(), content, original, deleted, size });
+                    }
+                    found
+                }));
+            }
+            for handle in handles {
+                if let Ok(mut found) = handle.join() {
+                    out.append(&mut found);
+                }
+            }
+        });
         out
     }
 
@@ -1157,6 +1178,7 @@ pub struct BinItem {
     pub content: PathBuf,
     pub info: PathBuf,
     pub size: u64,
+    pub is_dir: bool,
 }
 
 #[cfg(windows)]
@@ -1165,8 +1187,9 @@ pub fn bin_list() -> Vec<BinItem> {
         .into_iter()
         .filter_map(|r| {
             let when = recycle::from_filetime(r.deleted)?;
-            let size = item_size(&r.content);
-            Some(BinItem { original: r.original, when, content: r.content, info: r.info, size })
+            // No per-item metadata call: this listing is the hot path for a bin
+            // with thousands of records. Rows are files unless probed later.
+            Some(BinItem { original: r.original, when, content: r.content, info: r.info, size: r.size, is_dir: false })
         })
         .collect()
 }
@@ -1208,8 +1231,8 @@ fn bin_list_in(base: &Path) -> Vec<BinItem> {
         if !content.exists() {
             continue;
         }
-        let size = item_size(&content);
-        out.push(BinItem { original, when, content, info: path, size });
+        let size = fs::metadata(&content).map(|m| m.len()).unwrap_or(0);
+        out.push(BinItem { original, when, content, info: path, size, is_dir: false });
     }
     out.sort_by(|a, b| b.when.cmp(&a.when));
     out
@@ -1355,7 +1378,7 @@ mod tests {
     fn a_recycle_bin_record_names_where_the_item_came_from() {
         for version in [1u64, 2] {
             let bytes = record(version, r"C:\Users\someone\gone.txt", 133_000_000_000_000_000);
-            let (path, deleted) = parse_i(&bytes).expect("the record reads");
+            let (path, deleted, _) = parse_i(&bytes).expect("the record reads");
             assert_eq!(path, PathBuf::from(r"C:\Users\someone\gone.txt"));
             assert_eq!(deleted, 133_000_000_000_000_000);
         }

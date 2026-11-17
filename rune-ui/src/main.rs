@@ -8066,7 +8066,7 @@ fn take_back(action: &Undo) -> Stepped {
             let targets: Vec<&PathBuf> = replaced.iter().map(|r| &r.target).collect();
             let plain: Vec<(PathBuf, PathBuf)> = pairs
                 .iter()
-                .filter(|(_, to)| !targets.iter().any(|t| *t == to))
+                .filter(|(_, to)| !targets.contains(&to))
                 .cloned()
                 .collect();
             let mut step = step_moved(plain, true);
@@ -8144,7 +8144,7 @@ fn put_back(action: &Undo) -> Stepped {
             let targets: Vec<&PathBuf> = replaced.iter().map(|r| &r.target).collect();
             let plain: Vec<(PathBuf, PathBuf)> = pairs
                 .iter()
-                .filter(|(_, to)| !targets.iter().any(|t| *t == to))
+                .filter(|(_, to)| !targets.contains(&to))
                 .cloned()
                 .collect();
             let mut step = step_moved(plain, false);

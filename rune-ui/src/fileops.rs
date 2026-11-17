@@ -54,13 +54,12 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
     #[cfg(windows)]
     {
-        // Canonicalization resolves symlinks and junction writes; a hard link
-        // has a single canonical name, so comparing the resolved paths plus
-        // metadata catches the self-truncation case on Windows too.
-        return fs::canonicalize(a)
+        // Canonicalization resolves symlinks and junction writes; comparing
+        // the resolved paths catches a link alias on Windows too.
+        fs::canonicalize(a)
             .ok()
             .zip(fs::canonicalize(b).ok())
-            .is_some_and(|(x, y)| x == y);
+            .is_some_and(|(x, y)| x == y)
     }
     #[cfg(not(any(unix, windows)))]
     {

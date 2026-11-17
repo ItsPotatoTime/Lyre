@@ -41,6 +41,34 @@ pub struct Progress {
     pub total_bytes: u64,
 }
 
+/// Whether two paths name the same underlying file (hard link or resolved
+/// symlink), so a copy onto one of them cannot truncate the other.
+fn same_file(a: &Path, b: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        return fs::metadata(a)
+            .ok()
+            .zip(fs::metadata(b).ok())
+            .is_some_and(|(x, y)| x.dev() == y.dev() && x.ino() == y.ino());
+    }
+    #[cfg(windows)]
+    {
+        // Canonicalization resolves symlinks and junction writes; a hard link
+        // has a single canonical name, so comparing the resolved paths plus
+        // metadata catches the self-truncation case on Windows too.
+        return fs::canonicalize(a)
+            .ok()
+            .zip(fs::canonicalize(b).ok())
+            .is_some_and(|(x, y)| x == y);
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (a, b);
+        false
+    }
+}
+
 fn name_of(path: &Path) -> String {
     path.file_name()
         .map(|n| n.to_string_lossy().into_owned())
@@ -537,8 +565,10 @@ fn paste_one(
         }
     }
     // Settled after the conflict: a copy read from the file it is writing leaves
-    // it empty, so an item is never written over itself.
-    if dst == src {
+    // it empty. Compare identities, not just path text: a hard link (or a link
+    // resolving to the same file) is the same item under a different name and
+    // would be truncated by fs::copy.
+    if dst == src || same_file(src, &dst) {
         return Err("That item is already here.".into());
     }
     match mode {
@@ -667,14 +697,25 @@ pub fn paste<F: FnMut(Progress) -> bool>(
                     .collect();
                 for k in failing {
                     let r = replaced.remove(k);
-                    let _ = remove_item(&r.target);
-                    // Put the earlier contents back where they were, then
-                    // drop the now-redundant backup.
-                    let restore = copy_item(&r.old, &r.target, &AtomicBool::new(false), &mut |_| {});
-                    let _ = remove_item(&r.old);
-                    if let Err(back) = restore {
-                        error = Some(format!("{e}; the replaced item could not be restored: {back}"));
-                        break;
+                    // Put the earlier contents back where they were. Only drop
+                    // the backup once that worked — a locked child in the
+                    // destination must leave the sole good copy in place.
+                    let restore = (|| -> Result<(), String> {
+                        if r.target.exists() || fs::symlink_metadata(&r.target).is_ok() {
+                            remove_item(&r.target)?;
+                        }
+                        copy_item(&r.old, &r.target, &AtomicBool::new(false), &mut |_| {})
+                    })();
+                    match restore {
+                        Ok(()) => {
+                            let _ = remove_item(&r.old);
+                        }
+                        Err(back) => {
+                            // Keep the backup referenced for a later retry.
+                            replaced.push(r);
+                            error = Some(format!("{e}; the replaced item could not be restored: {back}"));
+                            break;
+                        }
                     }
                 }
                 if error.is_none() {

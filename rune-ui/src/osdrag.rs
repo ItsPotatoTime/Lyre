@@ -140,7 +140,12 @@ fn is_virtual_root(path: &Path) -> bool {
     let Some(rest) = name.strip_prefix("lyre-virtual-") else {
         return false;
     };
-    !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+    // Roots are named lyre-virtual-<pid>-<counter>.
+    let mut parts = rest.split('-');
+    let digits = |part: Option<&str>| {
+        part.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))
+    };
+    digits(parts.next()) && digits(parts.next()) && parts.next().is_none()
 }
 
 fn snapshot(src: &Path, dst: &Path, budget: &mut usize, depth: usize) -> bool {
@@ -231,11 +236,21 @@ pub fn release(paths: &[PathBuf]) {
     }
 }
 
-/// Sweep staging folders a crashed run left behind.
+fn staging_pid(path: &Path) -> Option<u64> {
+    let name = path.file_name()?.to_str()?;
+    let rest = name.strip_prefix(PREFIX)?;
+    rest.split('-').next()?.parse().ok()
+}
+
+/// Sweep staging folders a crashed run left behind. Only roots belonging to
+/// this process are touched: another running instance's staged files may
+/// still be in use, and must not be removed.
 pub fn sweep_stale() {
     let Ok(reader) = std::fs::read_dir(std::env::temp_dir()) else { return };
     for item in reader.flatten() {
-        if !is_staging_root(&item.path()) {
+        if !is_staging_root(&item.path())
+            || staging_pid(&item.path()) != Some(std::process::id() as u64)
+        {
             continue;
         }
         let old = item
@@ -668,7 +683,18 @@ pub mod win {
             for (i, name) in names.iter().enumerate() {
                 let Some(dst) = staged_member_path(&root, name) else { continue };
                 let Some(stream_medium) = get_medium(data, contents, i as i32, TYMED_ISTREAM) else { continue };
+                // A hostile or broken source can report S_OK with a null or
+                // wrong-typed pointer. Never dereference it blind — that
+                // crashed the app inside the OLE Drop callback.
+                if stream_medium.data.is_null() {
+                    ReleaseStgMedium(&mut { stream_medium });
+                    continue;
+                }
                 let stream = stream_medium.data as *mut *const StreamVtable;
+                if (*stream).is_null() {
+                    ReleaseStgMedium(&mut { stream_medium });
+                    continue;
+                }
                 if let Some(parent) = dst.parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }

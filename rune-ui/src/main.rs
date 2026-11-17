@@ -7957,23 +7957,33 @@ fn take_back(action: &Undo) -> Stepped {
             }
         },
         Undo::Copied { pairs, replaced } => {
+            // Pairs whose target was replaced are handled by the backup swap
+            // below; removing them here would discard the earlier bytes.
+            let targets: Vec<&PathBuf> = replaced.iter().map(|r| &r.target).collect();
+            let plain: Vec<(PathBuf, PathBuf)> = pairs
+                .iter()
+                .filter(|(_, to)| !targets.contains(&to))
+                .cloned()
+                .collect();
             let mut step = Stepped::each(
-                pairs.clone(),
+                plain,
                 |(_, copy)| {
                     fileops::remove(copy).map_err(|e| format!("Could not remove the copy: {e}"))
                 },
                 |pairs| Undo::Copied { pairs, replaced: Vec::new() },
             );
-            // Restore what Replace had set aside only once the new copies are
-            // out of the way, so the earlier bytes land where they used to be.
+            // Restore what Replace had set aside, newest first.
             for r in replaced.iter().rev() {
                 if let Err(e) = fileops::swap_back(r) {
                     step.error = Some(format!("Could not restore what was replaced: {e}"));
                     return step;
                 }
             }
-            if !replaced.is_empty() {
-                step.went = Some(Undo::Replaced { items: replaced.clone() });
+            if step.error.is_none() {
+                // Keep the whole action for redo, including copies that were
+                // not replacements. Replacing it with only the backup step
+                // lost those copies from the redo stack.
+                step.went = Some(Undo::Copied { pairs: pairs.clone(), replaced: replaced.clone() });
             }
             step
         },
@@ -8004,21 +8014,43 @@ fn put_back(action: &Undo) -> Stepped {
             Ok(()) => Stepped::whole(action),
             Err(e) => Stepped::stopped(action, format!("Could not make the folder again: {e}")),
         },
-        Undo::Copied { pairs, replaced } => match fileops::copy_again_each(pairs) {
-            Ok(_) => Stepped::whole(action),
-            Err((left, e)) => Stepped {
-                went: if left.len() == pairs.len() {
-                    None
-                } else {
-                    Some(Undo::Copied { pairs: pairs.clone(), replaced: replaced.clone() })
+        Undo::Copied { pairs, replaced } => {
+            // Recreate the plain copies first, then apply the replacements in
+            // their original order: the last replacement of a target is the
+            // state the person saw before undo.
+            let targets: Vec<&PathBuf> = replaced.iter().map(|r| &r.target).collect();
+            let plain: Vec<(PathBuf, PathBuf)> = pairs
+                .iter()
+                .filter(|(_, to)| !targets.contains(&to))
+                .cloned()
+                .collect();
+            let mut step = match fileops::copy_again_each(&plain) {
+                Ok(_) => Stepped::whole(action),
+                Err((left, e)) => Stepped {
+                    went: if left.len() == plain.len() {
+                        None
+                    } else {
+                        Some(Undo::Copied { pairs: plain.clone(), replaced: Vec::new() })
+                    },
+                    left: (!left.is_empty()).then(|| Undo::Copied { pairs: left, replaced: Vec::new() }),
+                    error: Some(format!("Could not copy it again: {e}")),
                 },
-                left: (!left.is_empty()).then(|| Undo::Copied { pairs: left, replaced: Vec::new() }),
-                error: Some(format!("Could not copy it again: {e}")),
-            },
+            };
+            if step.error.is_none() {
+                for r in replaced.iter() {
+                    if let Err(e) = fileops::swap_forward(r) {
+                        step.error = Some(format!("Could not replace it again: {e}"));
+                        break;
+                    }
+                }
+            }
+            step
         },
+        // Older stacks may still hold a bare backup step; applying it in the
+        // original order recreates the replaced bytes.
         Undo::Replaced { items } => {
             let mut failed = None;
-            for r in items.iter().rev() {
+            for r in items.iter() {
                 if let Err(e) = fileops::swap_forward(r) {
                     failed = Some(format!("Could not replace it again: {e}"));
                     break;
@@ -11907,6 +11939,72 @@ mod click_tests {
 #[cfg(test)]
 mod undo_tests {
     use super::*;
+
+    fn drain_all(s: &mut App) {
+        for _ in 0..250 {
+            drain_op(s);
+            if s.transfer.is_none() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    /// Redo of two replacements of the same target must restore the LAST
+    /// replacement, not an earlier one.
+    #[test]
+    fn redo_of_two_replacements_restores_the_last_one() {
+        let dir = scratch("two-replacements");
+        let target = dir.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("x.txt"), b"original").unwrap();
+        let a = dir.join("a").join("x.txt");
+        let b = dir.join("b").join("x.txt");
+        std::fs::create_dir_all(a.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(b.parent().unwrap()).unwrap();
+        std::fs::write(&a, b"from-a").unwrap();
+        std::fs::write(&b, b"from-b").unwrap();
+
+        let mut s = open(&dir);
+        start_paste(&mut s, fileops::Mode::Copy, fileops::Conflict::Overwrite, vec![a, b], target.clone());
+        drain_all(&mut s);
+        assert_eq!(std::fs::read_to_string(target.join("x.txt")).unwrap(), "from-b");
+
+        undo_last(&mut s);
+        assert_eq!(std::fs::read_to_string(target.join("x.txt")).unwrap(), "original");
+        redo_last(&mut s);
+        assert_eq!(std::fs::read_to_string(target.join("x.txt")).unwrap(), "from-b", "the last replacement wins after redo");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Undo then redo of a paste that both overwrote an item and added a new
+    /// one must bring back both, not just the overwritten one.
+    #[test]
+    fn a_mixed_replace_survives_undo_and_redo() {
+        let dir = scratch("mixed-redo");
+        let target = dir.join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("a.txt"), b"old").unwrap();
+        let src_a = dir.join("in").join("a.txt");
+        let src_b = dir.join("in").join("b.txt");
+        std::fs::create_dir_all(src_a.parent().unwrap()).unwrap();
+        std::fs::write(&src_a, b"new").unwrap();
+        std::fs::write(&src_b, b"extra").unwrap();
+
+        let mut s = open(&dir);
+        start_paste(&mut s, fileops::Mode::Copy, fileops::Conflict::Overwrite, vec![src_a, src_b], target.clone());
+        drain_all(&mut s);
+        assert_eq!(std::fs::read_to_string(target.join("a.txt")).unwrap(), "new");
+        assert_eq!(std::fs::read_to_string(target.join("b.txt")).unwrap(), "extra");
+
+        undo_last(&mut s);
+        assert_eq!(std::fs::read_to_string(target.join("a.txt")).unwrap(), "old", "undo restores what was replaced");
+        assert!(!target.join("b.txt").exists(), "undo removes the fresh copy");
+        redo_last(&mut s);
+        assert_eq!(std::fs::read_to_string(target.join("a.txt")).unwrap(), "new", "redo restores the replaced item");
+        assert_eq!(std::fs::read_to_string(target.join("b.txt")).unwrap(), "extra", "and the new one too");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("lyre-undo-{tag}-{}", std::process::id()));

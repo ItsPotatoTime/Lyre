@@ -476,17 +476,14 @@ pub fn swap_forward(item: &Replaced) -> Result<(), String> {
     copy_item(&item.new, &item.target, &AtomicBool::new(false), &mut |_| {})
 }
 
-/// Sweep backups left behind by an earlier run; their undo entries died with
-/// the process, so nothing can refer to them any more.
+/// Sweep backups left behind by an earlier run. Only the current process's
+/// own directory is ever touched: a second instance starting up must not wipe
+/// live undo backups that the first instance still needs.
 pub fn sweep_stale_backups() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
-        let Ok(reader) = fs::read_dir(std::env::temp_dir()) else { return };
-        for item in reader.flatten() {
-            if item.file_name().to_string_lossy().starts_with("lyre-replace-") {
-                let _ = remove_item(&item.path());
-            }
-        }
+        let dir = std::env::temp_dir().join(format!("lyre-replace-{}", std::process::id()));
+        let _ = remove_item(&dir);
     });
 }
 

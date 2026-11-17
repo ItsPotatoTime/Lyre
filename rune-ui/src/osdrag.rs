@@ -1714,6 +1714,22 @@ mod tests {
         let _ = std::fs::remove_dir_all(&victim);
     }
 
+    /// A staging root belonging to another process must survive our sweep.
+    #[test]
+    fn sweep_leaves_another_processs_staging_root() {
+        let root = std::env::temp_dir().join("lyre-drop-999999-0");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let keep = root.join("keep.txt");
+        std::fs::write(&keep, b"still in use").unwrap();
+        // Make the root look old enough to be swept.
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 60 * 60);
+        let _ = std::fs::File::open(&root).and_then(|f| f.set_times(std::fs::FileTimes::new().set_modified(old)));
+        sweep_stale();
+        assert!(keep.exists(), "another instance's staged files survive");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn paths_outside_temp_pass_through_unstaged() {
         let dir = std::env::current_dir().unwrap();

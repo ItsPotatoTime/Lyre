@@ -1779,6 +1779,30 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A hard link to the source is the same file; pasting onto it must not
+    /// truncate the bytes through the alias.
+    #[cfg(unix)]
+    #[test]
+    fn a_paste_onto_a_hard_link_is_refused() {
+        let dir = scratch("hardlink");
+        let target = dir.join("target");
+        fs::create_dir_all(&target).unwrap();
+        let src = dir.join("source.txt");
+        fs::write(&src, b"precious").unwrap();
+        fs::hard_link(&src, target.join("alias.txt")).unwrap();
+        let pasted = paste(
+            Mode::Copy,
+            Conflict::Overwrite,
+            std::slice::from_ref(&src),
+            &target,
+            &AtomicBool::new(false),
+            noop,
+        );
+        assert!(pasted.error.is_some(), "the self-paste is refused");
+        assert_eq!(fs::read_to_string(&src).unwrap(), "precious", "the bytes survive");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn copying_again_refuses_a_destination_that_was_taken() {
         let dir = scratch("again");

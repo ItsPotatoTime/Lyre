@@ -78,6 +78,60 @@ pub fn toggle_maximize() -> bool {
     imp::toggle_maximize()
 }
 
+/// Apply the OS window backdrop material and dark/light frame appearance to
+/// the installed window (called after [`install`]).
+pub fn apply_backdrop(backdrop: crate::theme::BackdropStyle, dark: bool) {
+    imp::apply_backdrop(backdrop, dark);
+}
+
+/// Apply the OS window backdrop material and dark/light frame appearance to
+/// `handle` directly.
+pub fn apply_backdrop_to(
+    handle: &WindowHandle,
+    backdrop: crate::theme::BackdropStyle,
+    dark: bool,
+) {
+    imp::apply_backdrop_to(handle, backdrop, dark);
+}
+
+mod backdrop_spec {
+    use crate::theme::BackdropStyle;
+
+    pub const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+    pub const DWMWA_USE_IMMERSIVE_DARK_MODE_PRE_20H1: u32 = 19;
+    pub const DWMWA_SYSTEMBACKDROP_TYPE: u32 = 38;
+
+    pub const DWMSBT_NONE: u32 = 1;
+    pub const DWMSBT_MAINWINDOW: u32 = 2;
+    pub const DWMSBT_TRANSIENTWINDOW: u32 = 3;
+
+    pub fn dwm_dark_mode(dark: bool) -> i32 {
+        i32::from(dark)
+    }
+
+    pub fn dwm_backdrop_type(style: BackdropStyle) -> u32 {
+        match style {
+            BackdropStyle::Opaque => DWMSBT_NONE,
+            BackdropStyle::Mica => DWMSBT_MAINWINDOW,
+            BackdropStyle::Acrylic => DWMSBT_TRANSIENTWINDOW,
+        }
+    }
+
+    /// Client-area DWM margins (`[left, right, top, bottom]`): `-1` on all
+    /// edges extends DWM glass/backdrop behind the transparent client area.
+    pub fn dwm_margins(style: BackdropStyle) -> [i32; 4] {
+        if style == BackdropStyle::Opaque {
+            [0, 0, 0, 0]
+        } else {
+            [-1, -1, -1, -1]
+        }
+    }
+
+    pub fn x11_blur_behind(style: BackdropStyle) -> bool {
+        style != BackdropStyle::Opaque
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Windows
 // ---------------------------------------------------------------------------
@@ -127,6 +181,14 @@ mod imp {
     type SubclassProc =
         unsafe extern "system" fn(isize, u32, usize, isize, usize, usize) -> isize;
 
+    #[repr(C)]
+    struct Margins {
+        left_width: i32,
+        right_width: i32,
+        top_height: i32,
+        bottom_height: i32,
+    }
+
     #[link(name = "dwmapi")]
     unsafe extern "system" {
         fn DwmSetWindowAttribute(
@@ -135,6 +197,7 @@ mod imp {
             value: *const core::ffi::c_void,
             size: u32,
         ) -> i32;
+        fn DwmExtendFrameIntoClientArea(hwnd: isize, margins: *const Margins) -> i32;
     }
     #[link(name = "user32")]
     unsafe extern "system" {
@@ -422,6 +485,61 @@ mod imp {
             }
         }
     }
+
+    fn apply_backdrop_hwnd(hwnd: isize, backdrop: crate::theme::BackdropStyle, dark: bool) {
+        use super::backdrop_spec::*;
+
+        let dark_val = dwm_dark_mode(dark);
+        let backdrop_val = dwm_backdrop_type(backdrop);
+        let [left_width, right_width, top_height, bottom_height] = dwm_margins(backdrop);
+        let margins = Margins {
+            left_width,
+            right_width,
+            top_height,
+            bottom_height,
+        };
+        unsafe {
+            let hr = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE,
+                (&dark_val as *const i32).cast(),
+                core::mem::size_of::<i32>() as u32,
+            );
+            if hr < 0 {
+                let _ = DwmSetWindowAttribute(
+                    hwnd,
+                    DWMWA_USE_IMMERSIVE_DARK_MODE_PRE_20H1,
+                    (&dark_val as *const i32).cast(),
+                    core::mem::size_of::<i32>() as u32,
+                );
+            }
+            let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
+            let _ = DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_SYSTEMBACKDROP_TYPE,
+                (&backdrop_val as *const u32).cast(),
+                core::mem::size_of::<u32>() as u32,
+            );
+        }
+    }
+
+    pub fn apply_backdrop(backdrop: crate::theme::BackdropStyle, dark: bool) {
+        if let Some(&hwnd) = HWND.get() {
+            apply_backdrop_hwnd(hwnd, backdrop, dark);
+        }
+    }
+
+    pub fn apply_backdrop_to(
+        handle: &WindowHandle,
+        backdrop: crate::theme::BackdropStyle,
+        dark: bool,
+    ) {
+        let _ = handle.with_raw_handle(|raw| {
+            if let RawWindowHandle::Win32(win) = raw.as_raw() {
+                apply_backdrop_hwnd(win.hwnd.get(), backdrop, dark);
+            }
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -477,6 +595,15 @@ mod imp {
             objc_msgSend(w, sel("performZoom:"), std::ptr::null_mut::<c_void>());
             !zoomed
         }
+    }
+
+    pub fn apply_backdrop(_backdrop: crate::theme::BackdropStyle, _dark: bool) {}
+
+    pub fn apply_backdrop_to(
+        _handle: &WindowHandle,
+        _backdrop: crate::theme::BackdropStyle,
+        _dark: bool,
+    ) {
     }
 }
 
@@ -544,6 +671,27 @@ mod imp {
         false
     }
 
+    pub fn apply_backdrop(backdrop: crate::theme::BackdropStyle, _dark: bool) {
+        if let Some(&win) = XWINDOW.get() {
+            x11::set_blur_behind(win, super::backdrop_spec::x11_blur_behind(backdrop));
+        }
+    }
+
+    pub fn apply_backdrop_to(
+        handle: &WindowHandle,
+        backdrop: crate::theme::BackdropStyle,
+        _dark: bool,
+    ) {
+        let _ = handle.with_raw_handle(|raw| {
+            if let RawWindowHandle::Xlib(x) = raw.as_raw() {
+                x11::set_blur_behind(
+                    x.window as u64,
+                    super::backdrop_spec::x11_blur_behind(backdrop),
+                );
+            }
+        });
+    }
+
     /// X11 loaded at runtime so Wayland-only systems need no libX11 at build time.
     mod x11 {
         use std::ffi::{CString, c_void};
@@ -592,6 +740,17 @@ mod imp {
         type IconifyWindow = unsafe extern "C" fn(*mut Display, Window, c_int) -> c_int;
         type SendEvent = unsafe extern "C" fn(*mut Display, Window, c_int, c_long, *mut c_void) -> c_int;
         type Flush = unsafe extern "C" fn(*mut Display) -> c_int;
+        type ChangeProperty = unsafe extern "C" fn(
+            *mut Display,
+            Window,
+            Atom,
+            Atom,
+            c_int,
+            c_int,
+            *const u8,
+            c_int,
+        ) -> c_int;
+        type DeleteProperty = unsafe extern "C" fn(*mut Display, Window, Atom) -> c_int;
 
         #[repr(C)]
         struct ClientMessage {
@@ -664,6 +823,42 @@ mod imp {
                 flush(display);
             });
         }
+
+        pub fn set_blur_behind(window: u64, enable: bool) {
+            with_display(|display| unsafe {
+                let Some(lib) = lib() else { return };
+                let Some(intern) = sym::<InternAtom>(lib, "XInternAtom") else { return };
+                let Some(flush) = sym::<Flush>(lib, "XFlush") else { return };
+                let c = CString::new("_KDE_NET_WM_BLUR_BEHIND_REGION").unwrap();
+                let blur_atom = intern(display, c.as_ptr(), 0);
+                if blur_atom == 0 {
+                    return;
+                }
+                if enable {
+                    let Some(change) = sym::<ChangeProperty>(lib, "XChangeProperty") else {
+                        return;
+                    };
+                    const XA_CARDINAL: Atom = 6;
+                    const PROP_MODE_REPLACE: c_int = 0;
+                    change(
+                        display,
+                        window as Window,
+                        blur_atom,
+                        XA_CARDINAL,
+                        32,
+                        PROP_MODE_REPLACE,
+                        std::ptr::null(),
+                        0,
+                    );
+                } else {
+                    let Some(delete) = sym::<DeleteProperty>(lib, "XDeleteProperty") else {
+                        return;
+                    };
+                    delete(display, window as Window, blur_atom);
+                }
+                flush(display);
+            });
+        }
     }
 }
 
@@ -678,5 +873,48 @@ mod imp {
     pub fn minimize() {}
     pub fn toggle_maximize() -> bool {
         false
+    }
+    pub fn apply_backdrop(_backdrop: crate::theme::BackdropStyle, _dark: bool) {}
+    pub fn apply_backdrop_to(
+        _handle: &WindowHandle,
+        _backdrop: crate::theme::BackdropStyle,
+        _dark: bool,
+    ) {
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::backdrop_spec::*;
+    use crate::theme::BackdropStyle;
+
+    #[test]
+    fn dwm_attribute_constants_match_windows_sdk() {
+        assert_eq!(DWMWA_USE_IMMERSIVE_DARK_MODE, 20);
+        assert_eq!(DWMWA_SYSTEMBACKDROP_TYPE, 38);
+        assert_eq!(DWMSBT_NONE, 1);
+        assert_eq!(DWMSBT_MAINWINDOW, 2);
+        assert_eq!(DWMSBT_TRANSIENTWINDOW, 3);
+    }
+
+    #[test]
+    fn backdrop_maps_to_dwm_types_margins_and_x11_blur() {
+        assert_eq!(dwm_backdrop_type(BackdropStyle::Opaque), DWMSBT_NONE);
+        assert_eq!(dwm_backdrop_type(BackdropStyle::Mica), DWMSBT_MAINWINDOW);
+        assert_eq!(
+            dwm_backdrop_type(BackdropStyle::Acrylic),
+            DWMSBT_TRANSIENTWINDOW
+        );
+
+        assert_eq!(dwm_margins(BackdropStyle::Opaque), [0, 0, 0, 0]);
+        assert_eq!(dwm_margins(BackdropStyle::Mica), [-1, -1, -1, -1]);
+        assert_eq!(dwm_margins(BackdropStyle::Acrylic), [-1, -1, -1, -1]);
+
+        assert!(!x11_blur_behind(BackdropStyle::Opaque));
+        assert!(x11_blur_behind(BackdropStyle::Mica));
+        assert!(x11_blur_behind(BackdropStyle::Acrylic));
+
+        assert_eq!(dwm_dark_mode(false), 0);
+        assert_eq!(dwm_dark_mode(true), 1);
     }
 }

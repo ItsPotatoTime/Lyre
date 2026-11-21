@@ -145,10 +145,12 @@ struct Paint {
     menu: Color,
     menu_line: Color,
     hair: f32,
+    radius: f32,
 }
 
 fn paint_base(dark: bool, scale: f32) -> Paint {
     let hair = 1.0 / scale;
+    let radius = 8.0;
     if dark {
         Paint {
             title: c("#000d17"),
@@ -181,6 +183,7 @@ fn paint_base(dark: bool, scale: f32) -> Paint {
             menu: c("#2b2b2b"),
             menu_line: c("#454545"),
             hair,
+            radius,
         }
     } else {
         Paint {
@@ -214,28 +217,29 @@ fn paint_base(dark: bool, scale: f32) -> Paint {
             menu: c("#ffffff"),
             menu_line: c("#e5e5e5"),
             hair,
+            radius,
         }
     }
 }
 
-/// The palette for this frame. Built-ins are unchanged; Custom keeps the
-/// chosen base palette and overrides the accent-derived colors with the
-/// person's accent. A malformed stored hex falls back to the base accent.
+/// The palette for this frame. Built-ins are unchanged; Custom applies
+/// contrast-safe derived accent colors, tinted surfaces, and corner profile.
 fn paint(s: &App, scale: f32) -> Paint {
     let mut p = paint_base(s.dark, scale);
     if s.theme == theme::Theme::Custom {
-        let accent = rune::color::hex(&s.custom_accent).unwrap_or(p.accent);
-        let ink_base = if s.dark { Color::BLACK } else { Color::WHITE };
-        p.accent = accent;
-        p.accent_fill = accent.mix(ink_base, if s.dark { 0.28 } else { 0.08 });
-        p.accent_ink = if s.dark {
-            accent.mix(Color::BLACK, 0.72)
-        } else {
-            Color::WHITE
-        };
-        p.row_sel = accent.mix(p.content, if s.dark { 0.86 } else { 0.90 });
-        p.sel_line = accent.mix(p.content, if s.dark { 0.62 } else { 0.68 });
-        p.rail_sel = accent.mix(p.content, if s.dark { 0.88 } else { 0.92 });
+        let pal = theme::derive_custom_colors(s.dark, &s.custom);
+        p.accent = pal.accent;
+        p.accent_fill = pal.accent_fill;
+        p.accent_ink = pal.accent_ink;
+        p.title = pal.title;
+        p.toolbar = pal.toolbar;
+        p.tab = pal.tab_active;
+        p.menu = pal.menu;
+        p.content = pal.content;
+        p.rail_sel = pal.rail_sel;
+        p.row_sel = pal.row_sel;
+        p.sel_line = pal.sel_line;
+        p.radius = s.custom.corners.radius();
     }
     p
 }
@@ -835,17 +839,15 @@ struct App {
     theme: theme::Theme,
     /// When the desktop was last asked, for following it while running.
     theme_at: Instant,
-    /// Custom appearance: an accent hex string and the light/dark base it sits
-    /// on. Hex is stored, not `Color`, because `Color` has no serde derives.
-    custom_accent: String,
-    custom_dark: bool,
+    /// Custom appearance configuration and visual effects.
+    custom: theme::CustomTheme,
     custom_open: bool,
     custom_hex: TextEdit,
-    /// Cross-platform visual effects, enabled only in Custom mode.
-    fx_enabled: bool,
-    fx_frosted: bool,
-    fx_translucent: bool,
-    fx_shadows: bool,
+    custom_hex_invalid: bool,
+    /// Whether the window was created with a transparent swapchain at launch.
+    startup_transparent: bool,
+    /// Last OS backdrop/appearance applied to the window handle.
+    applied_backdrop: Option<(theme::BackdropStyle, bool)>,
     view: View,
     mode: Mode,
     preview: bool,
@@ -1666,31 +1668,52 @@ fn load_prefs_from(s: &mut App, id: &str) {
     }
     // The custom appearance, loaded before the theme so a Custom choice can
     // resolve its base instead of asking the desktop.
-    if let Some(v) = prefs.get::<String>("custom_accent") {
-        s.custom_accent = v;
+    if let Some(v) = prefs.get::<String>("custom_accent")
+        && let Some(color) = rune::color::hex(&v)
+    {
+        s.custom.accent = color.alpha(1.0);
     }
     if let Some(v) = prefs.get::<bool>("custom_dark") {
-        s.custom_dark = v;
+        s.custom.dark = v;
+    }
+    if let Some(v) = prefs.get::<f32>("surface_tint") {
+        s.custom.surface_tint = v;
+    }
+    if let Some(v) = prefs.get::<f32>("panel_opacity") {
+        s.custom.panel_opacity = v;
+    } else if prefs.get::<bool>("fx_translucent") == Some(false) {
+        // Backwards compatibility for pre-slider boolean toggle.
+        s.custom.panel_opacity = 1.0;
+    }
+    if let Some(v) = prefs.get::<f32>("blur_radius") {
+        s.custom.blur_radius = v;
+    }
+    if let Some(v) = prefs.get::<String>("backdrop") {
+        s.custom.backdrop = theme::BackdropStyle::from_str(&v);
+    }
+    if let Some(v) = prefs.get::<String>("corners") {
+        s.custom.corners = theme::CornerStyle::from_str(&v);
     }
     if let Some(v) = prefs.get::<bool>("fx_enabled") {
-        s.fx_enabled = v;
+        s.custom.fx_enabled = v;
     }
     if let Some(v) = prefs.get::<bool>("fx_frosted") {
-        s.fx_frosted = v;
-    }
-    if let Some(v) = prefs.get::<bool>("fx_translucent") {
-        s.fx_translucent = v;
+        s.custom.fx_frosted = v;
     }
     if let Some(v) = prefs.get::<bool>("fx_shadows") {
-        s.fx_shadows = v;
+        s.custom.fx_shadows = v;
     }
+    if let Some(v) = prefs.get::<bool>("fx_borders") {
+        s.custom.fx_borders = v;
+    }
+    s.custom = s.custom.clamped();
     // The appearance preference. A save from before it existed carries only the
     // old boolean, which is taken as the choice it was.
     match prefs.get::<u8>("theme") {
         Some(stored) => {
             s.theme = theme::Theme::from_u8(stored);
             s.dark = if s.theme == theme::Theme::Custom {
-                s.custom_dark
+                s.custom.dark
             } else {
                 s.theme.is_dark()
             };
@@ -1774,12 +1797,18 @@ fn persist_to(s: &App, id: &str) {
     );
     let _ = prefs.set("settings", &settings);
     let _ = prefs.set("theme", &s.theme.to_u8());
-    let _ = prefs.set("custom_accent", &s.custom_accent);
-    let _ = prefs.set("custom_dark", &s.custom_dark);
-    let _ = prefs.set("fx_enabled", &s.fx_enabled);
-    let _ = prefs.set("fx_frosted", &s.fx_frosted);
-    let _ = prefs.set("fx_translucent", &s.fx_translucent);
-    let _ = prefs.set("fx_shadows", &s.fx_shadows);
+    let custom = s.custom.clamped();
+    let _ = prefs.set("custom_accent", &custom.accent_hex());
+    let _ = prefs.set("custom_dark", &custom.dark);
+    let _ = prefs.set("surface_tint", &custom.surface_tint);
+    let _ = prefs.set("panel_opacity", &custom.panel_opacity);
+    let _ = prefs.set("blur_radius", &custom.blur_radius);
+    let _ = prefs.set("backdrop", &custom.backdrop.as_str());
+    let _ = prefs.set("corners", &custom.corners.as_str());
+    let _ = prefs.set("fx_enabled", &custom.fx_enabled);
+    let _ = prefs.set("fx_frosted", &custom.fx_frosted);
+    let _ = prefs.set("fx_shadows", &custom.fx_shadows);
+    let _ = prefs.set("fx_borders", &custom.fx_borders);
     let _ = prefs.set("window_size", &s.window_settled);
     let _ = prefs.set("favorites", &s.favorites);
     let _ = prefs.set("recent", &s.recent);
@@ -1798,8 +1827,9 @@ fn persist_to(s: &App, id: &str) {
 
 /// A cheap fingerprint of everything persisted, so poll saves only on change.
 fn prefs_signature(s: &App) -> String {
+    let custom = s.custom.clamped();
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{:?}|{}|{}|{:?}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{:?}|{}|{}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
         s.sort,
         s.sort_desc,
         s.preview,
@@ -1825,12 +1855,17 @@ fn prefs_signature(s: &App) -> String {
         s.rail_w,
         s.theme.to_u8(),
         s.window_settled,
-        s.custom_accent,
-        s.custom_dark,
-        s.fx_enabled,
-        s.fx_frosted,
-        s.fx_translucent,
-        s.fx_shadows
+        custom.accent_hex(),
+        custom.dark,
+        custom.surface_tint.to_bits(),
+        custom.panel_opacity.to_bits(),
+        custom.blur_radius.to_bits(),
+        custom.backdrop.as_str(),
+        custom.corners.as_str(),
+        custom.fx_enabled,
+        custom.fx_frosted,
+        custom.fx_shadows,
+        custom.fx_borders,
     )
 }
 
@@ -1940,16 +1975,76 @@ fn unique_paths(paths: Vec<String>) -> Vec<String> {
 /// Whether a context-menu item survives the person's customize choices. Lyre's
 /// own items start on; another program's verbs start off and are turned on one
 /// at a time, so installing software never silently changes a right-click.
+/// The OS backdrop material active for the current theme and effects flags.
+fn active_backdrop(s: &App) -> theme::BackdropStyle {
+    if s.theme == theme::Theme::Custom && s.custom.fx_enabled {
+        s.custom.backdrop
+    } else {
+        theme::BackdropStyle::Opaque
+    }
+}
+
+/// Apply the OS window backdrop whenever theme, dark base, or backdrop style changes.
+fn sync_backdrop(s: &mut App) {
+    let next = (active_backdrop(s), s.dark);
+    if s.applied_backdrop != Some(next) {
+        s.applied_backdrop = Some(next);
+        frame::apply_backdrop(next.0, next.1);
+    }
+}
+
+/// Read startup theme/backdrop preferences before `WindowOptions` is constructed.
+fn startup_backdrop_prefs() -> (bool, theme::BackdropStyle, bool) {
+    let prefs = rune::prefs::Prefs::open(PREFS_ID);
+    let stored_dark = prefs
+        .get::<(u8, bool, bool, u8, bool, u8, bool, bool, bool, bool)>("settings")
+        .map(|s| s.9);
+    let theme = match prefs.get::<u8>("theme") {
+        Some(v) => theme::Theme::from_u8(v),
+        None => match stored_dark {
+            Some(true) => theme::Theme::Dark,
+            Some(false) => theme::Theme::Light,
+            None => theme::Theme::System,
+        },
+    };
+    let custom_dark = prefs.get::<bool>("custom_dark").unwrap_or(true);
+    let dark = if theme == theme::Theme::Custom {
+        custom_dark
+    } else {
+        theme.is_dark()
+    };
+    let fx_enabled = prefs.get::<bool>("fx_enabled").unwrap_or(true);
+    let backdrop = prefs
+        .get::<String>("backdrop")
+        .map(|s| theme::BackdropStyle::from_str(&s))
+        .unwrap_or(theme::BackdropStyle::Opaque);
+    let active = if theme == theme::Theme::Custom && fx_enabled {
+        backdrop
+    } else {
+        theme::BackdropStyle::Opaque
+    };
+    (active != theme::BackdropStyle::Opaque, active, dark)
+}
+
+/// Open the Custom appearance panel without clobbering the saved custom dark/light base.
+fn open_custom_panel(s: &mut App) {
+    s.custom_hex.text = s.custom.accent_hex();
+    s.custom_hex_invalid = false;
+    s.custom_open = true;
+    set_theme(s, theme::Theme::Custom);
+}
+
 /// Change the appearance choice, resolving it now so the next frame draws the
 /// right one.
 fn set_theme(s: &mut App, theme: theme::Theme) {
     s.theme = theme;
     s.dark = if theme == theme::Theme::Custom {
-        s.custom_dark
+        s.custom.dark
     } else {
         theme.is_dark()
     };
     s.theme_at = Instant::now();
+    sync_backdrop(s);
 }
 
 fn item_shown(s: &App, id: &str, default_on: bool) -> bool {
@@ -2263,6 +2358,9 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
             s.dark = dark;
             changed = true;
         }
+    }
+    if !headless {
+        sync_backdrop(s);
     }
     changed |= drain_openwith(s);
     if s.openwith_rx.is_some() {
@@ -3018,14 +3116,12 @@ fn init() -> App {
         dark: true,
         theme: theme::Theme::System,
         theme_at: Instant::now(),
-        custom_accent: "#4cc2ff".into(),
-        custom_dark: true,
+        custom: theme::CustomTheme::default(),
         custom_open: false,
         custom_hex: TextEdit::default(),
-        fx_enabled: true,
-        fx_frosted: true,
-        fx_translucent: true,
-        fx_shadows: true,
+        custom_hex_invalid: false,
+        startup_transparent: cfg!(target_os = "macos"),
+        applied_backdrop: None,
         view: View::Files,
         mode: Mode::Details,
         preview: false,
@@ -4251,6 +4347,48 @@ fn place_glyph(index: usize, size: f32) -> El {
 
 // ----------------------------------------------------------------- view ----
 
+fn os_backdrop_active(s: &App) -> bool {
+    s.theme == theme::Theme::Custom
+        && s.custom.fx_enabled
+        && s.custom.backdrop != theme::BackdropStyle::Opaque
+}
+
+fn chrome_alpha(s: &App) -> f32 {
+    match s.custom.backdrop {
+        theme::BackdropStyle::Acrylic => 0.72,
+        theme::BackdropStyle::Mica => 0.84,
+        theme::BackdropStyle::Opaque => 1.0,
+    }
+}
+
+fn chrome_fill(s: &App, base: Color) -> Color {
+    if os_backdrop_active(s) {
+        base.alpha(chrome_alpha(s))
+    } else {
+        base
+    }
+}
+
+fn content_fill(s: &App, base: Color) -> Color {
+    if os_backdrop_active(s) {
+        base.alpha(0.92)
+    } else {
+        base
+    }
+}
+
+fn with_chrome_material(el: El, s: &App) -> El {
+    if cfg!(target_os = "macos") && os_backdrop_active(s) {
+        let mat = match s.custom.backdrop {
+            theme::BackdropStyle::Acrylic => rune::SystemMaterial::Popover,
+            _ => rune::SystemMaterial::Glass,
+        };
+        el.system_material(mat)
+    } else {
+        el
+    }
+}
+
 fn view(s: &App, cx: &mut Cx<App>) -> El {
     {
         static FIRST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
@@ -4271,7 +4409,7 @@ fn view(s: &App, cx: &mut Cx<App>) -> El {
         .key("window")
         .w_full()
         .h_full()
-        .fill(p.title)
+        .fill(if os_backdrop_active(s) { Color::TRANSPARENT } else { p.title })
         .drawn_rect_into(&s.rect_window)
         .on_press(|s: &mut App| s.menu = None)
         .on_drop_files(|s: &mut App, files, _tx: &mut Tx| {
@@ -4356,7 +4494,13 @@ fn tab_button(s: &App, p: Paint, index: usize, tab: &Tab) -> El {
         .h(TAB_ITEM_H)
         .w(180.0)
         .corners([8.0, 8.0, 0.0, 0.0])
-        .fill(if active { p.tab } else if drop_hot(s, &format!("tab-{index}")) { p.hover } else { Color::TRANSPARENT })
+        .fill(if active {
+            if os_backdrop_active(s) { p.tab.alpha(0.88) } else { p.tab }
+        } else if drop_hot(s, &format!("tab-{index}")) {
+            p.hover
+        } else {
+            Color::TRANSPARENT
+        })
         .hover(if active { Color::TRANSPARENT } else { p.hover })
         .pl(12.0)
         .pr(6.0)
@@ -4420,17 +4564,20 @@ fn close_tab_at_path(s: &mut App, path: &str) -> bool {
 }
 
 fn tab_strip(s: &App, p: Paint) -> El {
-    let mut strip = row()
-        .key("tabs")
-        .w_full()
-        .h(TAB_H)
-        .fill(p.title)
-        .items_end()
-        .pl(8.0)
-        .gap(2.0)
-        // A borderless window has no system titlebar. This band is it: drag to
-        // move, double press to zoom, and the drawn controls below to close.
-        .window_drag();
+    let mut strip = with_chrome_material(
+        row()
+            .key("tabs")
+            .w_full()
+            .h(TAB_H)
+            .fill(chrome_fill(s, p.title))
+            .items_end()
+            .pl(8.0)
+            .gap(2.0)
+            // A borderless window has no system titlebar. This band is it: drag to
+            // move, double press to zoom, and the drawn controls below to close.
+            .window_drag(),
+        s,
+    );
     for (index, tab) in s.tabs.iter().enumerate() {
         strip = strip.child(tab_button(s, p, index, tab));
     }
@@ -4751,12 +4898,15 @@ fn address_row(s: &App, p: Paint) -> El {
         // the empty field does in Explorer.
         bar.child(el().grow(1.0).h_full().on_press(|s: &mut App| begin_address_edit(s)))
     };
-    row()
-        .key("address")
-        .w_full()
-        .h(ADDRESS_H)
-        .fill(p.toolbar)
-        .px(10.0)
+    with_chrome_material(
+        row()
+            .key("address")
+            .w_full()
+            .h(ADDRESS_H)
+            .fill(chrome_fill(s, p.toolbar))
+            .px(10.0),
+        s,
+    )
         .gap(4.0)
         .items_center()
         .child(nav_button(p, Ico::Back, "back", 0, !s.history.is_empty(), "Back"))
@@ -4868,12 +5018,15 @@ fn command_bar(s: &App, p: Paint) -> El {
             text_button_bare(p, which, chevron, false).help(label)
         }
     };
-    let mut bar = row()
-        .key("command")
-        .w_full()
-        .h(COMMAND_H)
-        .fill(p.command)
-        .px(10.0)
+    let mut bar = with_chrome_material(
+        row()
+            .key("command")
+            .w_full()
+            .h(COMMAND_H)
+            .fill(chrome_fill(s, p.command))
+            .px(10.0),
+        s,
+    )
         .gap(2.0)
         .items_center()
         .child(
@@ -5506,11 +5659,10 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                             )
                             .on_press(move |s: &mut App| {
                                 if choice == theme::Theme::Custom {
-                                    s.custom_dark = s.dark;
-                                    s.custom_hex.text = s.custom_accent.clone();
-                                    s.custom_open = true;
+                                    open_custom_panel(s);
+                                } else {
+                                    set_theme(s, choice);
                                 }
-                                set_theme(s, choice);
                                 s.menu = None;
                             }),
                         );
@@ -5947,24 +6099,16 @@ fn menu_overlay(s: &App, p: Paint) -> El {
     // The panel swallows a press on its own padding so a near miss neither
     // picks an item nor dismisses. Outside it, the body scrim (see `content`)
     // closes the menu and keeps the press from the rows behind.
-    let fx = s.theme == theme::Theme::Custom && s.fx_enabled;
-    let mut panel = col()
-        .key("menu-panel")
-        .absolute(x, y)
-        .w(mw)
-        .py(4.0)
-        .px(4.0)
-        .fill(panel_fill(s, p))
-        .border(p.hair, p.menu_line)
-        .radius(8.0);
-    if fx && s.fx_frosted {
-        panel = panel.backdrop_blur(10.0);
-    }
-    if fx && s.fx_shadows {
-        panel = panel.shadow(8.0, 30.0, Color::BLACK.alpha(0.55));
-    } else {
-        panel = panel.shadow(6.0, 18.0, Color::BLACK.alpha(0.45));
-    }
+    let panel = style_panel(
+        col()
+            .key("menu-panel")
+            .absolute(x, y)
+            .w(mw)
+            .py(4.0)
+            .px(4.0),
+        s,
+        p,
+    );
     panel.on_press(|_s: &mut App| {}).children(rows)
 }
 
@@ -6125,7 +6269,7 @@ fn tri_switch(p: Paint, state: Option<bool>) -> El {
     match state {
         Some(true) => box_el
             .fill(p.accent_fill)
-            .child(ico(p, Ico::Check, 12.0, Color::WHITE)),
+            .child(ico(p, Ico::Check, 12.0, p.accent_ink)),
         None => box_el.child(el().w(8.0).h(2.0).radius(1.0).fill(p.accent_fill)),
         Some(false) => box_el,
     }
@@ -6151,7 +6295,7 @@ fn custom_line(p: Paint, line: &CustomLine) -> El {
     let default_on = line.default_on;
     let load = line.load.clone();
     let check = if line.shown {
-        ico(p, Ico::Check, 12.0, Color::WHITE)
+        ico(p, Ico::Check, 12.0, p.accent_ink)
     } else {
         el().size(12.0, 12.0)
     };
@@ -6282,172 +6426,592 @@ fn customize_group(s: &App, p: Paint, group: &CustomGroup) -> El {
 /// Floating panels need a translucent fill for `backdrop_blur` to show: the
 /// blur is drawn first and the fill laid over it, so an opaque fill hides it.
 fn panel_fill(s: &App, p: Paint) -> Color {
-    // Frosting needs a translucent fill too, or the blur is hidden by paint.
-    if s.theme == theme::Theme::Custom && s.fx_enabled && (s.fx_frosted || s.fx_translucent) {
-        p.menu.alpha(0.72)
+    if s.theme == theme::Theme::Custom {
+        theme::panel_fill(p.menu, &s.custom)
     } else {
         p.menu
     }
 }
 
-/// Apply a stored custom accent, if it parses. Shared by the swatch buttons,
-/// the hex field's Apply button and Done so all three behave the same.
-fn apply_custom_hex(s: &mut App) {
-    let value = s.custom_hex.text.trim().to_string();
-    if rune::color::hex(&value).is_some() {
-        s.custom_accent = value;
+fn panel_blur(s: &App) -> Option<f32> {
+    if s.theme == theme::Theme::Custom {
+        theme::panel_blur(&s.custom)
+    } else {
+        None
     }
 }
 
-/// The Custom appearance panel: a light/dark base, an accent color chosen from
-/// swatches or a hex field, and the cross-platform effects toggles.
+fn panel_border(s: &App, p: Paint) -> Color {
+    if s.theme == theme::Theme::Custom {
+        theme::panel_border(p.menu_line, s.dark, &s.custom)
+    } else {
+        p.menu_line
+    }
+}
+
+fn panel_shadows(s: &App) -> bool {
+    if s.theme == theme::Theme::Custom {
+        s.custom.fx_enabled && s.custom.fx_shadows
+    } else {
+        true
+    }
+}
+
+fn style_panel(mut panel: El, s: &App, p: Paint) -> El {
+    panel = panel.fill(panel_fill(s, p)).radius(p.radius);
+    let border = panel_border(s, p);
+    if border.a > 0.0 {
+        panel = panel.border(p.hair, border);
+    }
+    if let Some(sigma) = panel_blur(s) {
+        panel = panel.backdrop_blur(sigma);
+    }
+    if panel_shadows(s) {
+        let shadow_alpha = if s.dark { 0.50 } else { 0.22 };
+        panel = panel.shadow(8.0, 28.0, Color::BLACK.alpha(shadow_alpha));
+    }
+    panel
+}
+
+/// Apply a stored custom accent, if it parses. Shared by the hex field's
+/// Enter submit, Apply button, and Done.
+fn apply_custom_hex(s: &mut App) {
+    let raw = s.custom_hex.text.trim();
+    let normalized = if raw.starts_with('#') {
+        raw.to_string()
+    } else {
+        format!("#{raw}")
+    };
+    if let Some(color) = rune::color::hex(&normalized) {
+        s.custom.accent = color.alpha(1.0);
+        s.custom_hex.text = s.custom.accent_hex();
+        s.custom_hex_invalid = false;
+        if s.theme != theme::Theme::Custom {
+            set_theme(s, theme::Theme::Custom);
+        }
+    } else {
+        s.custom_hex_invalid = true;
+    }
+}
+
+fn reset_custom_theme(s: &mut App) {
+    s.custom.reset();
+    s.custom_hex.text = s.custom.accent_hex();
+    s.custom_hex_invalid = false;
+    set_theme(s, theme::Theme::Custom);
+}
+
+fn custom_slider(
+    p: Paint,
+    key: &'static str,
+    label: &'static str,
+    value_text: String,
+    frac: f32,
+    on_change: fn(&mut App, f32),
+) -> El {
+    let frac = frac.clamp(0.0, 1.0);
+    let mut thumb_row = row().w_full().h(12.0).items_center();
+    if frac > 0.001 {
+        thumb_row = thumb_row.child(el().grow(frac).h(1.0));
+    }
+    thumb_row = thumb_row.child(
+        el().size(12.0, 12.0)
+            .radius(6.0)
+            .fill(p.accent_fill)
+            .border(1.5, p.menu),
+    );
+    if frac < 0.999 {
+        thumb_row = thumb_row.child(el().grow((1.0 - frac).max(0.001)).h(1.0));
+    }
+
+    let track = el()
+        .key(key)
+        .w_full()
+        .h(20.0)
+        .cursor(rune::Cursor::Pointer)
+        .child(
+            el().pin(Some(6.0), Some(8.0), Some(6.0), None)
+                .h(4.0)
+                .radius(2.0)
+                .fill(p.field_line)
+                .child(el().w_frac(frac).h_full().radius(2.0).fill(p.accent_fill)),
+        )
+        .child(el().pin(Some(0.0), Some(4.0), Some(0.0), None).h(12.0).child(thumb_row))
+        .on_drag(move |s: &mut App, d: &mut rune::Drag, tx: &mut Tx| {
+            tx.instant();
+            if matches!(d.phase, Phase::Down | Phase::Move) && !d.cancelled() {
+                let next = ((d.x - 6.0) / (d.w - 12.0).max(1.0)).clamp(0.0, 1.0);
+                on_change(s, next);
+            }
+        });
+
+    col()
+        .grow(1.0)
+        .min_w(0.0)
+        .gap(2.0)
+        .child(
+            row()
+                .w_full()
+                .items_center()
+                .child(text(label).font(CAPTION).color(p.secondary))
+                .child(el().grow(1.0))
+                .child(text(value_text).font(CAPTION).color(p.tertiary)),
+        )
+        .child(track)
+}
+
+/// The Custom appearance panel: presets, accent color, light/dark base, surface
+/// tint, panel opacity, blur strength, window backdrop, corners, and effects.
 fn custom_colors_overlay(s: &App, p: Paint) -> El {
     if !s.custom_open {
         return el().key("custom-none");
     }
-    let presets = [
-        "#4cc2ff", "#0078d4", "#7b68ee", "#e81123", "#ff8c00", "#107c10", "#c239b3", "#000000",
-    ];
-    let mut swatches = row().w_full().gap(8.0);
-    for hex in presets {
-        let chosen = s.custom_accent.eq_ignore_ascii_case(hex);
-        swatches = swatches.child(
-            el()
-                .key(format!("custom-swatch-{hex}"))
-                .w(28.0)
-                .h(28.0)
-                .radius(4.0)
-                .fill(c(hex))
-                .border(
-                    p.hair * if chosen { 3.0 } else { 1.0 },
-                    if chosen { p.text } else { p.field_line },
+    let current_hex = s.custom.accent_hex();
+    let pill_r = p.radius.min(6.0);
+
+    // 1. Curated presets + Reset pill
+    let mut presets_wrap = row().w_full().flex_wrap().gap(5.0);
+    for preset in theme::ThemePreset::ALL {
+        let preset_theme = preset.to_custom_theme();
+        let active = s.custom.dark == preset_theme.dark
+            && current_hex.eq_ignore_ascii_case(preset.accent_hex)
+            && (s.custom.surface_tint - preset_theme.surface_tint).abs() < 0.005
+            && (s.custom.panel_opacity - preset_theme.panel_opacity).abs() < 0.005
+            && (s.custom.blur_radius - preset_theme.blur_radius).abs() < 0.5
+            && s.custom.backdrop == preset_theme.backdrop
+            && s.custom.corners == preset_theme.corners;
+        let preset_copy = *preset;
+        presets_wrap = presets_wrap.child(
+            row()
+                .key(format!("custom-preset-{}", preset.id))
+                .h(23.0)
+                .px(8.0)
+                .radius(pill_r)
+                .fill(if active { p.accent_fill } else { p.pill_off })
+                .border(p.hair, if active { p.accent_fill } else { p.field_line })
+                .hover(p.hover)
+                .center()
+                .child(
+                    text(preset.label)
+                        .font(CAPTION)
+                        .color(if active { p.accent_ink } else { p.text }),
                 )
                 .on_press(move |s: &mut App| {
-                    s.custom_accent = hex.to_string();
-                    s.custom_hex.text = hex.to_string();
+                    s.custom = preset_copy.to_custom_theme();
+                    s.custom_hex.text = s.custom.accent_hex();
+                    s.custom_hex_invalid = false;
+                    set_theme(s, theme::Theme::Custom);
                 }),
         );
     }
 
+    // 2. Accent swatches (Slate replaces #000000) + live preview dot + hex input + Apply
+    let swatches_hex = [
+        "#4cc2ff", "#0078d4", "#7b68ee", "#e81123", "#ff8c00", "#107c10", "#c239b3", "#64748b",
+    ];
+    let mut swatches = row().w_full().gap(7.0).items_center();
+    for hex in swatches_hex {
+        let chosen = current_hex.eq_ignore_ascii_case(hex);
+        swatches = swatches.child(
+            el()
+                .key(format!("custom-swatch-{hex}"))
+                .w(24.0)
+                .h(24.0)
+                .radius(4.0)
+                .fill(c(hex))
+                .border(
+                    p.hair * if chosen { 2.5 } else { 1.0 },
+                    if chosen { p.text } else { p.field_line },
+                )
+                .on_press(move |s: &mut App| {
+                    if let Some(color) = rune::color::hex(hex) {
+                        s.custom.accent = color.alpha(1.0);
+                    }
+                    s.custom_hex.text = hex.to_string();
+                    s.custom_hex_invalid = false;
+                    if s.theme != theme::Theme::Custom {
+                        set_theme(s, theme::Theme::Custom);
+                    }
+                }),
+        );
+    }
+    swatches = swatches
+        .child(el().grow(1.0))
+        .child(
+            el().key("custom-accent-preview")
+                .w(24.0)
+                .h(24.0)
+                .radius(12.0)
+                .fill(s.custom.accent)
+                .border(p.hair, p.text),
+        )
+        .child(text(current_hex.as_str()).font(CAPTION).color(p.tertiary));
+
+    let hex_row = row()
+        .w_full()
+        .h(28.0)
+        .radius(4.0)
+        .fill(p.field)
+        .border(
+            p.hair * if s.custom_hex_invalid { 1.5 } else { 1.0 },
+            if s.custom_hex_invalid { c("#e81123") } else { p.field_line },
+        )
+        .pl(10.0)
+        .pr(3.0)
+        .gap(6.0)
+        .items_center()
+        .child(
+            text_input(&s.custom_hex, UI_TEXT)
+                .key("custom-hex")
+                .grow(1.0)
+                .min_w(0.0)
+                .single_line()
+                .color(p.text)
+                .placeholder("#4cc2ff", p.tertiary)
+                .on_edit(|s: &mut App| &mut s.custom_hex)
+                .on_submit(|s: &mut App, _tx: &mut Tx| apply_custom_hex(s)),
+        )
+        .child(if s.custom_hex_invalid {
+            text("Invalid hex").font(CAPTION).color(c("#e81123"))
+        } else {
+            el()
+        })
+        .child(
+            row()
+                .key("custom-hex-apply")
+                .h(22.0)
+                .px(10.0)
+                .radius(3.0)
+                .fill(p.pill_off)
+                .border(p.hair, p.field_line)
+                .hover(p.hover)
+                .center()
+                .child(text("Apply").font(CAPTION).color(p.text))
+                .on_press(|s: &mut App| apply_custom_hex(s)),
+        );
+
+    // 3. Base (Light / Dark) & Corners (Sharp / Standard / Rounded)
+    let radio_pill = |key: &'static str, label: &'static str, picked: bool, dark_val: bool| {
+        row()
+            .key(key)
+            .h(26.0)
+            .px(10.0)
+            .gap(6.0)
+            .radius(pill_r)
+            .fill(if picked { p.row_sel } else { p.pill_off })
+            .border(p.hair, if picked { p.sel_line } else { p.field_line })
+            .hover(p.hover)
+            .items_center()
+            .child(radio_dot(p, picked))
+            .child(text(label).font(CAPTION).color(p.text))
+            .on_press(move |s: &mut App| {
+                s.custom.dark = dark_val;
+                set_theme(s, theme::Theme::Custom);
+            })
+    };
+
+    let mut corner_pills = row().gap(4.0).items_center();
+    for style in theme::CornerStyle::ALL {
+        let active = s.custom.corners == style;
+        corner_pills = corner_pills.child(
+            row()
+                .key(format!("custom-corner-{}", style.as_str()))
+                .h(26.0)
+                .px(10.0)
+                .radius(pill_r)
+                .fill(if active { p.accent_fill } else { p.pill_off })
+                .border(p.hair, if active { p.accent_fill } else { p.field_line })
+                .hover(p.hover)
+                .center()
+                .child(
+                    text(style.label())
+                        .font(CAPTION)
+                        .color(if active { p.accent_ink } else { p.text }),
+                )
+                .on_press(move |s: &mut App| {
+                    s.custom.corners = style;
+                }),
+        );
+    }
+
+    let base_and_corners = row()
+        .w_full()
+        .gap(14.0)
+        .items_start()
+        .child(
+            col()
+                .gap(4.0)
+                .child(text("Base").font(CAPTION).color(p.secondary))
+                .child(
+                    row()
+                        .gap(6.0)
+                        .items_center()
+                        .child(radio_pill("custom-base-light", "Light", !s.custom.dark, false))
+                        .child(radio_pill("custom-base-dark", "Dark", s.custom.dark, true)),
+                ),
+        )
+        .child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .gap(4.0)
+                .child(text("Corners").font(CAPTION).color(p.secondary))
+                .child(corner_pills),
+        );
+
+    // 4. Surface tint (0%–25%) & Panel opacity (50%–100%) sliders
+    let tint_frac = (s.custom.surface_tint - theme::SURFACE_TINT_MIN)
+        / (theme::SURFACE_TINT_MAX - theme::SURFACE_TINT_MIN);
+    let opacity_frac = (s.custom.panel_opacity - theme::PANEL_OPACITY_MIN)
+        / (theme::PANEL_OPACITY_MAX - theme::PANEL_OPACITY_MIN);
+    let sliders_row = row()
+        .w_full()
+        .gap(16.0)
+        .items_center()
+        .child(custom_slider(
+            p,
+            "custom-tint-slider",
+            "Surface tint",
+            format!("{}%", (s.custom.surface_tint * 100.0).round() as u32),
+            tint_frac,
+            |s, frac| {
+                s.custom.surface_tint = (theme::SURFACE_TINT_MIN
+                    + frac * (theme::SURFACE_TINT_MAX - theme::SURFACE_TINT_MIN))
+                    .clamp(theme::SURFACE_TINT_MIN, theme::SURFACE_TINT_MAX);
+            },
+        ))
+        .child(custom_slider(
+            p,
+            "custom-opacity-slider",
+            "Panel opacity",
+            format!("{}%", (s.custom.panel_opacity * 100.0).round() as u32),
+            opacity_frac,
+            |s, frac| {
+                s.custom.panel_opacity = (theme::PANEL_OPACITY_MIN
+                    + frac * (theme::PANEL_OPACITY_MAX - theme::PANEL_OPACITY_MIN))
+                    .clamp(theme::PANEL_OPACITY_MIN, theme::PANEL_OPACITY_MAX);
+            },
+        ));
+
+    // 5. Blur strength segmented pills
+    let blur_levels = [("Off", 0.0f32), ("Subtle", 6.0), ("Medium", 12.0), ("Strong", 20.0)];
+    let active_blur = if !s.custom.fx_frosted || s.custom.blur_radius <= 0.0 {
+        0.0
+    } else if s.custom.blur_radius <= 9.0 {
+        6.0
+    } else if s.custom.blur_radius <= 16.0 {
+        12.0
+    } else {
+        20.0
+    };
+    let mut blur_pills = row().w_full().gap(6.0).items_center();
+    for (label, radius) in blur_levels {
+        let active = (active_blur - radius).abs() < 0.5;
+        blur_pills = blur_pills.child(
+            row()
+                .key(format!("custom-blur-{}", label.to_ascii_lowercase()))
+                .grow(1.0)
+                .h(24.0)
+                .radius(pill_r)
+                .fill(if active { p.accent_fill } else { p.pill_off })
+                .border(p.hair, if active { p.accent_fill } else { p.field_line })
+                .hover(p.hover)
+                .center()
+                .child(
+                    text(label)
+                        .font(CAPTION)
+                        .color(if active { p.accent_ink } else { p.text }),
+                )
+                .on_press(move |s: &mut App| {
+                    s.custom.blur_radius = radius;
+                    s.custom.fx_frosted = radius > 0.0;
+                }),
+        );
+    }
+
+    // 6. Window backdrop segmented pills + restart note if needed
+    let mut backdrop_pills = row().w_full().gap(6.0).items_center();
+    for style in theme::BackdropStyle::ALL {
+        let active = s.custom.backdrop == style;
+        backdrop_pills = backdrop_pills.child(
+            row()
+                .key(format!("custom-backdrop-{}", style.as_str()))
+                .grow(1.0)
+                .h(24.0)
+                .radius(pill_r)
+                .fill(if active { p.accent_fill } else { p.pill_off })
+                .border(p.hair, if active { p.accent_fill } else { p.field_line })
+                .hover(p.hover)
+                .center()
+                .child(
+                    text(style.label())
+                        .font(CAPTION)
+                        .color(if active { p.accent_ink } else { p.text }),
+                )
+                .on_press(move |s: &mut App| {
+                    s.custom.backdrop = style;
+                    sync_backdrop(s);
+                }),
+        );
+    }
+    let needs_restart_note = s.custom.backdrop != theme::BackdropStyle::Opaque
+        && !s.startup_transparent
+        && !cfg!(target_os = "macos");
+
+    // 7. Effects toggles (2x2 grid)
     let toggle_row = |label: &'static str, on: bool, key: &'static str, mutate: fn(&mut App)| {
         row()
             .key(key)
-            .w_full()
-            .h(30.0)
-            .gap(10.0)
+            .grow(1.0)
+            .min_w(0.0)
+            .h(24.0)
+            .px(8.0)
+            .gap(8.0)
+            .radius(4.0)
+            .hover(p.hover)
+            .press(p.press)
             .items_center()
             .child(check_box(p, on))
             .child(text(label).font(UI_TEXT).color(p.text))
             .on_press(move |s: &mut App| mutate(s))
     };
 
-    let mut panel = col()
-        .key("custom-panel")
-        .w(440.0)
-        .px(16.0)
-        .py(16.0)
-        .gap(12.0)
-        .fill(panel_fill(s, p))
-        .border(p.hair, p.menu_line)
-        .radius(8.0);
-    if s.fx_enabled && s.fx_frosted {
-        panel = panel.backdrop_blur(10.0);
-    }
-    if s.fx_enabled && s.fx_shadows {
-        panel = panel.shadow(8.0, 30.0, Color::BLACK.alpha(0.55));
-    }
-    panel = panel
-        .child(text("Custom appearance").font(TILE_TEXT).color(p.text))
+    let effects_grid = col()
+        .w_full()
+        .gap(2.0)
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .child(toggle_row("Effects on", s.custom.fx_enabled, "custom-fx-on", |s| {
+                    s.custom.fx_enabled = !s.custom.fx_enabled;
+                    sync_backdrop(s);
+                }))
+                .child(toggle_row("Frosted blur", s.custom.fx_frosted, "custom-fx-frost", |s| {
+                    s.custom.fx_frosted = !s.custom.fx_frosted;
+                    if s.custom.fx_frosted && s.custom.blur_radius <= 0.0 {
+                        s.custom.blur_radius = 12.0;
+                    }
+                })),
+        )
+        .child(
+            row()
+                .w_full()
+                .gap(8.0)
+                .child(toggle_row("Soft shadows", s.custom.fx_shadows, "custom-fx-shadow", |s| {
+                    s.custom.fx_shadows = !s.custom.fx_shadows;
+                }))
+                .child(toggle_row("Panel borders", s.custom.fx_borders, "custom-fx-border", |s| {
+                    s.custom.fx_borders = !s.custom.fx_borders;
+                })),
+        );
+
+    let wh = s.rect_window.get()[3];
+    let scroll_max_h = if wh > 0.0 { (wh - 96.0).clamp(200.0, 500.0) } else { 495.0 };
+
+    let mut body_col = col()
+        .key("custom-scroll")
+        .w_full()
+        .max_h(scroll_max_h)
+        .scroll(ScrollSpec { stick_bottom: false })
+        .gap(5.0)
+        .child(
+            row()
+                .w_full()
+                .items_center()
+                .child(text("Presets").font(CAPTION).color(p.secondary))
+                .child(el().grow(1.0))
+                .child(
+                    row()
+                        .key("custom-presets-reset")
+                        .h(20.0)
+                        .px(8.0)
+                        .radius(4.0)
+                        .hover(p.hover)
+                        .center()
+                        .child(text("Reset").font(CAPTION).color(p.secondary))
+                        .on_press(|s: &mut App| reset_custom_theme(s)),
+                ),
+        )
+        .child(presets_wrap)
         .child(text("Accent").font(CAPTION).color(p.secondary))
         .child(swatches)
-        .child(
-            row()
-                .w_full()
-                .h(FIELD_H)
-                .radius(4.0)
-                .fill(p.field)
-                .border(p.hair, p.field_line)
-                .px(10.0)
-                .items_center()
-                .child(
-                    text_input(&s.custom_hex, UI_TEXT)
-                        .key("custom-hex")
-                        .grow(1.0)
-                        .min_w(0.0)
-                        .single_line()
-                        .color(p.text)
-                        .on_edit(|s: &mut App| &mut s.custom_hex),
-                )
-                .child(
-                    text("Apply")
-                        .font(UI_TEXT)
-                        .color(p.secondary)
-                        .on_press(|s: &mut App| apply_custom_hex(s)),
-                ),
-        )
-        .child(text("Base").font(CAPTION).color(p.secondary))
-        .child(
-            row()
-                .w_full()
-                .gap(16.0)
-                .items_center()
-                .child(radio_dot(p, !s.custom_dark))
-                .child(
-                    text("Light")
-                        .font(UI_TEXT)
-                        .color(p.text)
-                        .on_press(|s: &mut App| {
-                            s.custom_dark = false;
-                            set_theme(s, theme::Theme::Custom);
-                        }),
-                )
-                .child(radio_dot(p, s.custom_dark))
-                .child(
-                    text("Dark")
-                        .font(UI_TEXT)
-                        .color(p.text)
-                        .on_press(|s: &mut App| {
-                            s.custom_dark = true;
-                            set_theme(s, theme::Theme::Custom);
-                        }),
-                ),
-        )
+        .child(hex_row)
+        .child(base_and_corners)
+        .child(sliders_row)
+        .child(text("Blur strength").font(CAPTION).color(p.secondary))
+        .child(blur_pills)
+        .child(text("Window backdrop").font(CAPTION).color(p.secondary))
+        .child(backdrop_pills);
+    if needs_restart_note {
+        body_col = body_col.child(
+            text("Restart Lyre to enable window transparency")
+                .font(CAPTION)
+                .color(p.tertiary),
+        );
+    }
+    body_col = body_col
         .child(text("Effects").font(CAPTION).color(p.secondary))
-        .child(toggle_row("Effects on", s.fx_enabled, "custom-fx-on", |s| {
-            s.fx_enabled = !s.fx_enabled;
-        }))
-        .child(toggle_row("Frosted panels", s.fx_frosted, "custom-fx-frost", |s| {
-            s.fx_frosted = !s.fx_frosted;
-        }))
-        .child(toggle_row("Translucent panels", s.fx_translucent, "custom-fx-translucent", |s| {
-            s.fx_translucent = !s.fx_translucent;
-        }))
-        .child(toggle_row("Soft shadows", s.fx_shadows, "custom-fx-shadow", |s| {
-            s.fx_shadows = !s.fx_shadows;
-        }))
-        .child(
-            row().w_full().items_center().child(el().grow(1.0)).child(
+        .child(effects_grid);
+
+    let panel = style_panel(
+        col()
+            .key("custom-panel")
+            .w(516.0)
+            .px(16.0)
+            .py(12.0)
+            .gap(8.0)
+            .on_press(|_s: &mut App| {}),
+        s,
+        p,
+    )
+    .child(text("Custom appearance").font(TILE_TEXT).color(p.text))
+    .child(body_col)
+    .child(
+        row()
+            .w_full()
+            .items_center()
+            .gap(8.0)
+            .child(
+                row()
+                    .key("custom-reset")
+                    .h(28.0)
+                    .px(14.0)
+                    .radius(pill_r)
+                    .fill(p.field)
+                    .border(p.hair, p.field_line)
+                    .hover(p.hover)
+                    .center()
+                    .child(text("Reset").font(UI_TEXT).color(p.text))
+                    .on_press(|s: &mut App| reset_custom_theme(s)),
+            )
+            .child(el().grow(1.0))
+            .child(
                 row()
                     .key("custom-done")
-                    .h(30.0)
+                    .h(28.0)
                     .px(18.0)
-                    .radius(4.0)
+                    .radius(pill_r)
                     .fill(p.accent_fill)
                     .hover(p.hover)
                     .center()
-                    .child(text("Done").font(UI_TEXT).color(Color::WHITE))
+                    .child(text("Done").font(UI_TEXT).color(p.accent_ink))
                     .on_press(|s: &mut App| {
                         apply_custom_hex(s);
+                        s.custom_hex_invalid = false;
                         s.custom_open = false;
                     }),
             ),
-        );
+    );
 
     el()
         .key("custom-overlay")
         .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-        .fill(Color::BLACK.alpha(0.45))
-        .on_press(|s: &mut App| s.custom_open = false)
+        .fill(Color::BLACK.alpha(0.08))
+        .on_press(|s: &mut App| {
+            s.custom_hex_invalid = false;
+            s.custom_open = false;
+        })
         .center()
         .child(panel)
 }
@@ -6462,53 +7026,54 @@ fn customize_dialog(s: &App, p: Paint) -> El {
         list = list.child(customize_group(s, p, group));
     }
 
+    let panel = style_panel(
+        col()
+            .key("customize-panel")
+            .w(560.0)
+            .px(16.0)
+            .py(16.0)
+            .gap(12.0)
+            .on_press(|_s: &mut App| {}),
+        s,
+        p,
+    )
+    .child(text("Customize context menu").font(TILE_TEXT).color(p.text))
+    .child(
+        text("Hover an owner to open it. Items marked Shift need Shift held.")
+            .font(CAPTION)
+            .color(p.tertiary),
+    )
+    .child(
+        col()
+            .key("customize-scroll")
+            .w_full()
+            .h(430.0)
+            .scroll(ScrollSpec { stick_bottom: false })
+            .child(list),
+    )
+    .child(
+        row().w_full().items_center()
+            .child(el().grow(1.0))
+            .child(
+                row()
+                    .key("customize-done")
+                    .h(30.0)
+                    .px(18.0)
+                    .radius(4.0)
+                    .fill(p.accent_fill)
+                    .hover(p.hover)
+                    .center()
+                    .child(text("Done").font(UI_TEXT).color(p.accent_ink))
+                    .on_press(|s: &mut App| s.customize_open = false),
+            ),
+    );
+
     el().key("customize-overlay")
         .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-        .fill(Color::BLACK.alpha(0.45))
+        .fill(Color::BLACK.alpha(if s.dark { 0.18 } else { 0.10 }))
         .on_press(|s: &mut App| s.customize_open = false)
         .center()
-        .child(
-            col()
-                .key("customize-panel")
-                .w(560.0)
-                .px(16.0)
-                .py(16.0)
-                .gap(12.0)
-                .fill(panel_fill(s, p))
-                .border(p.hair, p.menu_line)
-                .radius(8.0)
-                .shadow(6.0, 24.0, Color::BLACK.alpha(0.5))
-                .child(text("Customize context menu").font(TILE_TEXT).color(p.text))
-                .child(
-                    text("Hover an owner to open it. Items marked Shift need Shift held.")
-                        .font(CAPTION)
-                        .color(p.tertiary),
-                )
-                .child(
-                    col()
-                        .key("customize-scroll")
-                        .w_full()
-                        .h(430.0)
-                        .scroll(ScrollSpec { stick_bottom: false })
-                        .child(list),
-                )
-                .child(
-                    row().w_full().items_center()
-                        .child(el().grow(1.0))
-                        .child(
-                            row()
-                                .key("customize-done")
-                                .h(30.0)
-                                .px(18.0)
-                                .radius(4.0)
-                                .fill(p.accent_fill)
-                                .hover(p.hover)
-                                .center()
-                                .child(text("Done").font(UI_TEXT).color(Color::WHITE))
-                                .on_press(|s: &mut App| s.customize_open = false),
-                        ),
-                ),
-        )
+        .child(panel)
 }
 
 /// One button a dialog can show. The view draws the dialog's buttons from
@@ -6715,11 +7280,11 @@ fn dialog_button(p: Paint, label: &str, primary: bool, focused: bool) -> El {
         .border(p.hair, if primary { p.accent_fill } else { p.field_line })
         .hover(p.hover)
         .center()
-        .child(text(label).font(UI_TEXT).color(if primary { Color::WHITE } else { p.text }));
+        .child(text(label).font(UI_TEXT).color(if primary { p.accent_ink } else { p.text }));
     // The keyboard sits on one button; the ring says which, so Enter is never a
     // guess. It is drawn a little clear of the fill so both remain visible.
     if focused {
-        b.border(p.hair * 2.0, if primary { Color::WHITE } else { p.accent })
+        b.border(p.hair * 2.0, if primary { p.accent_ink } else { p.accent })
     } else {
         b
     }
@@ -6766,7 +7331,7 @@ fn check_box(p: Paint, on: bool) -> El {
         .border(p.hair * 2.0, if on { p.accent_fill } else { p.tertiary })
         .center();
     if on {
-        mark.fill(p.accent_fill).child(ico(p, Ico::Check, 11.0, Color::WHITE))
+        mark.fill(p.accent_fill).child(ico(p, Ico::Check, 11.0, p.accent_ink))
     } else {
         mark
     }
@@ -6795,16 +7360,17 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
         return el().key("dialog-none");
     };
     let base = || {
-        col()
-            .key("dialog-panel")
-            .w(420.0)
-            .px(20.0)
-            .py(18.0)
-            .gap(14.0)
-            .fill(panel_fill(s, p))
-            .border(p.hair, p.menu_line)
-            .radius(8.0)
-            .shadow(6.0, 24.0, Color::BLACK.alpha(0.5))
+        style_panel(
+            col()
+                .key("dialog-panel")
+                .w(420.0)
+                .px(20.0)
+                .py(18.0)
+                .gap(14.0)
+                .on_press(|_s: &mut App| {}),
+            s,
+            p,
+        )
     };
     let panel = match dialog {
         Dialog::Delete { permanent, paths } => {
@@ -7177,7 +7743,7 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
     };
     el().key("dialog-overlay")
         .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
-        .fill(Color::BLACK.alpha(0.45))
+        .fill(Color::BLACK.alpha(if s.dark { 0.18 } else { 0.10 }))
         .on_press(|s: &mut App| {
             if matches!(s.dialog, Some(Dialog::Update)) && s.update_busy {
                 return;
@@ -7379,12 +7945,15 @@ fn nav_rail(s: &App, p: Paint) -> El {
     } else {
         None
     };
-    let mut rail = col()
-        .key("rail")
-        .w(rail_width(s))
-        .h_full()
-        .fill(p.content)
-        .px(4.0)
+    let mut rail = with_chrome_material(
+        col()
+            .key("rail")
+            .w(rail_width(s))
+            .h_full()
+            .fill(chrome_fill(s, p.content))
+            .px(4.0),
+        s,
+    )
         .pt(6.0)
         .gap(1.0)
         .motion(Spring::NONE)
@@ -9467,6 +10036,7 @@ fn handle_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
     if s.custom_open {
         if ev.key == Key::Escape {
             s.custom_open = false;
+            s.custom_hex_invalid = false;
             return true;
         }
         if s.custom_hex.focused {
@@ -10252,6 +10822,11 @@ fn quick_access_content(s: &App, p: Paint) -> El {
     }
     let grid = col().w_full().pt(10.0).gap(6.0).child(line);
     let recent_on = s.quick_access_tab == 0;
+    let pill_ink = if s.theme == theme::Theme::Custom {
+        theme::contrast_ink(p.accent)
+    } else {
+        p.accent_ink
+    };
     let pills = row()
         .w_full()
         .pt(14.0)
@@ -10271,8 +10846,8 @@ fn quick_access_content(s: &App, p: Paint) -> El {
                 .hover(p.hover)
                 .gap(7.0)
                 .items_center()
-                .child(ico(p, Ico::Clock, 14.0, if recent_on { p.accent_ink } else { p.secondary }))
-                .child(text("Recent").font(UI_TEXT).color(if recent_on { p.accent_ink } else { p.text }))
+                .child(ico(p, Ico::Clock, 14.0, if recent_on { pill_ink } else { p.secondary }))
+                .child(text("Recent").font(UI_TEXT).color(if recent_on { pill_ink } else { p.text }))
                 .on_press(|s: &mut App| {
                     if s.quick_access_tab != 0 {
                         s.quick_access_tab = 0;
@@ -10290,8 +10865,8 @@ fn quick_access_content(s: &App, p: Paint) -> El {
                 .hover(p.hover)
                 .gap(7.0)
                 .items_center()
-                .child(ico(p, Ico::Star, 14.0, if recent_on { p.secondary } else { p.accent_ink }))
-                .child(text("Favorites").font(UI_TEXT).color(if recent_on { p.text } else { p.accent_ink }))
+                .child(ico(p, Ico::Star, 14.0, if recent_on { p.secondary } else { pill_ink }))
+                .child(text("Favorites").font(UI_TEXT).color(if recent_on { p.text } else { pill_ink }))
                 .on_press(|s: &mut App| {
                     if s.quick_access_tab != 1 {
                         s.quick_access_tab = 1;
@@ -10451,7 +11026,7 @@ fn quick_access_content(s: &App, p: Paint) -> El {
         .grow(1.0)
         .min_h(0.0)
         .w_full()
-        .fill(p.content)
+        .fill(content_fill(s, p.content))
         .child(
             row()
                 .w_full()
@@ -10473,7 +11048,7 @@ fn this_pc_content(s: &App, p: Paint) -> El {
         .grow(1.0)
         .min_h(0.0)
         .w_full()
-        .fill(p.content)
+        .fill(content_fill(s, p.content))
         .px(16.0)
         .pt(8.0)
         .child(
@@ -10740,7 +11315,7 @@ fn gallery_content(s: &App, p: Paint) -> El {
         .key("gallery")
         .min_h(0.0)
         .w_full()
-        .fill(p.content)
+        .fill(content_fill(s, p.content))
         .pb(16.0);
     let len = display_len(s);
     if len == 0 {
@@ -10967,7 +11542,7 @@ fn preview_pane(s: &App, p: Paint) -> El {
         .key("preview")
         .w(preview_width(s))
         .h_full()
-        .fill(p.content)
+        .fill(content_fill(s, p.content))
         .child(el().w(p.hair).h_full().fill(p.line))
         .child(inner)
 }
@@ -10980,7 +11555,7 @@ fn files_list(s: &App, p: Paint) -> El {
         // Not `w_full`: beside the rail, that asks for the whole window's width
         // and pushes the list past the right edge.
         .min_w(0.0)
-        .fill(p.content)
+        .fill(content_fill(s, p.content))
         .on_secondary_press(|s: &mut App, at: rune::PointerPress, _tx: &mut Tx| {
             s.menu = Some(Menu::Context { scope: CtxScope::Background, target: 0, x: at.x, y: at.y });
         })
@@ -11081,7 +11656,11 @@ fn status_bar(s: &App, p: Paint) -> El {
         .key("status")
         .w_full()
         .h(STATUS_H)
-        .fill(p.status)
+        .fill(if os_backdrop_active(s) {
+            p.status.alpha((chrome_alpha(s) + 0.08).min(0.95))
+        } else {
+            p.status
+        })
         .px(12.0)
         .gap(8.0)
         .items_center();
@@ -11307,17 +11886,40 @@ fn main() {
             }),
             ("custom", |s| {
                 s.theme = theme::Theme::Custom;
-                s.custom_dark = true;
-                s.dark = true;
-                s.custom_accent = "#e81123".into();
+                s.custom = theme::CustomTheme {
+                    accent: c("#e81123"),
+                    dark: true,
+                    surface_tint: 0.08,
+                    panel_opacity: 0.78,
+                    blur_radius: 14.0,
+                    backdrop: theme::BackdropStyle::Opaque,
+                    corners: theme::CornerStyle::Standard,
+                    fx_enabled: true,
+                    fx_frosted: true,
+                    fx_shadows: true,
+                    fx_borders: true,
+                };
+                s.dark = s.custom.dark;
                 load(s, Fixture::Downloads);
             }),
             ("custompanel", |s| {
                 s.theme = theme::Theme::Custom;
-                s.custom_dark = true;
-                s.dark = true;
-                s.custom_accent = "#e81123".into();
-                s.custom_hex.text = s.custom_accent.clone();
+                s.custom = theme::CustomTheme {
+                    accent: c("#4cc2ff"),
+                    dark: true,
+                    surface_tint: 0.10,
+                    panel_opacity: 0.76,
+                    blur_radius: 12.0,
+                    backdrop: theme::BackdropStyle::Mica,
+                    corners: theme::CornerStyle::Standard,
+                    fx_enabled: true,
+                    fx_frosted: true,
+                    fx_shadows: true,
+                    fx_borders: true,
+                };
+                s.dark = s.custom.dark;
+                s.custom_hex.text = s.custom.accent_hex();
+                s.custom_hex_invalid = false;
                 s.custom_open = true;
                 load(s, Fixture::Downloads);
             }),
@@ -11554,6 +12156,8 @@ fn main() {
             let display = displays.iter().find(|d| d.primary).or(displays.first())?;
             fit_to_screen((width, height), display.size, display.scale as f32)
         });
+        let (wants_transparent, startup_backdrop, startup_dark) = startup_backdrop_prefs();
+        let startup_transparent = wants_transparent || cfg!(target_os = "macos");
         // macOS rounds a transparent borderless window through Rune's own corner
         // radius; Windows rounds through DWM in frame::install; Linux leaves the
         // corners to the compositor.
@@ -11563,7 +12167,7 @@ fn main() {
                 resizable: true,
                 min_size: Some((MIN_W, MIN_H)),
                 physical_size: physical,
-                transparent: cfg!(target_os = "macos"),
+                transparent: startup_transparent,
                 ..Default::default()
             }
             .macos(rune::MacWindowOptions::default().corner_radius(8.0)),
@@ -11574,8 +12178,13 @@ fn main() {
         let wake = app_handle.clone();
         app_handle.update(move |s: &mut App, _tx: &mut Tx| {
             s.waker = Some(std::sync::Arc::new(move || wake.wake()));
+            s.startup_transparent = startup_transparent;
+            s.applied_backdrop = Some((startup_backdrop, startup_dark));
         });
-        let window = window.on_created(|handle| frame::install(&handle));
+        let window = window.on_created(move |handle| {
+            frame::install(&handle);
+            frame::apply_backdrop_to(&handle, startup_backdrop, startup_dark);
+        });
         [window.boxed()]
     });
 }
@@ -11584,43 +12193,61 @@ fn main() {
 mod customize_tests {
     use super::*;
 
-    /// A Custom choice survives a restart, including its base, accent and the
-    /// effect switches, and resolves `dark` from the stored base.
+    /// A Custom choice survives a restart, including its base, accent, sliders,
+    /// backdrop, corners, and effect switches, and resolves `dark` from the stored base.
     #[test]
     fn a_custom_appearance_survives_a_restart() {
         let store = "lyre-rune-custom-test";
         let mut before = init();
         before.theme = theme::Theme::Custom;
-        before.custom_dark = false;
-        before.custom_accent = "#7b68ee".into();
-        before.fx_frosted = false;
-        before.fx_translucent = false;
-        before.fx_shadows = false;
-        before.fx_enabled = true;
+        before.custom = theme::CustomTheme {
+            accent: c("#7b68ee"),
+            dark: false,
+            surface_tint: 0.12,
+            panel_opacity: 0.72,
+            blur_radius: 18.0,
+            backdrop: theme::BackdropStyle::Acrylic,
+            corners: theme::CornerStyle::Rounded,
+            fx_enabled: true,
+            fx_frosted: false,
+            fx_shadows: false,
+            fx_borders: false,
+        };
         before.dark = true;
         persist_to(&before, store);
 
         let mut after = init();
         after.theme = theme::Theme::System;
-        after.custom_dark = true;
-        after.custom_accent.clear();
-        after.fx_frosted = true;
-        after.fx_translucent = true;
-        after.fx_shadows = true;
+        after.custom = theme::CustomTheme::default();
         load_prefs_from(&mut after, store);
         assert_eq!(after.theme, theme::Theme::Custom);
         assert!(!after.dark, "a light base resolves to light, not the desktop");
-        assert_eq!(after.custom_accent, "#7b68ee");
-        assert!(!after.fx_frosted && !after.fx_translucent && !after.fx_shadows);
+        assert_eq!(after.custom.accent_hex(), "#7b68ee");
+        assert!((after.custom.surface_tint - 0.12).abs() < 1e-6);
+        assert!((after.custom.panel_opacity - 0.72).abs() < 1e-6);
+        assert!((after.custom.blur_radius - 18.0).abs() < 1e-6);
+        assert_eq!(after.custom.backdrop, theme::BackdropStyle::Acrylic);
+        assert_eq!(after.custom.corners, theme::CornerStyle::Rounded);
+        assert!(after.custom.fx_enabled);
+        assert!(!after.custom.fx_frosted && !after.custom.fx_shadows && !after.custom.fx_borders);
 
         let mut prefs = rune::prefs::Prefs::open(store);
-        let _ = prefs.remove("theme");
-        let _ = prefs.remove("custom_accent");
-        let _ = prefs.remove("custom_dark");
-        let _ = prefs.remove("fx_enabled");
-        let _ = prefs.remove("fx_frosted");
-        let _ = prefs.remove("fx_translucent");
-        let _ = prefs.remove("fx_shadows");
+        for key in [
+            "theme",
+            "custom_accent",
+            "custom_dark",
+            "surface_tint",
+            "panel_opacity",
+            "blur_radius",
+            "backdrop",
+            "corners",
+            "fx_enabled",
+            "fx_frosted",
+            "fx_shadows",
+            "fx_borders",
+        ] {
+            let _ = prefs.remove(key);
+        }
     }
 
     /// Changing any custom color or effect must mark the state as changed so
@@ -11631,12 +12258,12 @@ mod customize_tests {
         let base = prefs_signature(&s);
         s.theme = theme::Theme::Custom;
         s.dark = true;
-        s.custom_accent = "#ff8c00".into();
+        s.custom.accent = c("#ff8c00");
         assert_ne!(prefs_signature(&s), base, "the accent is part of the saved state");
         let accent = paint(&s, 1.0).accent;
         assert_eq!(accent, rune::color::hex("#ff8c00").unwrap());
 
-        s.fx_frosted = !s.fx_frosted;
+        s.custom.fx_frosted = !s.custom.fx_frosted;
         assert_ne!(prefs_signature(&s), base, "effects are part of the saved state");
     }
 
@@ -14902,5 +15529,169 @@ mod bugfix_tests {
         assert_eq!(dialog_buttons(s.dialog.as_ref()), vec![DialogButton::Cancel, DialogButton::Confirm]);
         press_dialog_button(&mut s, DialogButton::Cancel);
         assert!(s.dialog.is_none());
+    }
+}
+
+#[cfg(test)]
+mod theme_ui_tests {
+    use super::*;
+
+    fn contrast_ratio(a: Color, b: Color) -> f32 {
+        let la = a.luminance();
+        let lb = b.luminance();
+        let (hi, lo) = if la >= lb { (la, lb) } else { (lb, la) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    #[test]
+    fn custom_theme_prefs_round_trip_and_legacy_migration() {
+        let store = format!("lyre-rune-theme-ui-test-{}", std::process::id());
+        {
+            let mut prefs = rune::prefs::Prefs::open(&store);
+            let _ = prefs.set("theme", &theme::Theme::Custom.to_u8());
+            let _ = prefs.set("custom_accent", &"#e85d8a".to_string());
+            let _ = prefs.set("custom_dark", &false);
+            let _ = prefs.set("fx_enabled", &true);
+            let _ = prefs.set("fx_frosted", &true);
+            let _ = prefs.set("fx_translucent", &false);
+            let _ = prefs.set("fx_shadows", &false);
+        }
+
+        let mut legacy = init();
+        load_prefs_from(&mut legacy, &store);
+        assert_eq!(legacy.theme, theme::Theme::Custom);
+        assert!(!legacy.dark);
+        assert!(!legacy.custom.dark);
+        assert_eq!(legacy.custom.accent_hex(), "#e85d8a");
+        assert!((legacy.custom.panel_opacity - 1.0).abs() < 1e-6);
+        assert!(legacy.custom.fx_frosted);
+        assert!(!legacy.custom.fx_shadows);
+
+        legacy.custom.surface_tint = 0.15;
+        legacy.custom.panel_opacity = 0.68;
+        legacy.custom.blur_radius = 20.0;
+        legacy.custom.backdrop = theme::BackdropStyle::Mica;
+        legacy.custom.corners = theme::CornerStyle::Rounded;
+        legacy.custom.fx_borders = false;
+        persist_to(&legacy, &store);
+
+        let mut reloaded = init();
+        load_prefs_from(&mut reloaded, &store);
+        assert!((reloaded.custom.surface_tint - 0.15).abs() < 1e-6);
+        assert!((reloaded.custom.panel_opacity - 0.68).abs() < 1e-6);
+        assert!((reloaded.custom.blur_radius - 20.0).abs() < 1e-6);
+        assert_eq!(reloaded.custom.backdrop, theme::BackdropStyle::Mica);
+        assert_eq!(reloaded.custom.corners, theme::CornerStyle::Rounded);
+        assert!(!reloaded.custom.fx_borders);
+
+        let mut prefs = rune::prefs::Prefs::open(&store);
+        for key in [
+            "theme",
+            "custom_accent",
+            "custom_dark",
+            "surface_tint",
+            "panel_opacity",
+            "blur_radius",
+            "backdrop",
+            "corners",
+            "fx_enabled",
+            "fx_frosted",
+            "fx_translucent",
+            "fx_shadows",
+            "fx_borders",
+            "settings",
+            "window_size",
+            "favorites",
+            "recent",
+            "pinned",
+            "menu_hidden",
+            "menu_shown",
+            "handler_loaded",
+            "hidden_places",
+            "update_check_startup",
+            "prompt_default_manager",
+            "show_protected",
+            "show_extensions",
+            "col_w",
+            "rail_w",
+        ] {
+            let _ = prefs.remove(key);
+        }
+    }
+
+    #[test]
+    fn opening_custom_panel_preserves_saved_custom_dark_base() {
+        let mut s = init();
+        s.custom.dark = false;
+        set_theme(&mut s, theme::Theme::Dark);
+        assert!(s.dark);
+        assert!(!s.custom.dark);
+
+        open_custom_panel(&mut s);
+        assert!(s.custom_open);
+        assert_eq!(s.theme, theme::Theme::Custom);
+        assert!(!s.custom.dark, "opening Custom must not overwrite saved custom.dark");
+        assert!(!s.dark, "s.dark must resolve from s.custom.dark");
+
+        // Reopening while already in Custom with dark custom base preserves true too.
+        s.custom.dark = true;
+        set_theme(&mut s, theme::Theme::Light);
+        assert!(!s.dark);
+        open_custom_panel(&mut s);
+        assert!(s.custom.dark);
+        assert!(s.dark);
+    }
+
+    #[test]
+    fn custom_hex_validation_and_paint_contrast_and_panel_helpers() {
+        let mut s = init();
+        s.theme = theme::Theme::Custom;
+        s.custom = theme::CustomTheme::default();
+        s.custom.accent = c("#4cc2ff");
+        s.custom.corners = theme::CornerStyle::Sharp;
+        s.custom.panel_opacity = 0.72;
+        s.custom.blur_radius = 16.0;
+        s.custom.backdrop = theme::BackdropStyle::Acrylic;
+
+        s.custom_hex.text = "ffd700".into();
+        apply_custom_hex(&mut s);
+        assert!(!s.custom_hex_invalid);
+        assert_eq!(s.custom.accent_hex(), "#ffd700");
+
+        s.custom_hex.text = "not-a-color".into();
+        apply_custom_hex(&mut s);
+        assert!(s.custom_hex_invalid);
+        assert_eq!(s.custom.accent_hex(), "#ffd700");
+
+        for dark in [false, true] {
+            s.custom.dark = dark;
+            s.dark = dark;
+            for hex in ["#4cc2ff", "#ffd700", "#000000", "#ffffff", "#0078d4"] {
+                s.custom.accent = c(hex);
+                let p = paint(&s, 1.0);
+                assert_eq!(p.radius, 4.0);
+                assert!(
+                    contrast_ratio(p.accent_fill, p.accent_ink) >= 4.5,
+                    "unreadable accent_ink for {hex} dark={dark}"
+                );
+            }
+        }
+
+        let p = paint(&s, 1.0);
+        assert!((panel_fill(&s, p).a - 0.72).abs() < 1e-6);
+        assert_eq!(panel_blur(&s), Some(16.0));
+        assert_eq!(panel_border(&s, p), Color::WHITE.alpha(0.12));
+        assert!(panel_shadows(&s));
+        assert_eq!(active_backdrop(&s), theme::BackdropStyle::Acrylic);
+        assert!(os_backdrop_active(&s));
+
+        s.custom.fx_borders = false;
+        assert_eq!(panel_border(&s, p), Color::TRANSPARENT);
+        s.custom.fx_enabled = false;
+        assert!((panel_fill(&s, p).a - 1.0).abs() < 1e-6);
+        assert_eq!(panel_blur(&s), None);
+        assert!(!panel_shadows(&s));
+        assert_eq!(active_backdrop(&s), theme::BackdropStyle::Opaque);
+        assert!(!os_backdrop_active(&s));
     }
 }

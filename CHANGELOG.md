@@ -4,6 +4,31 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
+## [0.3.7]
+
+An incremental release adding Recycle Bin sidebar access and parallel loading,
+expanding the Custom appearance panel and translucency, and fixing file-operation,
+timestamp, drag-drop, and UI state bugs.
+
+### Added
+
+- **Recycle Bin in the sidebar and command bar.** Added a permanent Recycle Bin
+  place in the navigation rail, off-thread parallel Recycle Bin enumeration, and
+  an **Empty** button on the command bar.
+- **Expanded Custom appearance & translucency.** Added surface tint, panel
+  opacity, blur strength, corner radius, window backdrop (with restart note for
+  Windows/Linux transparent surface), and border visibility controls to the
+  Custom theme panel, along with unified frosted panel styling across overlays.
+
+### Fixed
+
+- **File operations, timestamps, and drag-and-drop.** Fixed data-loss edge cases,
+  timestamp handling, drag-and-drop behavior, and UI selection/refresh state
+  bugs across file operations.
+- **Refresh and virtual pages.** Kept virtual pages (such as Home, Recycle Bin,
+  and Search) on refresh, refreshed the Recycle Bin after changes, and wired the
+  address-bar refresh button to the same path as F5.
+
 ## [0.3.6]
 
 A stability release for file operations: moving, copying and deleting now keep

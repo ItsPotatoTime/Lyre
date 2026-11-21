@@ -28,6 +28,7 @@ pub struct OsDrop {
 pub enum OsDragMsg {
     Hover(Option<(f32, f32)>),
     Drop(OsDrop),
+    End,
 }
 
 /// The picture an OS drag shows under the pointer, as straight-alpha sRGB
@@ -599,10 +600,40 @@ pub mod win {
         }
     }
 
-    /// Member names out of a `FILEGROUP_DESCRIPTORW` global. The descriptor
-    /// array starts at offset 8: the DWORD count is followed by padding to
-    /// the FILE_DESCRIPTORW's eight-byte alignment.
-    pub fn descriptor_names(bytes: &[u8]) -> Vec<String> {
+    const FD_ATTRIBUTES: u32 = 0x0000_0004;
+    const FD_CREATETIME: u32 = 0x0000_0008;
+    const FD_ACCESSTIME: u32 = 0x0000_0010;
+    const FD_WRITESTIME: u32 = 0x0000_0020;
+    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+
+    pub(crate) struct VirtualMember {
+        pub index: i32,
+        pub name: String,
+        pub is_dir: bool,
+        pub created: Option<std::time::SystemTime>,
+        pub accessed: Option<std::time::SystemTime>,
+        pub written: Option<std::time::SystemTime>,
+    }
+
+    fn filetime_to_system_time(ft: u64) -> Option<std::time::SystemTime> {
+        if ft == 0 {
+            return None;
+        }
+        const EPOCH_100NS: u64 = 116_444_736_000_000_000;
+        if ft >= EPOCH_100NS {
+            let diff = ft - EPOCH_100NS;
+            let secs = diff / 10_000_000;
+            let nanos = ((diff % 10_000_000) * 100) as u32;
+            std::time::UNIX_EPOCH.checked_add(std::time::Duration::new(secs, nanos))
+        } else {
+            let diff = EPOCH_100NS - ft;
+            let secs = diff / 10_000_000;
+            let nanos = ((diff % 10_000_000) * 100) as u32;
+            std::time::UNIX_EPOCH.checked_sub(std::time::Duration::new(secs, nanos))
+        }
+    }
+
+    pub(crate) fn parse_descriptors(bytes: &[u8]) -> Vec<VirtualMember> {
         if bytes.len() < 8 {
             return Vec::new();
         }
@@ -619,10 +650,72 @@ pub mod win {
             if let Ok(name) = String::from_utf16(&units)
                 && !name.is_empty()
             {
-                out.push(name);
+                let is_dir = (d.flags & FD_ATTRIBUTES) != 0
+                    && (d._attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                let created = ((d.flags & FD_CREATETIME) != 0)
+                    .then(|| filetime_to_system_time(d._created))
+                    .flatten();
+                let accessed = ((d.flags & FD_ACCESSTIME) != 0)
+                    .then(|| filetime_to_system_time(d._accessed))
+                    .flatten();
+                let written = ((d.flags & FD_WRITESTIME) != 0)
+                    .then(|| filetime_to_system_time(d._written))
+                    .flatten();
+                out.push(VirtualMember {
+                    index: i as i32,
+                    name,
+                    is_dir,
+                    created,
+                    accessed,
+                    written,
+                });
             }
         }
         out
+    }
+
+    fn build_descriptor_times(member: &VirtualMember) -> Option<std::fs::FileTimes> {
+        use std::os::windows::fs::FileTimesExt;
+        let mut times = std::fs::FileTimes::new();
+        let mut any = false;
+        if let Some(created) = member.created {
+            times = times.set_created(created);
+            any = true;
+        }
+        if let Some(accessed) = member.accessed {
+            times = times.set_accessed(accessed);
+            any = true;
+        }
+        if let Some(written) = member.written {
+            times = times.set_modified(written);
+            any = true;
+        }
+        any.then_some(times)
+    }
+
+    fn apply_dir_times(path: &Path, member: &VirtualMember) {
+        use std::os::windows::fs::OpenOptionsExt;
+        let Some(times) = build_descriptor_times(member) else {
+            return;
+        };
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        const FILE_SHARE_ALL: u32 = 0x0001 | 0x0002 | 0x0004;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        if let Ok(dir) = std::fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .share_mode(FILE_SHARE_ALL)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+        {
+            let _ = dir.set_times(times);
+        }
+    }
+
+    /// Member names out of a `FILEGROUP_DESCRIPTORW` global. The descriptor
+    /// array starts at offset 8: the DWORD count is followed by padding to
+    /// the FILE_DESCRIPTORW's eight-byte alignment.
+    pub fn descriptor_names(bytes: &[u8]) -> Vec<String> {
+        parse_descriptors(bytes).into_iter().map(|m| m.name).collect()
     }
 
     /// Where a virtual member lands inside the staging folder. A member name
@@ -648,7 +741,7 @@ pub mod win {
     }
 
     /// Every path or virtual member the source offers, extracted in full.
-    unsafe fn collect(data: *mut c_void, descriptor: u16, contents: u16) -> Vec<PathBuf> {
+    pub(crate) unsafe fn collect(data: *mut c_void, descriptor: u16, contents: u16) -> Vec<PathBuf> {
         unsafe {
             if let Some(medium) = get_medium(data, CF_HDROP, -1, 1) {
                 let ptr = GlobalLock(medium.data);
@@ -673,16 +766,24 @@ pub mod win {
                 return Vec::new();
             }
             let count_bytes = GlobalSize(group.data);
-            let names = descriptor_names(std::slice::from_raw_parts(ptr as *const u8, count_bytes));
+            let members = parse_descriptors(std::slice::from_raw_parts(ptr as *const u8, count_bytes));
             let root = std::env::temp_dir().join(format!(
                 "lyre-virtual-{}-{}",
                 std::process::id(),
                 super::NEXT_ROOT.fetch_add(1, Ordering::Relaxed)
             ));
             let mut out = Vec::new();
-            for (i, name) in names.iter().enumerate() {
-                let Some(dst) = staged_member_path(&root, name) else { continue };
-                let Some(stream_medium) = get_medium(data, contents, i as i32, TYMED_ISTREAM) else { continue };
+            let mut dir_times: Vec<(PathBuf, VirtualMember)> = Vec::new();
+            for member in members {
+                let Some(dst) = staged_member_path(&root, &member.name) else { continue };
+                if member.is_dir {
+                    if std::fs::create_dir_all(&dst).is_ok() {
+                        out.push(dst.clone());
+                        dir_times.push((dst, member));
+                    }
+                    continue;
+                }
+                let Some(stream_medium) = get_medium(data, contents, member.index, TYMED_ISTREAM) else { continue };
                 // A hostile or broken source can report S_OK with a null or
                 // wrong-typed pointer. Never dereference it blind — that
                 // crashed the app inside the OLE Drop callback.
@@ -695,19 +796,31 @@ pub mod win {
                     ReleaseStgMedium(&mut { stream_medium });
                     continue;
                 }
-                if let Some(parent) = dst.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+                if let Some(parent) = dst.parent()
+                    && std::fs::create_dir_all(parent).is_err()
+                {
+                    ReleaseStgMedium(&mut { stream_medium });
+                    continue;
                 }
-                let Ok(mut file) = std::fs::File::create(&dst) else { continue };
+                let Ok(mut file) = std::fs::File::create(&dst) else {
+                    ReleaseStgMedium(&mut { stream_medium });
+                    continue;
+                };
                 let mut buf = vec![0u8; 64 * 1024];
+                let mut ok = true;
                 loop {
                     let mut read = 0u32;
                     let hr = ((*(*stream)).read)(stream as *mut c_void, buf.as_mut_ptr().cast(), buf.len() as u32, &mut read);
                     if read > 0 {
                         use std::io::Write;
                         if file.write_all(&buf[..read as usize]).is_err() {
+                            ok = false;
                             break;
                         }
+                    }
+                    if hr < 0 {
+                        ok = false;
+                        break;
                     }
                     // S_OK means a full buffer with more behind it. The final,
                     // partial read reports S_FALSE with its byte count set, and
@@ -718,8 +831,21 @@ pub mod win {
                         break;
                     }
                 }
-                ReleaseStgMedium(&mut { stream_medium });
-                out.push(dst);
+                if ok {
+                    if let Some(times) = build_descriptor_times(&member) {
+                        let _ = file.set_times(times);
+                    }
+                    drop(file);
+                    ReleaseStgMedium(&mut { stream_medium });
+                    out.push(dst);
+                } else {
+                    drop(file);
+                    let _ = std::fs::remove_file(&dst);
+                    ReleaseStgMedium(&mut { stream_medium });
+                }
+            }
+            for (dir_path, member) in dir_times.iter().rev() {
+                apply_dir_times(dir_path, member);
             }
             GlobalUnlock(group.data);
             ReleaseStgMedium(&mut { group });
@@ -997,6 +1123,9 @@ pub mod win {
                 if trace {
                     eprintln!("[drag] the shell gave no data object for {} path(s)", paths.len());
                 }
+                if let Some(tx) = super::sender() {
+                    let _ = tx.send(OsDragMsg::End);
+                }
                 return;
             };
             if let Some(preview) = &preview {
@@ -1033,6 +1162,7 @@ pub mod win {
             // need not have called DragLeave, so clear the hover explicitly.
             if let Some(tx) = super::sender() {
                 let _ = tx.send(OsDragMsg::Hover(None));
+                let _ = tx.send(OsDragMsg::End);
             }
         }
     }
@@ -1436,6 +1566,9 @@ pub mod linux {
             XDestroyWindow(d, win);
             XCloseDisplay(d);
         }
+        if let Some(tx) = super::sender() {
+            let _ = tx.send(super::OsDragMsg::End);
+        }
     }
 
     // -- Wayland -------------------------------------------------------------
@@ -1612,6 +1745,9 @@ pub mod linux {
             pump(&mut queue, &conn, &mut state, 100);
             let Ok(paths) = rx.try_recv() else { continue };
             if state.serial == 0 {
+                if let Some(tx) = super::sender() {
+                    let _ = tx.send(super::OsDragMsg::End);
+                }
                 continue;
             }
             state.payload = uri_list(&paths);
@@ -1630,6 +1766,9 @@ pub mod linux {
             source.destroy();
             let _ = conn.flush();
             state.payload.clear();
+            if let Some(tx) = super::sender() {
+                let _ = tx.send(super::OsDragMsg::End);
+            }
         }
     }
 }
@@ -1768,5 +1907,269 @@ mod tests {
             win::parse_hdrop(&bytes),
             vec![PathBuf::from("C:\\a.txt"), PathBuf::from("C:\\b.txt")]
         );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn parse_descriptors_reads_directory_flag_and_timestamps() {
+        let stride = std::mem::size_of::<win::FileDescriptor>();
+        let mut bytes = vec![0u8; 8 + stride * 2];
+        bytes[0..4].copy_from_slice(&2u32.to_ne_bytes());
+
+        // Entry 0: directory with FD_ATTRIBUTES | FD_WRITESTIME
+        let d0 = unsafe { &mut *(bytes.as_mut_ptr().add(8) as *mut win::FileDescriptor) };
+        let set_flags = 0x0000_0004 | 0x0000_0008 | 0x0000_0010 | 0x0000_0020;
+        unsafe {
+            let p0 = (&raw mut *d0) as *mut u8;
+            (p0 as *mut u32).write(set_flags);
+            (p0.add(36) as *mut u32).write(0x10); // FILE_ATTRIBUTE_DIRECTORY
+            // 2020-01-01T00:00:00Z in FILETIME = 132223104000000000
+            let ft_2020: u64 = 132_223_104_000_000_000;
+            (p0.add(40) as *mut u64).write(ft_2020);
+            (p0.add(48) as *mut u64).write(ft_2020);
+            (p0.add(56) as *mut u64).write(ft_2020);
+            let name_ptr = p0.add(72) as *mut u16;
+            for (i, u) in "folder".encode_utf16().enumerate() {
+                name_ptr.add(i).write(u);
+            }
+        }
+
+        // Entry 1: file with pre-1970 mtime (1969-12-31T00:00:00Z = 11644387200s * 10^7)
+        unsafe {
+            let p1 = bytes.as_mut_ptr().add(8 + stride);
+            (p1 as *mut u32).write(0x0000_0020); // FD_WRITESTIME
+            let ft_1969: u64 = 116_443_872_000_000_000;
+            (p1.add(56) as *mut u64).write(ft_1969);
+            let name_ptr = p1.add(72) as *mut u16;
+            for (i, u) in "folder\\file.txt".encode_utf16().enumerate() {
+                name_ptr.add(i).write(u);
+            }
+        }
+
+        let parsed = win::parse_descriptors(&bytes);
+        assert_eq!(parsed.len(), 2);
+        assert!(parsed[0].is_dir);
+        assert_eq!(parsed[0].name, "folder");
+        assert!(parsed[0].written.is_some());
+        assert!(!parsed[1].is_dir);
+        assert_eq!(parsed[1].name, "folder\\file.txt");
+        let written = parsed[1].written.expect("pre-1970 FILETIME parses");
+        assert_eq!(
+            std::time::UNIX_EPOCH.duration_since(written).unwrap().as_secs(),
+            86_400
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn collect_handles_directories_timestamps_and_stream_errors() {
+        use std::ffi::c_void;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GlobalAlloc(flags: u32, bytes: usize) -> *mut c_void;
+            fn GlobalLock(mem: *mut c_void) -> *mut c_void;
+            fn GlobalUnlock(mem: *mut c_void) -> i32;
+            fn GlobalFree(mem: *mut c_void) -> *mut c_void;
+        }
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn RegisterClipboardFormatW(name: *const u16) -> u16;
+        }
+
+        #[repr(C)]
+        struct FormatEtc {
+            cf: u16,
+            ptd: *mut c_void,
+            aspect: u32,
+            lindex: i32,
+            tymed: u32,
+        }
+        #[repr(C)]
+        struct StgMedium {
+            tymed: u32,
+            pad: u32,
+            data: *mut c_void,
+            unk: *mut c_void,
+        }
+        #[repr(C)]
+        struct DataVtbl {
+            query: *const c_void,
+            add: *const c_void,
+            release: *const c_void,
+            get_data: unsafe extern "system" fn(*mut c_void, *mut FormatEtc, *mut StgMedium) -> i32,
+            get_data_here: *const c_void,
+            query_get_data: unsafe extern "system" fn(*mut c_void, *mut FormatEtc) -> i32,
+            rest: [*const c_void; 3],
+        }
+        #[repr(C)]
+        struct StreamVtbl {
+            query: *const c_void,
+            add: *const c_void,
+            release: *const c_void,
+            read: unsafe extern "system" fn(*mut c_void, *mut c_void, u32, *mut u32) -> i32,
+            rest: [*const c_void; 10],
+        }
+        unsafe impl Sync for DataVtbl {}
+        unsafe impl Sync for StreamVtbl {}
+        #[repr(C)]
+        struct MockStream {
+            vtbl: &'static StreamVtbl,
+            payload: &'static [u8],
+            pos: usize,
+            fail_second_read: bool,
+            releases: &'static AtomicUsize,
+        }
+        #[repr(C)]
+        struct MockData {
+            vtbl: &'static DataVtbl,
+            cf_desc: u16,
+            cf_cont: u16,
+            desc_bytes: Vec<u8>,
+            good_stream: Box<MockStream>,
+            bad_stream: Box<MockStream>,
+        }
+
+        unsafe extern "system" fn noop_qi(_: *mut c_void, _: *const c_void, _: *mut *mut c_void) -> i32 { -2147467262 }
+        unsafe extern "system" fn noop_add(_: *mut c_void) -> u32 { 1 }
+        unsafe extern "system" fn noop_rel(_: *mut c_void) -> u32 { 1 }
+        unsafe extern "system" fn stream_rel(this: *mut c_void) -> u32 {
+            let s = unsafe { &*(this as *const MockStream) };
+            s.releases.fetch_add(1, Ordering::Relaxed);
+            0
+        }
+        unsafe extern "system" fn stream_read(
+            this: *mut c_void,
+            buf: *mut c_void,
+            cb: u32,
+            read: *mut u32,
+        ) -> i32 {
+            let s = unsafe { &mut *(this as *mut MockStream) };
+            if s.pos < s.payload.len() {
+                let n = (cb as usize).min(s.payload.len() - s.pos);
+                unsafe { std::ptr::copy_nonoverlapping(s.payload.as_ptr().add(s.pos), buf as *mut u8, n) };
+                s.pos += n;
+                unsafe { *read = n as u32 };
+                if s.fail_second_read {
+                    return 0; // S_OK so caller loops and hits the error on second call
+                }
+                return 1; // S_FALSE (end of stream)
+            }
+            unsafe { *read = 0 };
+            if s.fail_second_read { -2147467259 } else { 1 }
+        }
+        unsafe extern "system" fn data_query(_: *mut c_void, _: *mut FormatEtc) -> i32 { -2147221404 }
+        unsafe extern "system" fn data_get(
+            this: *mut c_void,
+            etc: *mut FormatEtc,
+            med: *mut StgMedium,
+        ) -> i32 {
+            let d = unsafe { &mut *(this as *mut MockData) };
+            let etc = unsafe { &*etc };
+            if etc.cf == d.cf_desc && (etc.tymed & 1) != 0 {
+                let h = unsafe { GlobalAlloc(0x0002, d.desc_bytes.len()) };
+                let p = unsafe { GlobalLock(h) };
+                unsafe { std::ptr::copy_nonoverlapping(d.desc_bytes.as_ptr(), p as *mut u8, d.desc_bytes.len()) };
+                unsafe { GlobalUnlock(h) };
+                unsafe {
+                    *med = StgMedium { tymed: 1, pad: 0, data: h, unk: std::ptr::null_mut() };
+                }
+                return 0;
+            }
+            if etc.cf == d.cf_cont && (etc.tymed & 4) != 0 {
+                let stream_ptr: *mut c_void = match etc.lindex {
+                    1 => (&mut *d.good_stream) as *mut MockStream as *mut c_void,
+                    2 => (&mut *d.bad_stream) as *mut MockStream as *mut c_void,
+                    _ => return -2147221404,
+                };
+                unsafe {
+                    *med = StgMedium { tymed: 4, pad: 0, data: stream_ptr, unk: std::ptr::null_mut() };
+                }
+                return 0;
+            }
+            let _ = GlobalFree;
+            -2147221404
+        }
+
+        static STREAM_VTBL: StreamVtbl = StreamVtbl {
+            query: noop_qi as *const c_void,
+            add: noop_add as *const c_void,
+            release: stream_rel as *const c_void,
+            read: stream_read,
+            rest: [std::ptr::null(); 10],
+        };
+        static DATA_VTBL: DataVtbl = DataVtbl {
+            query: noop_qi as *const c_void,
+            add: noop_add as *const c_void,
+            release: noop_rel as *const c_void,
+            get_data: data_get,
+            get_data_here: std::ptr::null(),
+            query_get_data: data_query,
+            rest: [std::ptr::null(); 3],
+        };
+
+        let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+        let cf_desc = unsafe { RegisterClipboardFormatW(wide("FileGroupDescriptorW").as_ptr()) };
+        let cf_cont = unsafe { RegisterClipboardFormatW(wide("FileContents").as_ptr()) };
+
+        let stride = std::mem::size_of::<win::FileDescriptor>();
+        let mut desc_bytes = vec![0u8; 8 + stride * 3];
+        desc_bytes[0..4].copy_from_slice(&3u32.to_ne_bytes());
+        let ft_2020: u64 = 132_223_104_000_000_000;
+        let write_entry = |buf: &mut [u8], idx: usize, flags: u32, attrs: u32, mtime: u64, name: &str| {
+            let p = unsafe { buf.as_mut_ptr().add(8 + idx * stride) };
+            unsafe {
+                (p as *mut u32).write(flags);
+                (p.add(36) as *mut u32).write(attrs);
+                (p.add(40) as *mut u64).write(mtime);
+                (p.add(56) as *mut u64).write(mtime);
+                let np = p.add(72) as *mut u16;
+                for (i, u) in name.encode_utf16().enumerate() {
+                    np.add(i).write(u);
+                }
+            }
+        };
+        write_entry(&mut desc_bytes, 0, 0x04 | 0x20, 0x10, ft_2020, "dir");
+        write_entry(&mut desc_bytes, 1, 0x08 | 0x20, 0, ft_2020, "dir\\good.txt");
+        write_entry(&mut desc_bytes, 2, 0x20, 0, ft_2020, "dir\\broken.txt");
+
+        static GOOD_REL: AtomicUsize = AtomicUsize::new(0);
+        static BAD_REL: AtomicUsize = AtomicUsize::new(0);
+        let mut data = MockData {
+            vtbl: &DATA_VTBL,
+            cf_desc,
+            cf_cont,
+            desc_bytes,
+            good_stream: Box::new(MockStream {
+                vtbl: &STREAM_VTBL,
+                payload: b"hello virtual",
+                pos: 0,
+                fail_second_read: false,
+                releases: &GOOD_REL,
+            }),
+            bad_stream: Box::new(MockStream {
+                vtbl: &STREAM_VTBL,
+                payload: b"partial",
+                pos: 0,
+                fail_second_read: true,
+                releases: &BAD_REL,
+            }),
+        };
+
+        let out = unsafe { win::collect((&mut data) as *mut MockData as *mut c_void, cf_desc, cf_cont) };
+        assert_eq!(out.len(), 2, "directory and good file landed; failed stream removed: {out:?}");
+        assert!(out[0].is_dir());
+        assert_eq!(std::fs::read_to_string(&out[1]).unwrap(), "hello virtual");
+        assert!(!out[0].join("broken.txt").exists(), "partial failed file was removed");
+        assert_eq!(GOOD_REL.load(Ordering::Relaxed), 1);
+        assert_eq!(BAD_REL.load(Ordering::Relaxed), 1);
+
+        let meta = std::fs::metadata(&out[1]).unwrap();
+        let mtime = meta.modified().unwrap().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+        assert_eq!(mtime, 1_577_836_800, "2020-01-01 mtime preserved");
+        if let Some(root) = out[0].parent() {
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 }

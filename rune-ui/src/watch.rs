@@ -145,22 +145,36 @@ fn flush(
     true
 }
 
+fn modified_millis(meta: &std::fs::Metadata) -> i64 {
+    let Ok(at) = meta.modified() else { return 0 };
+    match at.duration_since(std::time::UNIX_EPOCH) {
+        Ok(span) => i64::try_from(span.as_millis()).unwrap_or(i64::MAX),
+        Err(err) => {
+            let before = err.duration();
+            let ms = i64::try_from(before.as_millis())
+                .ok()
+                .and_then(|v| v.checked_neg())
+                .unwrap_or(i64::MIN);
+            if before.subsec_nanos() % 1_000_000 > 0 {
+                ms.saturating_sub(1)
+            } else {
+                ms
+            }
+        }
+    }
+}
+
 /// The identity of a folder's contents: names, sizes and modified times. A
 /// file edited in place changes its time or size but not the folder's own
 /// metadata, which is why the directory mtime alone was never enough.
 fn fingerprint(folder: &Path) -> Option<(u64, usize)> {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-    let mut rows: Vec<(String, u64, u64, bool)> = Vec::new();
+    let mut rows: Vec<(String, u64, i64, bool)> = Vec::new();
     for item in std::fs::read_dir(folder).ok()? {
         let item = item.ok()?;
         let meta = item.metadata().ok();
-        let modified = meta
-            .as_ref()
-            .and_then(|m| m.modified().ok())
-            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|span| span.as_millis() as u64)
-            .unwrap_or(0);
+        let modified = meta.as_ref().map_or(0, modified_millis);
         rows.push((
             item.file_name().to_string_lossy().into_owned(),
             meta.as_ref().map_or(0, |m| m.len()),
@@ -825,6 +839,26 @@ mod tests {
         }
         assert_eq!(names.len(), 40, "every file of the burst must land");
         assert!(notices <= 4, "40 writes were {notices} notices, not a coalesced burst");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fingerprint_distinguishes_pre_1970_mtimes() {
+        let dir = temp_dir("pre1970");
+        let file = dir.join("retro.txt");
+        {
+            let f = std::fs::File::create(&file).unwrap();
+            let t1 = std::time::UNIX_EPOCH - Duration::from_secs(86_400 * 5);
+            f.set_times(std::fs::FileTimes::new().set_modified(t1)).unwrap();
+        }
+        let fp1 = fingerprint(&dir).expect("fingerprint 1");
+        {
+            let f = std::fs::OpenOptions::new().write(true).open(&file).unwrap();
+            let t2 = std::time::UNIX_EPOCH - Duration::from_secs(86_400 * 10);
+            f.set_times(std::fs::FileTimes::new().set_modified(t2)).unwrap();
+        }
+        let fp2 = fingerprint(&dir).expect("fingerprint 2");
+        assert_ne!(fp1, fp2, "distinct pre-1970 mtimes must produce distinct fingerprints");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

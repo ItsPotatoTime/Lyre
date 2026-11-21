@@ -14,7 +14,7 @@ use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::Instant;
 
 /// Past this the list is noise; deeper matches are counted but not shown.
 const LIMIT: usize = 1000;
@@ -546,6 +546,7 @@ fn work(
             // Borrowed for valid UTF-8, which nearly every name is; the owned
             // string is only made for something that matched.
             let name = raw.to_string_lossy();
+            #[cfg(not(windows))]
             if !show_hidden && name.starts_with('.') {
                 continue;
             }
@@ -671,6 +672,7 @@ fn filter_cache(
     let mut hits = Vec::new();
     let mut matched = 0usize;
     for (dir, name, is_dir) in &cache.names {
+        #[cfg(not(windows))]
         if !show_hidden && name.starts_with('.') {
             continue;
         }
@@ -710,10 +712,12 @@ fn filter_cache(
 fn describe(name: String, path: PathBuf, is_dir: bool) -> Option<crate::Entry> {
     let meta = fs::metadata(&path).ok()?;
     let size = if is_dir { 0 } else { meta.len() };
-    let modified_at = meta.modified().ok();
+    let modified_at = meta
+        .modified()
+        .ok()
+        .and_then(crate::metadata::system_time_to_secs);
     let modified = modified_at
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| crate::format_time(d.as_secs()))
+        .map(crate::metadata::format_local_datetime)
         .unwrap_or_default();
     let kind = crate::classify(&name, is_dir);
     let (hidden, system) = {
@@ -1073,5 +1077,64 @@ mod tests {
         // Local then Done, no Batch (no recursive walk for one character).
         assert!(matches!(events.last(), Some(Event::Done { .. })));
         assert!(!events.iter().any(|e| matches!(e, Event::Batch { .. })));
+    }
+
+    #[test]
+    fn dotfiles_and_pre1970_timestamps_in_recursive_search() {
+        let dir = std::env::temp_dir().join(format!("lyre-search-dotfiles-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let dotfile = dir.join(".gitignore");
+        {
+            let f = std::fs::File::create(&dotfile).unwrap();
+            let pre1970 = std::time::UNIX_EPOCH - std::time::Duration::from_secs(86_400 * 3);
+            f.set_times(std::fs::FileTimes::new().set_modified(pre1970)).unwrap();
+        }
+        let req = Request {
+            path: dir.to_string_lossy().into_owned(),
+            local: Vec::new(),
+            query: "gitignore".into(),
+            recursive: true,
+            show_hidden: false,
+            show_protected: false,
+            cache: None,
+        };
+        let events = collect_events(&req);
+        let walked: Vec<Hit> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Batch { items, .. } => Some(items.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect();
+        let cache = events.iter().find_map(|e| match e {
+            Event::Index(c) => Some(c.clone()),
+            _ => None,
+        });
+        #[cfg(windows)]
+        {
+            assert_eq!(walked.len(), 1, "Windows does not hide dotfiles by name");
+            assert!(!walked[0].entry.modified.is_empty(), "pre-1970 mtime is formatted");
+            let cached_req = Request { cache, ..req };
+            let cached_events = collect_events(&cached_req);
+            let cached: Vec<Hit> = cached_events
+                .iter()
+                .filter_map(|e| match e {
+                    Event::Batch { items, .. } => Some(items.clone()),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            assert_eq!(cached.len(), 1, "cache also keeps dotfiles on Windows");
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = cache;
+            assert!(walked.is_empty(), "Unix skips dotfiles when show_hidden is false");
+            let described = describe(".gitignore".into(), dotfile, false).unwrap();
+            assert!(!described.modified.is_empty(), "pre-1970 mtime is formatted");
+        }
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

@@ -21,6 +21,10 @@ pub struct Details {
     pub modified: Option<u64>,
     pub created: Option<u64>,
     pub accessed: Option<u64>,
+    /// Signed seconds since the Unix epoch, supporting pre-1970 timestamps.
+    pub modified_secs: Option<i64>,
+    pub created_secs: Option<i64>,
+    pub accessed_secs: Option<i64>,
     /// Type-specific facts, in the order they should be read.
     pub extra: Vec<Fact>,
 }
@@ -44,12 +48,262 @@ impl Details {
             format!("{value:.1} {unit} ({bytes} bytes)")
         }
     }
+
+    #[allow(dead_code)]
+    pub fn modified_label(&self) -> Option<String> {
+        self.modified_secs.map(format_local_datetime)
+    }
+
+    #[allow(dead_code)]
+    pub fn created_label(&self) -> Option<String> {
+        self.created_secs.map(format_local_datetime)
+    }
+
+    #[allow(dead_code)]
+    pub fn accessed_label(&self) -> Option<String> {
+        self.accessed_secs.map(format_local_datetime)
+    }
 }
 
-fn seconds(time: std::io::Result<std::time::SystemTime>) -> Option<u64> {
-    time.ok()
-        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|since| since.as_secs())
+/// Convert a `SystemTime` to signed seconds since `UNIX_EPOCH` (flooring
+/// sub-second pre-1970 values toward negative infinity).
+pub fn system_time_to_secs(t: std::time::SystemTime) -> Option<i64> {
+    match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(since) => i64::try_from(since.as_secs()).ok(),
+        Err(err) => {
+            let before = err.duration();
+            let neg = i64::try_from(before.as_secs()).ok()?.checked_neg()?;
+            if before.subsec_nanos() > 0 {
+                neg.checked_sub(1)
+            } else {
+                Some(neg)
+            }
+        }
+    }
+}
+
+fn civil_from_days(z: i64) -> (i64, i64, i64) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = mp + if mp < 10 { 3 } else { -9 };
+    (y + if m <= 2 { 1 } else { 0 }, m, d)
+}
+
+fn utc_civil(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400) as u32;
+    let (y, m, d) = civil_from_days(days);
+    (
+        y.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
+        m as u32,
+        d as u32,
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60,
+    )
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+#[repr(C)]
+struct Tm {
+    tm_sec: std::ffi::c_int,
+    tm_min: std::ffi::c_int,
+    tm_hour: std::ffi::c_int,
+    tm_mday: std::ffi::c_int,
+    tm_mon: std::ffi::c_int,
+    tm_year: std::ffi::c_int,
+    tm_wday: std::ffi::c_int,
+    tm_yday: std::ffi::c_int,
+    tm_isdst: std::ffi::c_int,
+    tm_gmtoff: std::ffi::c_long,
+    tm_zone: *const std::ffi::c_char,
+}
+
+#[cfg(all(unix, target_pointer_width = "64"))]
+unsafe extern "C" {
+    fn localtime_r(timep: *const std::ffi::c_long, result: *mut Tm) -> *mut Tm;
+    fn mktime(tm: *mut Tm) -> std::ffi::c_long;
+}
+
+/// Convert signed Unix epoch seconds into local `(year, month, day, hour, minute, second)`.
+pub fn local_civil(secs: i64) -> (i32, u32, u32, u32, u32, u32) {
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct FileTime {
+            low: u32,
+            high: u32,
+        }
+        #[repr(C)]
+        struct SystemTimeWin {
+            year: u16,
+            month: u16,
+            day_of_week: u16,
+            day: u16,
+            hour: u16,
+            minute: u16,
+            second: u16,
+            milliseconds: u16,
+        }
+        unsafe extern "system" {
+            fn FileTimeToLocalFileTime(ft: *const FileTime, local: *mut FileTime) -> i32;
+            fn FileTimeToSystemTime(ft: *const FileTime, st: *mut SystemTimeWin) -> i32;
+        }
+        const WINDOWS_EPOCH_DIFF_SECS: i64 = 11_644_473_600;
+        if let Some(ft_secs) = secs.checked_add(WINDOWS_EPOCH_DIFF_SECS)
+            && ft_secs >= 0
+            && let Some(ticks) = (ft_secs as u64).checked_mul(10_000_000)
+        {
+            let utc = FileTime {
+                low: ticks as u32,
+                high: (ticks >> 32) as u32,
+            };
+            let mut local = FileTime { low: 0, high: 0 };
+            let mut st = SystemTimeWin {
+                year: 0,
+                month: 0,
+                day_of_week: 0,
+                day: 0,
+                hour: 0,
+                minute: 0,
+                second: 0,
+                milliseconds: 0,
+            };
+            let ok = unsafe {
+                FileTimeToLocalFileTime(&utc, &mut local) != 0
+                    && FileTimeToSystemTime(&local, &mut st) != 0
+            };
+            if ok {
+                return (
+                    st.year as i32,
+                    st.month as u32,
+                    st.day as u32,
+                    st.hour as u32,
+                    st.minute as u32,
+                    st.second as u32,
+                );
+            }
+        }
+    }
+    #[cfg(all(unix, target_pointer_width = "64"))]
+    {
+        let t = secs as std::ffi::c_long;
+        let mut out = Tm {
+            tm_sec: 0,
+            tm_min: 0,
+            tm_hour: 0,
+            tm_mday: 0,
+            tm_mon: 0,
+            tm_year: 0,
+            tm_wday: 0,
+            tm_yday: 0,
+            tm_isdst: 0,
+            tm_gmtoff: 0,
+            tm_zone: std::ptr::null(),
+        };
+        let ptr = unsafe { localtime_r(&t, &mut out) };
+        if !ptr.is_null() {
+            return (
+                out.tm_year + 1900,
+                (out.tm_mon + 1).max(1) as u32,
+                out.tm_mday.max(1) as u32,
+                out.tm_hour.clamp(0, 23) as u32,
+                out.tm_min.clamp(0, 59) as u32,
+                out.tm_sec.clamp(0, 60) as u32,
+            );
+        }
+    }
+    utc_civil(secs)
+}
+
+/// Format signed Unix epoch seconds as `YYYY-MM-DD HH:MM` in local time.
+pub fn format_local_datetime(secs: i64) -> String {
+    let (y, m, d, hh, mm, _) = local_civil(secs);
+    format!("{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}")
+}
+
+/// Format signed Unix epoch seconds as `YYYY-MM-DD` in local time.
+pub fn format_local_date(secs: i64) -> String {
+    let (y, m, d, _, _, _) = local_civil(secs);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+#[cfg(unix)]
+pub(crate) fn days_in_month(year: i64, month: u32) -> u32 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = year.rem_euclid(4) == 0
+                && (year.rem_euclid(100) != 0 || year.rem_euclid(400) == 0);
+            if leap { 29 } else { 28 }
+        }
+        _ => 0,
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn local_to_epoch_secs(
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    min: u32,
+    sec: u32,
+) -> Option<i64> {
+    if !(1..=12).contains(&month)
+        || day < 1
+        || day > days_in_month(year as i64, month)
+        || hour > 23
+        || min > 59
+        || sec > 59
+    {
+        return None;
+    }
+    #[cfg(target_pointer_width = "64")]
+    {
+        let tm_year = year.checked_sub(1900)?;
+        let mut tm = Tm {
+            tm_sec: sec as std::ffi::c_int,
+            tm_min: min as std::ffi::c_int,
+            tm_hour: hour as std::ffi::c_int,
+            tm_mday: day as std::ffi::c_int,
+            tm_mon: (month - 1) as std::ffi::c_int,
+            tm_year: tm_year as std::ffi::c_int,
+            tm_wday: -1,
+            tm_yday: 0,
+            tm_isdst: -1,
+            tm_gmtoff: 0,
+            tm_zone: std::ptr::null(),
+        };
+        let res = unsafe { mktime(&mut tm) };
+        if res == -1 && tm.tm_wday == -1 {
+            return None;
+        }
+        Some(res as i64)
+    }
+    #[cfg(not(target_pointer_width = "64"))]
+    {
+        let y = if month <= 2 { year as i64 - 1 } else { year as i64 };
+        let era = if y >= 0 { y } else { y - 399 } / 400;
+        let yoe = y - era * 400;
+        let mp = if month > 2 { month as i64 - 3 } else { month as i64 + 9 };
+        let doy = (153 * mp + 2) / 5 + day as i64 - 1;
+        let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+        let days = era * 146_097 + doe - 719_468;
+        days.checked_mul(86_400)?
+            .checked_add(hour as i64 * 3600 + min as i64 * 60 + sec as i64)
+    }
+}
+
+fn signed_seconds(time: std::io::Result<std::time::SystemTime>) -> Option<i64> {
+    time.ok().and_then(system_time_to_secs)
 }
 
 /// Read one file or folder.
@@ -71,21 +325,36 @@ pub fn describe(path: &Path, is_dir: bool, kind: &str) -> Details {
         modified: None,
         created: None,
         accessed: None,
+        modified_secs: None,
+        created_secs: None,
+        accessed_secs: None,
         extra: Vec::new(),
     };
 
-    let Ok(entry) = std::fs::metadata(path) else {
+    let Ok(entry) = std::fs::symlink_metadata(path) else {
         details
             .extra
             .push(("Status".into(), "This item can no longer be read".into()));
         return details;
     };
     details.size = entry.len();
-    details.modified = seconds(entry.modified());
-    details.created = seconds(entry.created());
-    details.accessed = seconds(entry.accessed());
+    details.modified_secs = signed_seconds(entry.modified());
+    details.created_secs = signed_seconds(entry.created());
+    details.accessed_secs = signed_seconds(entry.accessed());
+    details.modified = details.modified_secs.and_then(|s| u64::try_from(s).ok());
+    details.created = details.created_secs.and_then(|s| u64::try_from(s).ok());
+    details.accessed = details.accessed_secs.and_then(|s| u64::try_from(s).ok());
 
-    if is_dir {
+    if entry.file_type().is_symlink() {
+        if let Ok(target) = std::fs::read_link(path) {
+            details
+                .extra
+                .push(("Target".into(), target.to_string_lossy().into_owned()));
+        }
+        return details;
+    }
+
+    if is_dir || entry.is_dir() {
         details.size = 0;
         details.extra.extend(folder_facts(path));
         return details;
@@ -342,6 +611,95 @@ mod tests {
             .map(|(_, value)| value.clone())
             .unwrap_or_default();
         assert_eq!(contains, "1 file, 1 folder");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn system_time_to_secs_handles_pre_1970_and_subsec() {
+        use std::time::{Duration, UNIX_EPOCH};
+        assert_eq!(system_time_to_secs(UNIX_EPOCH), Some(0));
+        assert_eq!(system_time_to_secs(UNIX_EPOCH + Duration::new(123, 900_000_000)), Some(123));
+        assert_eq!(system_time_to_secs(UNIX_EPOCH - Duration::from_secs(1)), Some(-1));
+        assert_eq!(
+            system_time_to_secs(UNIX_EPOCH - Duration::from_millis(500)),
+            Some(-1),
+            "sub-second pre-1970 floors toward negative infinity"
+        );
+        assert_eq!(
+            system_time_to_secs(UNIX_EPOCH - Duration::new(1, 500_000_000)),
+            Some(-2)
+        );
+    }
+
+    #[test]
+    fn local_civil_and_formatters_handle_pre_1970() {
+        let (y, m, d, hh, mm, ss) = local_civil(-86_400);
+        assert!(y == 1969 && (m == 12 || m == 1) && (1..=31).contains(&d));
+        assert!(hh < 24 && mm < 60 && ss < 60);
+        let dt = format_local_datetime(-86_400);
+        assert_eq!(dt.len(), 16, "YYYY-MM-DD HH:MM: {dt}");
+        assert_eq!(&dt[4..5], "-");
+        assert_eq!(&dt[7..8], "-");
+        assert_eq!(&dt[10..11], " ");
+        assert_eq!(&dt[13..14], ":");
+        let date = format_local_date(-86_400);
+        assert_eq!(date, &dt[..10]);
+    }
+
+    #[test]
+    fn describe_preserves_pre_1970_mtime_and_handles_broken_links() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let dir = std::env::temp_dir().join(format!("lyre-meta-pre1970-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let file = dir.join("old.txt");
+        {
+            let f = std::fs::File::create(&file).unwrap();
+            let pre1970 = UNIX_EPOCH - Duration::from_secs(86_400 * 10);
+            let times = std::fs::FileTimes::new().set_modified(pre1970);
+            f.set_times(times).unwrap();
+        }
+        let details = describe(&file, false, "Text Document");
+        assert_eq!(details.modified_secs, Some(-86_400 * 10));
+        assert!(details.modified_label().is_some());
+
+        #[cfg(unix)]
+        {
+            let broken = dir.join("broken-link");
+            std::os::unix::fs::symlink(dir.join("missing"), &broken).unwrap();
+            let link_details = describe(&broken, false, "Symbolic link");
+            assert!(
+                !link_details.extra.iter().any(|(k, _)| k == "Status"),
+                "broken symlink must not fail as unreadable"
+            );
+            assert!(link_details.modified_secs.is_some());
+        }
+
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            let target = dir.join("gone_target");
+            std::fs::create_dir_all(&target).unwrap();
+            let junction = dir.join("broken-junction");
+            let out = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&junction)
+                .arg(&target)
+                .creation_flags(0x0800_0000)
+                .output()
+                .unwrap();
+            if out.status.success() {
+                std::fs::remove_dir(&target).unwrap();
+                let link_details = describe(&junction, true, "Junction");
+                assert!(
+                    !link_details.extra.iter().any(|(k, _)| k == "Status"),
+                    "broken junction must not fail as unreadable"
+                );
+                assert!(link_details.modified_secs.is_some());
+            }
+        }
+
         std::fs::remove_dir_all(&dir).ok();
     }
 }

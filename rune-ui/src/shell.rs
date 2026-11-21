@@ -695,29 +695,7 @@ mod win {
         if template.trim().is_empty() {
             return Err("That item has no command to run.".into());
         }
-        let quote = |path: &str| format!("\"{path}\"");
-        let first = paths.first().map(|path| quote(path)).unwrap_or_default();
-        let all: Vec<String> = paths.iter().map(|path| quote(path)).collect();
-        let mut line = template.to_string();
-        for token in ["%V", "%L", "%1"] {
-            // The token may be quoted already, and the quotes belong to the path.
-            let surround = format!("\"{token}\"");
-            if line.contains(&surround) {
-                line = line.replace(&surround, &first);
-            } else {
-                line = line.replace(token, &first);
-            }
-        }
-        // `%*` is the whole selection; without it a command written for one file
-        // still has to be handed the others.
-        let wanted_all = template.contains("%*");
-        line = line.replace("%*", &all.join(" "));
-        for token in ["%2", "%3", "%4", "%5", "%6", "%7", "%8", "%9"] {
-            line = line.replace(token, "");
-        }
-        if !wanted_all && paths.len() > 1 {
-            line = format!("{line} {}", all[1..].join(" "));
-        }
+        let line = super::expand_template(template, paths);
         execute("open", "cmd.exe", Some(&format!("/c {line}")))
     }
 
@@ -765,3 +743,70 @@ mod other {
 
 #[cfg(not(target_os = "windows"))]
 pub use other::{handlers, open_default, open_with_picker, run, verbs};
+
+/// Expand a shell command template against `paths` in a single left-to-right pass
+/// so `%2`..`%9` stripping and multi-token placeholders never corrupt paths that
+/// contain `%1`..`%9`, `%V`, `%L`, or `%*`.
+fn expand_template(template: &str, paths: &[String]) -> String {
+    let quote = |path: &str| format!("\"{path}\"");
+    let first = paths.first().map(|path| quote(path)).unwrap_or_default();
+    let all: Vec<String> = paths.iter().map(|path| quote(path)).collect();
+    let wanted_all = template.contains("%*");
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while !rest.is_empty() {
+        if let Some(after) = ["\"%V\"", "\"%L\"", "\"%1\""]
+            .into_iter()
+            .find_map(|tok| rest.strip_prefix(tok))
+        {
+            out.push_str(&first);
+            rest = after;
+        } else if let Some(after) = ["%V", "%L", "%1"]
+            .into_iter()
+            .find_map(|tok| rest.strip_prefix(tok))
+        {
+            out.push_str(&first);
+            rest = after;
+        } else if let Some(after) = rest.strip_prefix("%*") {
+            out.push_str(&all.join(" "));
+            rest = after;
+        } else if let Some(after) = ["%2", "%3", "%4", "%5", "%6", "%7", "%8", "%9"]
+            .into_iter()
+            .find_map(|tok| rest.strip_prefix(tok))
+        {
+            rest = after;
+        } else {
+            let ch = rest.chars().next().unwrap();
+            out.push(ch);
+            rest = &rest[ch.len_utf8()..];
+        }
+    }
+    if !wanted_all && paths.len() > 1 {
+        out.push(' ');
+        out.push_str(&all[1..].join(" "));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::expand_template;
+
+    #[test]
+    fn expand_template_preserves_percent_tokens_inside_paths() {
+        let paths = vec![
+            r"C:\docs\a%20b%2%9\file%1.txt".to_string(),
+            r"C:\docs\second%3.txt".to_string(),
+        ];
+        let cmd = expand_template(r#"tool.exe "%1" %2 %3"#, &paths);
+        assert_eq!(
+            cmd,
+            r#"tool.exe "C:\docs\a%20b%2%9\file%1.txt"   "C:\docs\second%3.txt""#
+        );
+        let all_cmd = expand_template(r#"tool.exe %* %9"#, &paths);
+        assert_eq!(
+            all_cmd,
+            r#"tool.exe "C:\docs\a%20b%2%9\file%1.txt" "C:\docs\second%3.txt" "#
+        );
+    }
+}

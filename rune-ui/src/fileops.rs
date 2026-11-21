@@ -41,6 +41,222 @@ pub struct Progress {
     pub total_bytes: u64,
 }
 
+#[cfg(windows)]
+fn win_file_id(path: &Path, follow_links: bool) -> Option<(u32, u64)> {
+    use std::ffi::c_void;
+    use std::os::windows::ffi::OsStrExt;
+
+    #[repr(C)]
+    struct ByHandleFileInformation {
+        file_attributes: u32,
+        creation_time: [u32; 2],
+        last_access_time: [u32; 2],
+        last_write_time: [u32; 2],
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn CreateFileW(
+            name: *const u16,
+            access: u32,
+            share: u32,
+            security: *mut c_void,
+            disposition: u32,
+            flags: u32,
+            template: usize,
+        ) -> usize;
+        fn GetFileInformationByHandle(handle: usize, info: *mut ByHandleFileInformation) -> i32;
+        fn CloseHandle(handle: usize) -> i32;
+    }
+
+    const INVALID_HANDLE_VALUE: usize = usize::MAX;
+    const FILE_SHARE_ALL: u32 = 0x0001 | 0x0002 | 0x0004;
+    const OPEN_EXISTING: u32 = 3;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+
+    let mut flags = FILE_FLAG_BACKUP_SEMANTICS;
+    if !follow_links {
+        flags |= FILE_FLAG_OPEN_REPARSE_POINT;
+    }
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            0,
+            FILE_SHARE_ALL,
+            std::ptr::null_mut(),
+            OPEN_EXISTING,
+            flags,
+            0,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return None;
+    }
+    let mut info = unsafe { std::mem::zeroed::<ByHandleFileInformation>() };
+    let ok = unsafe { GetFileInformationByHandle(handle, &mut info) != 0 };
+    unsafe { CloseHandle(handle) };
+    if !ok {
+        return None;
+    }
+    let index = ((info.file_index_high as u64) << 32) | (info.file_index_low as u64);
+    Some((info.volume_serial_number, index))
+}
+
+fn strip_verbatim_prefix(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let text = path.to_string_lossy();
+        if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = text.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+fn normalize_lexical(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else {
+                    out.push(comp);
+                }
+            }
+            _ => out.push(comp),
+        }
+    }
+    out
+}
+
+fn is_symlink_path(path: &Path) -> bool {
+    fs::symlink_metadata(path)
+        .map(|m| m.file_type().is_symlink())
+        .unwrap_or(false)
+}
+
+/// Resolve a path for ancestry/equality checks, canonicalizing parents (and
+/// non-symlink targets) without dereferencing a leaf symlink to its target.
+fn resolve_for_check(path: &Path) -> PathBuf {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    if !is_symlink_path(&abs)
+        && let Ok(canon) = fs::canonicalize(&abs)
+    {
+        return strip_verbatim_prefix(&canon);
+    }
+    if let (Some(parent), Some(name)) = (abs.parent(), abs.file_name()) {
+        let parent_dir = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(canon_parent) = fs::canonicalize(parent_dir) {
+            return strip_verbatim_prefix(&canon_parent).join(name);
+        }
+    }
+    strip_verbatim_prefix(&normalize_lexical(&abs))
+}
+
+/// Resolve a paste target folder, dereferencing junctions/symlinks so pasting
+/// into a junction pointing inside `src` is caught as folder-into-itself.
+fn resolve_target_for_check(target: &Path) -> PathBuf {
+    let abs = std::path::absolute(target).unwrap_or_else(|_| target.to_path_buf());
+    if let Ok(canon) = fs::canonicalize(&abs) {
+        return strip_verbatim_prefix(&canon);
+    }
+    resolve_for_check(&abs)
+}
+
+fn component_eq(a: std::path::Component<'_>, b: std::path::Component<'_>) -> bool {
+    #[cfg(windows)]
+    {
+        a.as_os_str().to_string_lossy().to_lowercase()
+            == b.as_os_str().to_string_lossy().to_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
+}
+
+fn norm_eq(a: &Path, b: &Path) -> bool {
+    let mut ca = a.components();
+    let mut cb = b.components();
+    loop {
+        match (ca.next(), cb.next()) {
+            (None, None) => return true,
+            (Some(x), Some(y)) if component_eq(x, y) => {}
+            _ => return false,
+        }
+    }
+}
+
+fn norm_starts_with(path: &Path, base: &Path) -> bool {
+    let mut cp = path.components();
+    for b in base.components() {
+        let Some(p) = cp.next() else {
+            return false;
+        };
+        if !component_eq(p, b) {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether `a` and `b` live in the same directory, differ only in letter case,
+/// and name the very same directory entry (without following symlinks).
+fn is_case_only_same_entry(a: &Path, b: &Path) -> bool {
+    let (Some(pa), Some(pb)) = (a.parent(), b.parent()) else {
+        return false;
+    };
+    let (Some(na), Some(nb)) = (a.file_name(), b.file_name()) else {
+        return false;
+    };
+    let na_str = na.to_string_lossy();
+    let nb_str = nb.to_string_lossy();
+    if na_str == nb_str || na_str.to_lowercase() != nb_str.to_lowercase() {
+        return false;
+    }
+    let pa_norm = resolve_for_check(if pa.as_os_str().is_empty() { Path::new(".") } else { pa });
+    let pb_norm = resolve_for_check(if pb.as_os_str().is_empty() { Path::new(".") } else { pb });
+    if !norm_eq(&pa_norm, &pb_norm) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        fs::symlink_metadata(a)
+            .ok()
+            .zip(fs::symlink_metadata(b).ok())
+            .is_some_and(|(x, y)| x.dev() == y.dev() && x.ino() == y.ino())
+    }
+    #[cfg(windows)]
+    {
+        win_file_id(a, false)
+            .zip(win_file_id(b, false))
+            .is_some_and(|(x, y)| x == y)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        false
+    }
+}
+
 /// Whether two paths name the same underlying file (hard link or resolved
 /// symlink), so a copy onto one of them cannot truncate the other.
 fn same_file(a: &Path, b: &Path) -> bool {
@@ -54,8 +270,12 @@ fn same_file(a: &Path, b: &Path) -> bool {
     }
     #[cfg(windows)]
     {
-        // Canonicalization resolves symlinks and junction writes; comparing
-        // the resolved paths catches a link alias on Windows too.
+        if win_file_id(a, true)
+            .zip(win_file_id(b, true))
+            .is_some_and(|(x, y)| x == y)
+        {
+            return true;
+        }
         fs::canonicalize(a)
             .ok()
             .zip(fs::canonicalize(b).ok())
@@ -75,19 +295,32 @@ fn name_of(path: &Path) -> String {
 }
 
 /// A destination that does not collide: "name (2).ext", "name (3).ext", …
+/// Folders keep dots as part of their name (`v1.2` -> `v1.2 (2)`).
 pub fn free_path(dst: &Path) -> PathBuf {
-    if !dst.exists() {
+    let is_dir = fs::symlink_metadata(dst).is_ok_and(|m| m.is_dir());
+    free_path_for(dst, is_dir)
+}
+
+/// Like `free_path`, with the caller stating whether the item is a folder.
+pub fn free_path_for(dst: &Path, is_dir: bool) -> PathBuf {
+    if fs::symlink_metadata(dst).is_err() {
         return dst.to_path_buf();
     }
-    let stem = dst.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-    let ext = dst.extension().map(|e| format!(".{}", e.to_string_lossy()));
+    let (stem, ext) = if is_dir {
+        (name_of(dst), None)
+    } else {
+        (
+            dst.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default(),
+            dst.extension().map(|e| format!(".{}", e.to_string_lossy())),
+        )
+    };
     let parent = dst.parent().map(Path::to_path_buf).unwrap_or_default();
     for n in 2..10_000 {
         let candidate = match &ext {
             Some(ext) => parent.join(format!("{stem} ({n}){ext}")),
             None => parent.join(format!("{stem} ({n})")),
         };
-        if !candidate.exists() {
+        if fs::symlink_metadata(&candidate).is_err() {
             return candidate;
         }
     }
@@ -103,7 +336,7 @@ pub fn free_path(dst: &Path) -> PathBuf {
             Some(ext) => parent.join(format!("{stem} ({n}){ext}")),
             None => parent.join(format!("{stem} ({n})")),
         };
-        if !candidate.exists() {
+        if fs::symlink_metadata(&candidate).is_err() {
             return candidate;
         }
     }
@@ -138,6 +371,48 @@ fn size_of(path: &Path, depth: usize) -> u64 {
                 .fold(0u64, |sum, e| sum.saturating_add(size_of(&e.path(), depth + 1)))
         })
         .unwrap_or(0)
+}
+
+fn apply_times(src_meta: &fs::Metadata, dst: &Path, is_dir: bool) {
+    let mut times = fs::FileTimes::new();
+    let mut any = false;
+    if let Ok(accessed) = src_meta.accessed() {
+        times = times.set_accessed(accessed);
+        any = true;
+    }
+    if let Ok(modified) = src_meta.modified() {
+        times = times.set_modified(modified);
+        any = true;
+    }
+    #[cfg(windows)]
+    if let Ok(created) = src_meta.created() {
+        use std::os::windows::fs::FileTimesExt;
+        times = times.set_created(created);
+        any = true;
+    }
+    if !any {
+        return;
+    }
+    #[cfg(windows)]
+    let handle = {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_WRITE_ATTRIBUTES: u32 = 0x0100;
+        const FILE_SHARE_ALL: u32 = 0x0001 | 0x0002 | 0x0004;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        fs::OpenOptions::new()
+            .access_mode(FILE_WRITE_ATTRIBUTES)
+            .share_mode(FILE_SHARE_ALL)
+            .custom_flags(if is_dir { FILE_FLAG_BACKUP_SEMANTICS } else { 0 })
+            .open(dst)
+    };
+    #[cfg(not(windows))]
+    let handle = {
+        let _ = is_dir;
+        fs::File::open(dst)
+    };
+    if let Ok(file) = handle {
+        let _ = file.set_times(times);
+    }
 }
 
 fn copy_item(
@@ -191,12 +466,14 @@ fn copy_at(
             }
             copy_at(&from, &to, depth + 1, cancel, report)?;
         }
+        apply_times(&meta, dst, true);
         Ok(())
     } else {
         if let Some(parent) = dst.parent() {
             let _ = fs::create_dir_all(parent);
         }
         let copied = fs::copy(src, dst).map_err(|e| format!("{}: {e}", src.display()))?;
+        apply_times(&meta, dst, false);
         report(copied);
         Ok(())
     }
@@ -209,6 +486,10 @@ fn copy_at(
 /// down rather than failing one operation.
 #[cfg(windows)]
 fn copy_link(src: &Path, dst: &Path) -> Result<(), String> {
+    use std::os::windows::fs::{MetadataExt, symlink_dir, symlink_file};
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
     let target = fs::read_link(src).map_err(|e| format!("{}: {e}", src.display()))?;
     // A junction target is resolved relative to the link's folder, not the
     // process working directory, before deciding whether it is a directory.
@@ -217,7 +498,14 @@ fn copy_link(src: &Path, dst: &Path) -> Result<(), String> {
     } else {
         src.parent().unwrap_or_else(|| Path::new(".")).join(&target)
     };
-    if absolute.is_dir() {
+    let is_dir_link = fs::symlink_metadata(src)
+        .map(|m| m.file_attributes() & 0x10 != 0)
+        .unwrap_or(false)
+        || absolute.is_dir();
+    if let Some(parent) = dst.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if is_dir_link {
         // No shell: paths go straight to mklink, so spaces, `&` and `|` in a
         // name cannot break the command or run a second one. Each argument is
         // quoted only by CreateProcess's exact-argument rule.
@@ -225,22 +513,20 @@ fn copy_link(src: &Path, dst: &Path) -> Result<(), String> {
             .args(["/C", "mklink", "/J"])
             .arg(dst)
             .arg(&absolute)
-            .status();
-        if made.is_ok_and(|status| status.success()) {
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+        if made.as_ref().is_ok_and(|out| out.status.success()) {
             return Ok(());
         }
+        symlink_dir(&target, dst)
+            .map_err(|e| format!("{}: could not recreate directory link: {e}", src.display()))
     } else {
         // A file symlink can be recreated with the Windows API without
-        // elevation; try it before giving up on the link.
-        use std::os::windows::fs::symlink_file;
-        if symlink_file(&target, dst).is_ok() {
-            return Ok(());
-        }
+        // elevation when Developer Mode is enabled; otherwise fail rather than
+        // claiming success so a cross-volume Cut never deletes the original.
+        symlink_file(&target, dst)
+            .map_err(|e| format!("{}: could not recreate link: {e}", src.display()))
     }
-    // A link this account cannot recreate is skipped, but the rest of the
-    // folder still copies — an unmakeable link must not abort the whole paste
-    // and leave a partial tree with no undo record.
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -251,7 +537,7 @@ fn copy_link(src: &Path, dst: &Path) -> Result<(), String> {
 
 #[cfg(not(any(unix, windows)))]
 fn copy_link(_src: &Path, _dst: &Path) -> Result<(), String> {
-    Ok(())
+    Err("Copying links is not supported on this system.".into())
 }
 
 /// What a delete left behind, enough to put the item back: where it came from,
@@ -327,7 +613,7 @@ fn restore_one(item: &Trashed) -> Result<(), String> {
     let (Some(trashed), Some(info)) = (item.trashed.as_ref(), item.info.as_ref()) else {
         return Err("That deletion cannot be taken back.".into());
     };
-    if item.original.exists() {
+    if fs::symlink_metadata(&item.original).is_ok() {
         return Err(format!(
             "{} is there again already.",
             item.original.display()
@@ -353,12 +639,16 @@ fn restore_one(_item: &Trashed) -> Result<(), String> {
 
 fn remove_item(path: &Path) -> Result<(), String> {
     let meta = fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    // On Windows a junction is a symlink to a directory and `is_dir()` on the
-    // symlink metadata is false; DeleteFile cannot remove a directory reparse
-    // point. Treat a link to a folder as the folder it stands for.
-    let folder_link = cfg!(windows)
-        && meta.file_type().is_symlink()
-        && fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
+    // On Windows a junction or directory symlink is a reparse point with
+    // FILE_ATTRIBUTE_DIRECTORY (0x10) set even when broken; DeleteFile cannot
+    // remove a directory reparse point, so remove_dir_all must be used.
+    #[cfg(windows)]
+    let folder_link = {
+        use std::os::windows::fs::MetadataExt;
+        meta.file_type().is_symlink() && (meta.file_attributes() & 0x10 != 0)
+    };
+    #[cfg(not(windows))]
+    let folder_link = false;
     if meta.is_dir() || folder_link {
         fs::remove_dir_all(path).map_err(|e| format!("{}: {e}", path.display()))
     } else {
@@ -452,7 +742,7 @@ fn move_item(
 /// there on Unix without a word, so an undo could land on a file that took
 /// the place since; what stands there now is never written over.
 pub fn relocate(src: &Path, dst: &Path) -> Result<(), String> {
-    if fs::symlink_metadata(dst).is_ok() {
+    if fs::symlink_metadata(dst).is_ok() && !is_case_only_same_entry(src, dst) {
         return Err(format!("{} is there already.", dst.display()));
     }
     let cancel = AtomicBool::new(false);
@@ -494,24 +784,64 @@ fn replace_backup(src: &Path) -> Result<PathBuf, String> {
     Ok(dst)
 }
 
-/// Undo a Replace: remove the copy that was put in place, then restore the old
-/// bytes to their original path.
-pub fn swap_back(item: &Replaced) -> Result<(), String> {
-    if item.target.exists() || fs::symlink_metadata(&item.target).is_ok() {
-        remove_item(&item.target)?;
+static SWAP_NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn sibling_stage_path(target: &Path, tag: &str) -> Result<PathBuf, String> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| format!("{}: missing parent directory", target.display()))?;
+    let pid = std::process::id();
+    loop {
+        let n = SWAP_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let candidate = parent.join(format!(".lyre-swap-{tag}-{pid}-{n}"));
+        if fs::symlink_metadata(&candidate).is_err() {
+            return Ok(candidate);
+        }
     }
-    // Copy, not move: both backups stay available for any number of
-    // undo/redo presses.
-    copy_item(&item.old, &item.target, &AtomicBool::new(false), &mut |_| {})
+}
+
+/// Replace `target` with a copy of `backup` without ever deleting `target`
+/// before `backup` is verified and staged alongside `target`.
+fn swap_with_backup(backup: &Path, target: &Path) -> Result<(), String> {
+    if backup.as_os_str().is_empty() || fs::symlink_metadata(backup).is_err() {
+        return Err("The backup copy for undo/redo is no longer available.".into());
+    }
+    let staged = sibling_stage_path(target, "stage")?;
+    if let Err(e) = copy_item(backup, &staged, &AtomicBool::new(false), &mut |_| {}) {
+        let _ = remove_item(&staged);
+        return Err(e);
+    }
+    if fs::symlink_metadata(target).is_ok() {
+        let aside = sibling_stage_path(target, "aside")?;
+        if let Err(e) = fs::rename(target, &aside) {
+            let _ = remove_item(&staged);
+            return Err(format!("{}: {e}", target.display()));
+        }
+        if let Err(e) = fs::rename(&staged, target) {
+            let _ = fs::rename(&aside, target);
+            let _ = remove_item(&staged);
+            return Err(format!("{}: {e}", target.display()));
+        }
+        let _ = remove_item(&aside);
+    } else if let Err(e) = fs::rename(&staged, target) {
+        let _ = remove_item(&staged);
+        return Err(format!("{}: {e}", target.display()));
+    }
+    Ok(())
+}
+
+/// Undo a Replace: restore the old bytes to `item.target` via a staged swap.
+pub fn swap_back(item: &Replaced) -> Result<(), String> {
+    swap_with_backup(&item.old, &item.target)
 }
 
 /// Redo a Replace: put the new bytes back, keeping the restored old ones for a
 /// further undo.
 pub fn swap_forward(item: &Replaced) -> Result<(), String> {
-    if item.target.exists() || fs::symlink_metadata(&item.target).is_ok() {
-        remove_item(&item.target)?;
+    if item.new.as_os_str().is_empty() {
+        return Err("The redo backup copy is not available.".into());
     }
-    copy_item(&item.new, &item.target, &AtomicBool::new(false), &mut |_| {})
+    swap_with_backup(&item.new, &item.target)
 }
 
 /// Sweep backups left behind by an earlier run. Only the current process's
@@ -543,13 +873,18 @@ fn paste_one(
 ) -> Result<PathBuf, String> {
     let name = name_of(src);
     let mut dst = target.join(&name);
+    let src_is_link = is_symlink_path(src);
+    let src_is_dir = !src_is_link && fs::metadata(src).map(|m| m.is_dir()).unwrap_or(false);
+    let src_norm = resolve_for_check(src);
+    let target_norm = resolve_target_for_check(target);
+    let initial_dst_norm = target_norm.join(&name);
     // Never paste a folder into itself.
-    if src.is_dir() && dst.starts_with(src) && dst != src {
+    if src_is_dir && !norm_eq(&initial_dst_norm, &src_norm) && norm_starts_with(&initial_dst_norm, &src_norm) {
         return Err("Cannot paste a folder into itself.".into());
     }
-    if dst.exists() {
+    if let Ok(dst_meta) = fs::symlink_metadata(&dst) {
         match conflict {
-            Conflict::Rename => dst = free_path(&dst),
+            Conflict::Rename => dst = free_path_for(&dst, src_is_dir),
             Conflict::Overwrite => {
                 // Keep the old bytes before anything is written over. The copy
                 // is separate from the destination, so a folder merge can still
@@ -557,10 +892,13 @@ fn paste_one(
                 // back. On failure the caller restores it.
                 let old = replace_backup(&dst)?;
                 replaced.push(Replaced { source: src.to_path_buf(), old, new: PathBuf::new(), target: dst.clone() });
-                // A file and a folder cannot stand in for one another in place.
-                // Everything else merges, so what is only in the destination
-                // survives and only the names in both are written over.
-                if dst.is_dir() != src.is_dir() {
+                // A file and a folder cannot stand in for one another in place,
+                // and a symlink cannot be merged into. Everything else merges,
+                // so what is only in the destination survives and only the names
+                // in both are written over.
+                let dst_is_link = dst_meta.file_type().is_symlink();
+                let dst_is_dir = !dst_is_link && dst_meta.is_dir();
+                if src_is_link || dst_is_link || dst_is_dir != src_is_dir {
                     remove_item(&dst)?;
                 }
             }
@@ -570,7 +908,8 @@ fn paste_one(
     // it empty. Compare identities, not just path text: a hard link (or a link
     // resolving to the same file) is the same item under a different name and
     // would be truncated by fs::copy.
-    if dst == src || same_file(src, &dst) {
+    let dst_norm = target_norm.join(name_of(&dst));
+    if norm_eq(&src_norm, &dst_norm) || same_file(src, &dst) {
         return Err("That item is already here.".into());
     }
     match mode {
@@ -593,24 +932,44 @@ pub fn paste<F: FnMut(Progress) -> bool>(
     // A folder and something inside it are the same operation twice: keeping
     // both made the second source vanish after the first moved, reporting a
     // false failure and recording an undo that could not cover the child.
-    // Sources nested inside an earlier source go with it; they are not
-    // separate operations to attempt once the ancestor has moved.
-    let covered: Vec<bool> = sources
+    // Order-independent check: regardless of selection order, any real ancestor
+    // directory anywhere in `sources` covers its descendants.
+    let norm_sources: Vec<(PathBuf, bool)> = sources
+        .iter()
+        .map(|src| (resolve_for_check(src), is_symlink_path(src)))
+        .collect();
+    let covered: Vec<bool> = norm_sources
         .iter()
         .enumerate()
-        .map(|(i, src)| sources[..i].iter().any(|earlier| src.starts_with(earlier)))
+        .map(|(i, (src_norm, _))| {
+            norm_sources.iter().enumerate().any(|(j, (other_norm, other_is_link))| {
+                if j == i || *other_is_link {
+                    return false;
+                }
+                if norm_eq(src_norm, other_norm) {
+                    j < i
+                } else {
+                    norm_starts_with(src_norm, other_norm)
+                }
+            })
+        })
         .collect();
-    for src in sources.iter() {
-        let dst = target.join(name_of(src));
-        if !src.is_dir() {
+    let target_norm = resolve_target_for_check(target);
+    for (i, src) in sources.iter().enumerate() {
+        if covered[i] {
             continue;
         }
+        let (src_norm, src_is_link) = &norm_sources[i];
+        if *src_is_link || !src.is_dir() {
+            continue;
+        }
+        let dst_norm = target_norm.join(name_of(src));
         // Strictly inside, where renaming the newcomer cannot rescue it.
-        if dst != *src && dst.starts_with(src) {
+        if !norm_eq(&dst_norm, src_norm) && norm_starts_with(&dst_norm, src_norm) {
             return Pasted::refused("Cannot paste a folder into itself.");
         }
         // A folder replaced by itself would be written over itself.
-        if dst == *src && conflict == Conflict::Overwrite {
+        if norm_eq(&dst_norm, src_norm) && conflict == Conflict::Overwrite {
             return Pasted::refused(if sources.len() == 1 {
                 "That item is already here."
             } else {
@@ -702,12 +1061,7 @@ pub fn paste<F: FnMut(Progress) -> bool>(
                     // Put the earlier contents back where they were. Only drop
                     // the backup once that worked — a locked child in the
                     // destination must leave the sole good copy in place.
-                    let restore = (|| -> Result<(), String> {
-                        if r.target.exists() || fs::symlink_metadata(&r.target).is_ok() {
-                            remove_item(&r.target)?;
-                        }
-                        copy_item(&r.old, &r.target, &AtomicBool::new(false), &mut |_| {})
-                    })();
+                    let restore = swap_with_backup(&r.old, &r.target);
                     match restore {
                         Ok(()) => {
                             let _ = remove_item(&r.old);
@@ -851,7 +1205,7 @@ fn check_new_name(name: &str) -> Result<(), String> {
 
 pub fn create_folder(parent: &Path, name: &str) -> Result<PathBuf, String> {
     check_new_name(name)?;
-    let path = free_path(&parent.join(name));
+    let path = free_path_for(&parent.join(name), true);
     fs::create_dir(&path).map_err(|e| format!("Could not create the folder: {e}"))?;
     Ok(path)
 }
@@ -863,18 +1217,8 @@ pub fn rename(path: &Path, new_name: &str) -> Result<PathBuf, String> {
     if target == path {
         return Ok(path.to_path_buf());
     }
-    if target.exists() {
-        // On a case-insensitive filesystem the item that exists can be this
-        // very item under another case; renaming `a.txt` to `A.txt` is a
-        // rename, not a collision.
-        let same_item = fs::canonicalize(&target)
-            .ok()
-            .zip(fs::canonicalize(path).ok())
-            .map(|(found, this)| found == this)
-            .unwrap_or(false);
-        if !same_item {
-            return Err("An item with that name already exists.".into());
-        }
+    if fs::symlink_metadata(&target).is_ok() && !is_case_only_same_entry(path, &target) {
+        return Err("An item with that name already exists.".into());
     }
     fs::rename(path, &target).map_err(|e| format!("Could not rename: {e}"))?;
     Ok(target)
@@ -893,66 +1237,137 @@ fn trash_one(path: &Path) -> Result<Trashed, String> {
 
 #[cfg(windows)]
 mod recycle {
-    use std::ffi::c_void;
     use std::fs;
     use std::os::windows::ffi::OsStrExt;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
-    #[repr(C)]
-    struct FileOperation {
-        window: isize,
-        action: u32,
-        from: *const u16,
-        to: *const u16,
-        flags: u16,
-        aborted: i32,
-        mappings: *mut c_void,
-        title: *const u16,
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetDriveTypeW(root: *const u16) -> u32;
     }
 
-    const DELETE: u32 = 3;
-    const ALLOW_UNDO: u16 = 0x0040;
-    const NO_CONFIRMATION: u16 = 0x0010;
-    const SILENT: u16 = 0x0004;
-    const NO_ERROR_UI: u16 = 0x0400;
+    fn normalize_for_shell(path: &Path) -> Result<PathBuf, String> {
+        let abs = std::path::absolute(path)
+            .map_err(|e| format!("{}: {e}", path.display()))?;
+        let text = abs.to_string_lossy().replace('/', "\\");
+        let cleaned = if let Some(rest) = text.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{rest}")
+        } else if let Some(rest) = text.strip_prefix(r"\\?\") {
+            rest.to_string()
+        } else {
+            text
+        };
+        Ok(PathBuf::from(cleaned))
+    }
 
-    #[link(name = "shell32")]
-    unsafe extern "system" {
-        fn SHFileOperationW(operation: *mut FileOperation) -> i32;
+    fn ensure_recyclable_target(path: &Path) -> Result<(), String> {
+        let text = path.to_string_lossy();
+        if text.starts_with(r"\\") {
+            return Err("Items on a network share cannot be moved to the Recycle Bin.".into());
+        }
+        let mut chars = text.chars();
+        if let (Some(drive), Some(':')) = (chars.next(), chars.next())
+            && drive.is_ascii_alphabetic()
+        {
+            let root: Vec<u16> = format!("{drive}:\\")
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let dt = unsafe { GetDriveTypeW(root.as_ptr()) };
+            const DRIVE_REMOTE: u32 = 4;
+            const DRIVE_CDROM: u32 = 5;
+            const DRIVE_RAMDISK: u32 = 6;
+            if matches!(dt, DRIVE_REMOTE | DRIVE_CDROM | DRIVE_RAMDISK) {
+                return Err(
+                    "Items on a network or read-only drive cannot be moved to the Recycle Bin."
+                        .into(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn send_with_ifo(abs_paths: &[PathBuf]) -> Result<(), String> {
+        use windows::core::PCWSTR;
+        use windows::Win32::Foundation::RPC_E_CHANGED_MODE;
+        use windows::Win32::System::Com::{
+            CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
+            CoUninitialize,
+        };
+        use windows::Win32::UI::Shell::{
+            FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT, FOFX_RECYCLEONDELETE,
+            FileOperation, IFileOperation, IShellItem, SHCreateItemFromParsingName,
+        };
+
+        struct ComGuard(bool);
+        impl Drop for ComGuard {
+            fn drop(&mut self) {
+                if self.0 {
+                    unsafe { CoUninitialize() };
+                }
+            }
+        }
+
+        let init = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        if init == RPC_E_CHANGED_MODE {
+            return std::thread::scope(|scope| {
+                scope
+                    .spawn(|| send_with_ifo(abs_paths))
+                    .join()
+                    .unwrap_or_else(|_| Err("Recycle Bin worker panicked.".into()))
+            });
+        }
+        if init.is_err() {
+            return Err(format!("Could not initialize COM for Recycle Bin ({}).", init.0));
+        }
+        let _guard = ComGuard(true);
+
+        let op: IFileOperation = unsafe { CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER) }
+            .map_err(|e| format!("Could not open Windows file operation: {e}"))?;
+        let flags =
+            FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_NOERRORUI | FOF_SILENT | FOFX_RECYCLEONDELETE;
+        unsafe { op.SetOperationFlags(flags) }
+            .map_err(|e| format!("Could not configure Recycle Bin operation: {e}"))?;
+
+        for path in abs_paths {
+            let wide: Vec<u16> = path
+                .as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect();
+            let item: IShellItem =
+                unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None) }
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+            unsafe { op.DeleteItem(&item, None) }
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+
+        unsafe { op.PerformOperations() }.map_err(|e| {
+            format!("Windows could not move the item to the Recycle Bin without permanently deleting it: {e}")
+        })?;
+        let aborted = unsafe { op.GetAnyOperationsAborted() }
+            .map(|b| b.as_bool())
+            .unwrap_or(true);
+        if aborted {
+            return Err("Windows cancelled moving the item to the Recycle Bin.".into());
+        }
+        Ok(())
     }
 
     pub fn send(paths: &[&Path]) -> Result<(), String> {
         if paths.is_empty() {
             return Ok(());
         }
-        let mut list: Vec<u16> = Vec::new();
+        let mut abs_paths = Vec::with_capacity(paths.len());
         for path in paths {
-            list.extend(path.as_os_str().encode_wide());
-            list.push(0);
+            let abs = normalize_for_shell(path)?;
+            ensure_recyclable_target(&abs)?;
+            if fs::symlink_metadata(&abs).is_err() {
+                return Err(format!("{}: does not exist", path.display()));
+            }
+            abs_paths.push(abs);
         }
-        list.push(0);
-        let mut operation = FileOperation {
-            window: 0,
-            action: DELETE,
-            from: list.as_ptr(),
-            to: std::ptr::null(),
-            flags: ALLOW_UNDO | NO_CONFIRMATION | SILENT | NO_ERROR_UI,
-            aborted: 0,
-            mappings: std::ptr::null_mut(),
-            title: std::ptr::null(),
-        };
-        let result = unsafe { SHFileOperationW(&mut operation) };
-        if result != 0 {
-            return Err(format!("Windows would not move it to the Recycle Bin (code {result})."));
-        }
-        // The shell can return success after silently skipping items (a file
-        // needing elevation, one too large for the bin). fAnyOperationsAborted
-        // is the only signal, and it was ignored, reporting skipped items as
-        // deleted with an undo record that could never be honoured.
-        if operation.aborted != 0 {
-            return Err("Windows skipped an item while moving it to the Recycle Bin.".into());
-        }
-        Ok(())
+        send_with_ifo(&abs_paths)
     }
 
     /// Put one item back where it came from, by finding its record in the bin.
@@ -1000,7 +1415,7 @@ mod recycle {
                 original.display()
             ));
         };
-        if original.exists() {
+        if fs::symlink_metadata(original).is_ok() {
             return Err(format!("{} is there again already.", original.display()));
         }
         if let Some(parent) = original.parent() {
@@ -1019,12 +1434,14 @@ mod recycle {
         pub original: std::path::PathBuf,
         pub deleted: u64,
         pub size: u64,
+        pub is_dir: bool,
     }
 
     /// Every record in every bin this account can read. The small `$I` files
     /// are parsed on a few worker threads: a full bin has thousands of them and
     /// doing it on one thread was the freeze when the place was opened.
     pub(super) fn records(drive: Option<&str>) -> Vec<Record> {
+        use std::os::windows::fs::MetadataExt;
         use std::path::PathBuf;
         let letters: Vec<char> = match drive.and_then(|d| d.chars().next()) {
             Some(letter) => vec![letter],
@@ -1057,7 +1474,18 @@ mod recycle {
                         let Some((original, deleted, size)) = super::parse_i(&data) else { continue };
                         let suffix = path.file_name().unwrap_or_default().to_string_lossy();
                         let content = path.with_file_name(format!("$R{}", &suffix[2..]));
-                        found.push(Record { info: path.clone(), content, original, deleted, size });
+                        let is_dir = fs::symlink_metadata(&content).is_ok_and(|m| {
+                            m.is_dir()
+                                || (m.file_type().is_symlink() && (m.file_attributes() & 0x10 != 0))
+                        });
+                        found.push(Record {
+                            info: path.clone(),
+                            content,
+                            original,
+                            deleted,
+                            size,
+                            is_dir,
+                        });
                     }
                     found
                 }));
@@ -1083,8 +1511,24 @@ mod recycle {
 }
 
 #[cfg(unix)]
+fn absolutize_without_following_leaf(path: &Path) -> PathBuf {
+    let abs = std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf());
+    if let (Some(parent), Some(name)) = (abs.parent(), abs.file_name()) {
+        let parent_dir = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        if let Ok(canon_parent) = fs::canonicalize(parent_dir) {
+            return canon_parent.join(name);
+        }
+    }
+    normalize_lexical(&abs)
+}
+
+#[cfg(unix)]
 fn trash_one(path: &Path) -> Result<Trashed, String> {
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::SystemTime;
 
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
@@ -1096,10 +1540,11 @@ fn trash_one(path: &Path) -> Result<Trashed, String> {
     fs::create_dir_all(&files).map_err(|e| format!("Could not reach the trash: {e}"))?;
     fs::create_dir_all(&info).map_err(|e| format!("Could not reach the trash: {e}"))?;
 
+    let meta = fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     let name = name_of(path);
-    let target = free_path(&files.join(&name));
-    let absolute = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-    let stamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let target = free_path_for(&files.join(&name), meta.is_dir());
+    let absolute = absolutize_without_following_leaf(path);
+    let stamp = crate::metadata::system_time_to_secs(SystemTime::now()).unwrap_or(0);
     let target_name = name_of(&target);
     let info_path = info.join(format!("{target_name}.trashinfo"));
     let body = format!(
@@ -1138,25 +1583,9 @@ fn percent_encode(text: &str) -> String {
 }
 
 #[cfg(unix)]
-fn trash_date(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
-    let rem = secs % 86_400;
-    let (y, m, d) = civil(days);
-    format!("{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}", rem / 3600, (rem % 3600) / 60, rem % 60)
-}
-
-#[cfg(unix)]
-fn civil(z: i64) -> (i64, i64, i64) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = mp + if mp < 10 { 3 } else { -9 };
-    (y + if m <= 2 { 1 } else { 0 }, m, d)
+fn trash_date(secs: i64) -> String {
+    let (y, m, d, hh, mm, ss) = crate::metadata::local_civil(secs);
+    format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}")
 }
 
 #[cfg(not(any(windows, unix)))]
@@ -1187,9 +1616,14 @@ pub fn bin_list() -> Vec<BinItem> {
         .into_iter()
         .filter_map(|r| {
             let when = recycle::from_filetime(r.deleted)?;
-            // No per-item metadata call: this listing is the hot path for a bin
-            // with thousands of records. Rows are files unless probed later.
-            Some(BinItem { original: r.original, when, content: r.content, info: r.info, size: r.size, is_dir: false })
+            Some(BinItem {
+                original: r.original,
+                when,
+                content: r.content,
+                info: r.info,
+                size: r.size,
+                is_dir: r.is_dir,
+            })
         })
         .collect()
 }
@@ -1228,11 +1662,12 @@ fn bin_list_in(base: &Path) -> Vec<BinItem> {
         let (Some(original), Some(when)) = (original, when) else { continue };
         let leaf = path.file_stem().unwrap_or_default().to_os_string();
         let content = files_dir.join(&leaf);
-        if !content.exists() {
+        let Ok(meta) = fs::symlink_metadata(&content) else {
             continue;
-        }
-        let size = fs::metadata(&content).map(|m| m.len()).unwrap_or(0);
-        out.push(BinItem { original, when, content, info: path, size, is_dir: false });
+        };
+        let is_dir = meta.is_dir();
+        let size = if is_dir { 0 } else { meta.len() };
+        out.push(BinItem { original, when, content, info: path, size, is_dir });
     }
     out.sort_by(|a, b| b.when.cmp(&a.when));
     out
@@ -1268,28 +1703,46 @@ fn percent_decode(text: &str) -> String {
 #[cfg(unix)]
 fn parse_trash_date(text: &str) -> Option<std::time::SystemTime> {
     use std::time::{Duration, UNIX_EPOCH};
-    let date = text.get(0..10)?;
-    let time = text.get(11..19)?;
-    let y: i64 = date.get(0..4)?.parse().ok()?;
-    let m: i64 = date.get(5..7)?.parse().ok()?;
-    let d: i64 = date.get(8..10)?.parse().ok()?;
-    let h: u64 = time.get(0..2)?.parse().ok()?;
-    let mi: u64 = time.get(3..5)?.parse().ok()?;
-    let s: u64 = time.get(6..8)?.parse().ok()?;
-    let days = days_from_civil(y, m, d);
-    let secs = (days * 86_400) as u64 + h * 3600 + mi * 60 + s;
-    Some(UNIX_EPOCH + Duration::from_secs(secs))
-}
-
-#[cfg(unix)]
-fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = if m > 2 { m - 3 } else { m + 9 };
-    let doy = (153 * mp + 2) / 5 + d - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe - 719_468
+    let bytes = text.as_bytes();
+    if bytes.len() != 19 || !text.is_ascii() {
+        return None;
+    }
+    if bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return None;
+    }
+    let digits = |slice: &str| slice.bytes().all(|b| b.is_ascii_digit());
+    let y_str = text.get(0..4)?;
+    let m_str = text.get(5..7)?;
+    let d_str = text.get(8..10)?;
+    let h_str = text.get(11..13)?;
+    let mi_str = text.get(14..16)?;
+    let s_str = text.get(17..19)?;
+    if !(digits(y_str)
+        && digits(m_str)
+        && digits(d_str)
+        && digits(h_str)
+        && digits(mi_str)
+        && digits(s_str))
+    {
+        return None;
+    }
+    let y: i32 = y_str.parse().ok()?;
+    let m: u32 = m_str.parse().ok()?;
+    let d: u32 = d_str.parse().ok()?;
+    let h: u32 = h_str.parse().ok()?;
+    let mi: u32 = mi_str.parse().ok()?;
+    let s: u32 = s_str.parse().ok()?;
+    let secs = crate::metadata::local_to_epoch_secs(y, m, d, h, mi, s)?;
+    if secs >= 0 {
+        UNIX_EPOCH.checked_add(Duration::from_secs(secs as u64))
+    } else {
+        UNIX_EPOCH.checked_sub(Duration::from_secs(secs.unsigned_abs()))
+    }
 }
 
 /// Put one bin item back where it came from.
@@ -2037,7 +2490,7 @@ mod tests {
             format!(
                 "[Trash Info]\nPath={}\nDeletionDate={}\n",
                 percent_encode(&original.to_string_lossy()),
-                trash_date(stamp)
+                trash_date(stamp as i64)
             ),
         )
         .unwrap();
@@ -2066,6 +2519,224 @@ mod tests {
         let pairs = vec![(src.clone(), dst.clone())];
         assert!(copy_again(&pairs).is_err(), "a taken destination is refused");
         assert_eq!(fs::read_to_string(&dst).unwrap(), "taken since", "and left as it was");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn swap_back_and_forward_never_delete_target_when_backup_is_missing_or_empty() {
+        let dir = scratch("swap-safe");
+        let target = dir.join("precious.txt");
+        fs::write(&target, b"keep-me").unwrap();
+
+        let empty_redo = Replaced {
+            source: dir.join("src.txt"),
+            old: dir.join("missing-old.txt"),
+            new: PathBuf::new(),
+            target: target.clone(),
+        };
+        assert!(swap_back(&empty_redo).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep-me");
+        assert!(swap_forward(&empty_redo).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep-me");
+
+        let missing_redo = Replaced {
+            source: dir.join("src.txt"),
+            old: dir.join("missing-old.txt"),
+            new: dir.join("missing-new.txt"),
+            target: target.clone(),
+        };
+        assert!(swap_forward(&missing_redo).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep-me");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn nested_selection_child_before_parent_is_not_split_on_cut() {
+        let dir = scratch("nested-reverse");
+        let folder = dir.join("folder");
+        fs::create_dir_all(&folder).unwrap();
+        let child = folder.join("child.txt");
+        fs::write(&child, b"inside").unwrap();
+        let out = dir.join("out");
+        fs::create_dir_all(&out).unwrap();
+
+        let pasted = paste(
+            Mode::Cut,
+            Conflict::Rename,
+            &[child, folder.clone()],
+            &out,
+            &AtomicBool::new(false),
+            noop,
+        );
+        assert!(pasted.error.is_none(), "paste succeeds: {:?}", pasted.error);
+        assert_eq!(pasted.landed.len(), 1, "parent covers child regardless of order");
+        assert!(out.join("folder/child.txt").exists());
+        assert!(!out.join("child.txt").exists(), "child was not split out of folder");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn free_path_and_create_folder_keep_dots_in_folder_names() {
+        let dir = scratch("dot-folder");
+        let v1 = create_folder(&dir, "v1.2").unwrap();
+        assert_eq!(v1, dir.join("v1.2"));
+        let v2 = create_folder(&dir, "v1.2").unwrap();
+        assert_eq!(v2, dir.join("v1.2 (2)"));
+        assert_eq!(free_path(&v1), dir.join("v1.2 (3)"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copy_preserves_file_and_folder_timestamps() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let dir = scratch("copy-times");
+        let src_dir = dir.join("src");
+        fs::create_dir_all(&src_dir).unwrap();
+        let src_file = src_dir.join("retro.txt");
+        let pre1970 = UNIX_EPOCH - Duration::from_secs(86_400 * 5);
+        {
+            let f = fs::File::create(&src_file).unwrap();
+            f.set_times(fs::FileTimes::new().set_modified(pre1970)).unwrap();
+        }
+        let dir_mtime = UNIX_EPOCH + Duration::from_secs(1_577_836_800);
+        apply_times(
+            &{
+                let f = fs::File::create(dir.join("stamp_ref")).unwrap();
+                f.set_times(fs::FileTimes::new().set_modified(dir_mtime)).unwrap();
+                fs::metadata(dir.join("stamp_ref")).unwrap()
+            },
+            &src_dir,
+            true,
+        );
+
+        let out = dir.join("out");
+        fs::create_dir_all(&out).unwrap();
+        let pasted = paste(
+            Mode::Copy,
+            Conflict::Rename,
+            std::slice::from_ref(&src_dir),
+            &out,
+            &AtomicBool::new(false),
+            noop,
+        );
+        assert!(pasted.error.is_none(), "{:?}", pasted.error);
+        let copied_file_mtime = fs::metadata(out.join("src/retro.txt")).unwrap().modified().unwrap();
+        assert_eq!(copied_file_mtime, pre1970);
+        let copied_dir_mtime = fs::metadata(out.join("src")).unwrap().modified().unwrap();
+        assert_eq!(copied_dir_mtime, dir_mtime);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_case_only_rename_and_relocate_and_junction_guards() {
+        use std::os::windows::process::CommandExt;
+        let dir = scratch("win-case-junc");
+
+        // Case-only rename + undo relocate
+        let lower = dir.join("alpha.txt");
+        fs::write(&lower, b"data").unwrap();
+        let upper = rename(&lower, "Alpha.txt").unwrap();
+        assert_eq!(upper.file_name().unwrap(), "Alpha.txt");
+        relocate(&upper, &lower).expect("case-only relocate succeeds for Undo::Rename");
+        assert_eq!(fs::read_to_string(&lower).unwrap(), "data");
+
+        // Folder into itself with case difference + via junction
+        let parent = dir.join("MyFolder");
+        let sub = parent.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let lower_sub = PathBuf::from(sub.to_string_lossy().to_lowercase());
+        let self_paste = paste(
+            Mode::Copy,
+            Conflict::Rename,
+            std::slice::from_ref(&parent),
+            &lower_sub,
+            &AtomicBool::new(false),
+            noop,
+        );
+        assert_eq!(self_paste.error.as_deref(), Some("Cannot paste a folder into itself."));
+
+        let junction = dir.join("junc");
+        let mk = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&junction)
+            .arg(&sub)
+            .creation_flags(0x0800_0000)
+            .output()
+            .unwrap();
+        if mk.status.success() {
+            let via_junc = paste(
+                Mode::Copy,
+                Conflict::Rename,
+                std::slice::from_ref(&parent),
+                &junction,
+                &AtomicBool::new(false),
+                noop,
+            );
+            assert_eq!(via_junc.error.as_deref(), Some("Cannot paste a folder into itself."));
+
+            // Broken junction removal
+            fs::remove_dir_all(&sub).unwrap();
+            assert!(fs::symlink_metadata(&junction).is_ok());
+            remove_item(&junction).expect("broken junction removes cleanly");
+            assert!(fs::symlink_metadata(&junction).is_err());
+        }
+
+        // Network UNC path refused by recycle::send
+        let unc = PathBuf::from(r"\\127.0.0.1\nonexistent_share\file.txt");
+        assert!(recycle::send(&[&unc]).is_err());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_trash_broken_symlink_and_pre1970_trashinfo_do_not_panic() {
+        let dir = scratch("unix-trash");
+        let link = dir.join("broken-link");
+        std::os::unix::fs::symlink(dir.join("missing"), &link).unwrap();
+
+        // Absolutize does not follow leaf symlink
+        let abs = absolutize_without_following_leaf(&link);
+        assert_eq!(abs.file_name().unwrap(), "broken-link");
+
+        // free_path and rename see broken symlinks
+        assert_ne!(free_path(&link), link);
+        assert!(rename(&dir.join("other"), "broken-link").is_err());
+
+        // parse_trash_date handles pre-1970 and malformed dates without panicking
+        assert!(parse_trash_date("1969-12-31T23:59:59").is_some());
+        assert!(parse_trash_date("1970-01-01 00:00:00").is_none());
+        assert!(parse_trash_date("2024-02-30T12:00:00").is_none());
+        assert!(parse_trash_date("9999-13-01T00:00:00").is_none());
+        assert!(parse_trash_date("+202-01-01T00:00:00").is_none());
+
+        // bin_list_in lists broken symlinks and folder is_dir accurately
+        let base = dir.join("xdg");
+        let info = base.join("Trash/info");
+        let files = base.join("Trash/files");
+        fs::create_dir_all(&info).unwrap();
+        fs::create_dir_all(&files).unwrap();
+        std::os::unix::fs::symlink(dir.join("missing"), files.join("broken-link")).unwrap();
+        fs::write(
+            info.join("broken-link.trashinfo"),
+            "[Trash Info]\nPath=/tmp/broken-link\nDeletionDate=1969-12-31T23:59:59\n",
+        )
+        .unwrap();
+        fs::create_dir_all(files.join("folder")).unwrap();
+        fs::write(
+            info.join("folder.trashinfo"),
+            "[Trash Info]\nPath=/tmp/folder\nDeletionDate=2024-01-01T12:00:00\n",
+        )
+        .unwrap();
+
+        let items = bin_list_in(&base);
+        assert_eq!(items.len(), 2);
+        let folder_item = items.iter().find(|i| i.original == Path::new("/tmp/folder")).unwrap();
+        assert!(folder_item.is_dir);
+        assert!(items.iter().any(|i| i.original == Path::new("/tmp/broken-link")));
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

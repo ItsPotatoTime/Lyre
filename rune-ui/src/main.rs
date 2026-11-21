@@ -23,7 +23,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::Instant;
 
 use rune::color::hex;
 use rune::{
@@ -319,8 +319,8 @@ pub(crate) struct Entry {
     is_dir: bool,
     size: u64,
     modified: String,
-    /// The raw modified time, for sorting and grouping a photo library.
-    modified_at: Option<std::time::SystemTime>,
+    /// The raw modified time (Unix seconds, signed for pre-1970), for sorting and grouping.
+    modified_at: Option<i64>,
     type_label: String,
     kind: Kind,
     /// The hidden attribute (a dotfile on Unix); `system` marks protected OS
@@ -466,7 +466,7 @@ enum DropMenu {
     Subfolders,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum CtxScope {
     Item,
     Background,
@@ -580,6 +580,8 @@ struct IconDone {
 /// default manager, update, or which application opens a file.
 enum Dialog {
     Delete { permanent: bool, paths: Vec<PathBuf> },
+    BinDelete { item: fileops::BinItem },
+    BinEmpty,
     PasteConflict { mode: fileops::Mode, sources: Vec<PathBuf>, target: PathBuf },
     Rename { path: PathBuf, edit: TextEdit },
     NewFolder { parent: PathBuf, edit: TextEdit },
@@ -623,6 +625,7 @@ fn drain_osdrop(s: &mut App, tx: &mut Tx) -> bool {
     }
     let any = !msgs.is_empty();
     let mut hover = None;
+    let mut end = false;
     for m in msgs {
         match m {
             osdrag::OsDragMsg::Drop(m) => {
@@ -639,6 +642,7 @@ fn drain_osdrop(s: &mut App, tx: &mut Tx) -> bool {
             // Only the last hover of the frame matters, and a drop ends the
             // session with a leave, so the last word after a drop is always off.
             osdrag::OsDragMsg::Hover(at) => hover = Some(at),
+            osdrag::OsDragMsg::End => end = true,
         }
     }
     if let Some(at) = hover {
@@ -655,6 +659,10 @@ fn drain_osdrop(s: &mut App, tx: &mut Tx) -> bool {
                 });
             }
         }
+    }
+    if end {
+        s.os_drag = None;
+        s.os_hover = None;
     }
     any
 }
@@ -779,6 +787,9 @@ fn os_drag_source(el: El, ei: usize) -> El {
     })
     .on_drag_end(|s: &mut App, _outcome, _tx: &mut Tx| s.os_drag = None)
     .on_drop_files(move |s: &mut App, files, tx: &mut Tx| {
+        if !matches!(s.view, View::Files | View::Gallery) {
+            return;
+        }
         let target = if s.searching {
             s.search_hits
                 .get(ei)
@@ -1176,8 +1187,13 @@ fn switch_tab(s: &mut App, index: usize) {
     // A search belongs to the tab that started it: its hits are that folder's
     // names, and drawing them under the arriving tab would show the wrong list.
     clear_search(s);
+    s.search_edit.text.clear();
+    s.search_edit.focused = false;
+    close_dialog(s);
+    s.pending_refresh = None;
     s.menu = None;
     s.marquee = None;
+    s.marquee_rects.borrow_mut().clear();
     s.address_edit = None;
     // A gesture in flight was aimed at the tab being left, so it cannot carry
     // over: a drag released after the switch would paste into the new folder.
@@ -1196,12 +1212,17 @@ fn reset_tab_quick_access(s: &mut App) {
     s.tab = "Quick Access".into();
     s.crumbs = vec!["Quick Access".into()];
     s.search = "Search Quick Access".into();
+    s.search_edit.text.clear();
+    s.search_edit.focused = false;
     s.contextual = false;
     s.groups.clear();
-    clear_selection(s);
+    clear_search(s);
+    close_dialog(s);
+    s.pending_refresh = None;
     s.notice.clear();
     s.menu = None;
     s.marquee = None;
+    s.marquee_rects.borrow_mut().clear();
     s.history.clear();
     s.forward.clear();
     s.keep_order = true;
@@ -1236,11 +1257,18 @@ fn close_tab_at(s: &mut App, index: usize) {
     }
     let tab = s.tabs[s.active_tab].clone();
     restore_tab(s, &tab);
+    clear_search(s);
+    s.search_edit.text.clear();
+    s.search_edit.focused = false;
+    close_dialog(s);
+    s.pending_refresh = None;
     s.menu = None;
     s.address_edit = None;
     s.drag = None;
     s.drag_press = None;
     s.os_hover = None;
+    s.marquee = None;
+    s.marquee_rects.borrow_mut().clear();
     rescan_restored(s);
 }
 
@@ -1260,26 +1288,11 @@ pub(crate) fn format_size(n: u64) -> String {
     }
 }
 
-fn civil_from_days(z: i64) -> (i64, i64, i64) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = mp + if mp < 10 { 3 } else { -9 };
-    (y + if m <= 2 { 1 } else { 0 }, m, d)
-}
-
-fn format_time(secs: u64) -> String {
-    let (y, m, d) = civil_from_days((secs / 86_400) as i64);
-    let within = secs % 86_400;
-    let h = within / 3600;
+fn format_time(secs: i64) -> String {
+    let (y, m, d, h, mm, _) = metadata::local_civil(secs);
     let ampm = if h >= 12 { "PM" } else { "AM" };
     let h12 = if h % 12 == 0 { 12 } else { h % 12 };
-    format!("{m}/{d}/{y}  {h12}:{:02} {ampm}", (within % 3600) / 60)
+    format!("{m}/{d}/{y}  {h12}:{mm:02} {ampm}")
 }
 
 /// Scan a folder with nothing able to stop it. Used where there is nobody to
@@ -1376,11 +1389,8 @@ pub(crate) fn scan_until(
             let path = item.path();
             let Ok(meta) = item.metadata() else { continue };
             let is_dir = entry_is_dir(&path, &meta);
-            let modified_at = meta.modified().ok();
-            let modified = modified_at
-                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                .map(|d| format_time(d.as_secs()))
-                .unwrap_or_default();
+            let modified_at = meta.modified().ok().and_then(metadata::system_time_to_secs);
+            let modified = modified_at.map(format_time).unwrap_or_default();
             let kind = classify(&name, is_dir);
             let (hidden, system) = {
                 #[cfg(windows)]
@@ -1853,7 +1863,19 @@ fn record_recent(s: &mut App, path: &str) {
 
 /// Rebuild the Recent rows from the remembered paths, dropping any that have
 /// since disappeared.
+fn remap_selection_by_path(s: &mut App, selected: &[String], focused: Option<&str>, anchor: Option<&str>) {
+    let index_of = |p: &str| s.entries.iter().position(|e| e.path == p);
+    s.selected = selected.iter().filter_map(|p| index_of(p)).collect();
+    s.focused = focused.and_then(index_of);
+    s.anchor = anchor.and_then(index_of);
+    update_selection_detail(s);
+}
+
 fn refresh_recent(s: &mut App) {
+    let path_of = |i: usize| s.entries.get(i).map(|e| e.path.clone());
+    let sel_paths: Vec<String> = s.selected.iter().filter_map(|&i| path_of(i)).collect();
+    let foc_path = s.focused.and_then(path_of);
+    let anc_path = s.anchor.and_then(path_of);
     let mut entries = Vec::new();
     for path in s.recent.clone() {
         let Ok(meta) = fs::metadata(&path) else { continue };
@@ -1865,11 +1887,8 @@ fn refresh_recent(s: &mut App) {
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path.clone());
         let kind = classify(&name, false);
-        let modified_at = meta.modified().ok();
-        let modified = modified_at
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| format_time(d.as_secs()))
-            .unwrap_or_default();
+        let modified_at = meta.modified().ok().and_then(metadata::system_time_to_secs);
+        let modified = modified_at.map(format_time).unwrap_or_default();
         entries.push(Entry {
             name,
             path,
@@ -1888,6 +1907,12 @@ fn refresh_recent(s: &mut App) {
     s.count = entries.len();
     s.entries = entries;
     s.visible = (0..s.entries.len()).collect();
+    s.marquee_rects.borrow_mut().clear();
+    if s.view == View::QuickAccess && s.quick_access_tab == 0 {
+        remap_selection_by_path(s, &sel_paths, foc_path.as_deref(), anc_path.as_deref());
+    } else {
+        clear_selection(s);
+    }
 }
 
 fn toggle_pin(s: &mut App, path: &str) {
@@ -2013,22 +2038,48 @@ fn refresh_visible(s: &mut App) {
     if s.keep_order {
         // authored groups already set by the fixture
     } else if s.group_by_date && s.view == View::Files {
-        // Newest first, so today leads and the days run backwards, as Explorer
-        // groups them. Same key as the sort above: the timestamp, not its text.
-        order.sort_by(|&a, &b| s.entries[b].modified_at.cmp(&s.entries[a].modified_at));
-        order.sort_by(|&a, &b| s.entries[b].is_dir.cmp(&s.entries[a].is_dir));
+        let day_key = |e: &Entry| -> String {
+            if let Some(secs) = e.modified_at {
+                metadata::format_local_date(secs)
+            } else {
+                let tok = e.modified.split_whitespace().next().unwrap_or("");
+                if tok.is_empty() {
+                    "Unknown date".to_string()
+                } else {
+                    tok.to_string()
+                }
+            }
+        };
+        // Newest day first so same-day folders and files share one group header
+        // (folders still lead within a day), and undated entries sit together
+        // at the end under "Unknown date".
+        order.sort_by(|&a, &b| {
+            let ea = &s.entries[a];
+            let eb = &s.entries[b];
+            match (ea.modified_at, eb.modified_at) {
+                (Some(sa), Some(sb)) => {
+                    let da = metadata::format_local_date(sa);
+                    let db = metadata::format_local_date(sb);
+                    db.cmp(&da)
+                        .then_with(|| eb.is_dir.cmp(&ea.is_dir))
+                        .then_with(|| sb.cmp(&sa))
+                        .then_with(|| ea.name.to_lowercase().cmp(&eb.name.to_lowercase()))
+                }
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => eb
+                    .is_dir
+                    .cmp(&ea.is_dir)
+                    .then_with(|| ea.name.to_lowercase().cmp(&eb.name.to_lowercase())),
+            }
+        });
         let mut groups: Vec<(usize, String)> = Vec::new();
-        let mut last = String::new();
+        let mut last: Option<String> = None;
         for (i, &ei) in order.iter().enumerate() {
-            let day = s.entries[ei]
-                .modified
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .to_string();
-            if day != last {
+            let day = day_key(&s.entries[ei]);
+            if last.as_ref() != Some(&day) {
                 groups.push((i, day.clone()));
-                last = day;
+                last = Some(day);
             }
         }
         s.groups = groups;
@@ -2039,6 +2090,10 @@ fn refresh_visible(s: &mut App) {
     s.visible = order;
 }
 
+fn is_headless() -> bool {
+    std::env::args().any(|a| a == "--snap" || a == "--scene")
+}
+
 /// Rune calls this before each frame. Search edits land in `TextEdit` through
 /// `on_edit`, which only binds the field, so the row order is recomputed here.
 fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
@@ -2047,10 +2102,12 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
     // run here: inside this callback winit buffers every redraw, and OLE's
     // modal loop would freeze the window for the whole drag.
     #[cfg(target_os = "windows")]
-    if let Some((paths, preview)) = s.pending_os_drag.take()
-        && let Some(hwnd) = frame::hwnd()
-    {
-        osdrag::win::request_start(hwnd, paths, preview);
+    if let Some((paths, preview)) = s.pending_os_drag.take() {
+        if let Some(hwnd) = frame::hwnd() {
+            osdrag::win::request_start(hwnd, paths, preview);
+        } else {
+            s.os_drag = None;
+        }
     }
     // The mouse's side buttons walk the same history as Alt+Left and Alt+Right.
     // `poll` runs before the frame is drawn, so the change is on screen already,
@@ -2094,10 +2151,13 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
     } else {
         s.window_pending = None;
     }
-    let sig = prefs_signature(s);
-    if sig != s.prefs_sig {
-        persist(s);
-        s.prefs_sig = sig;
+    let headless = is_headless();
+    if !headless {
+        let sig = prefs_signature(s);
+        if sig != s.prefs_sig {
+            persist(s);
+            s.prefs_sig = sig;
+        }
     }
     // Once at launch, unless this is a headless scene render: check quietly for
     // a newer build, and offer to take over folder opening until the person
@@ -2105,7 +2165,6 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
     // off-thread and the offer only appears where it is actually possible.
     if !s.startup_check_done {
         s.startup_check_done = true;
-        let headless = std::env::args().any(|a| a == "--snap" || a == "--scene");
         if !headless {
             if s.update_check_startup {
                 start_update_check(s, true);
@@ -2416,6 +2475,8 @@ fn set_location(s: &mut App, path: PathBuf) {
     s.drag = None;
     s.drag_press = None;
     s.os_hover = None;
+    s.marquee = None;
+    s.marquee_rects.borrow_mut().clear();
     let crumbs: Vec<String> = path
         .components()
         .map(|part| part.as_os_str().to_string_lossy().into_owned())
@@ -2546,6 +2607,8 @@ fn spawn_bin_scan(s: &mut App) {
     s.entries.clear();
     s.bin_items.clear();
     s.visible.clear();
+    clear_selection(s);
+    s.marquee_rects.borrow_mut().clear();
     s.count = 0;
     s.notice = "Reading the Recycle Bin…".into();
     let (tx, rx) = std::sync::mpsc::channel();
@@ -2562,6 +2625,10 @@ fn spawn_bin_scan(s: &mut App) {
 
 /// Rebuild the bin listing from a scan answered on the worker thread.
 fn apply_bin_items(s: &mut App, items: Vec<fileops::BinItem>) {
+    let path_of = |i: usize| s.entries.get(i).map(|e| e.path.clone());
+    let sel_paths: Vec<String> = s.selected.iter().filter_map(|&i| path_of(i)).collect();
+    let foc_path = s.focused.and_then(path_of);
+    let anc_path = s.anchor.and_then(path_of);
     let mut entries = Vec::with_capacity(items.len());
     for item in &items {
         let name = Path::new(&item.original)
@@ -2570,11 +2637,8 @@ fn apply_bin_items(s: &mut App, items: Vec<fileops::BinItem>) {
             .unwrap_or_else(|| item.original.to_string_lossy().into_owned());
         let is_dir = item.is_dir;
         let kind = classify(&name, is_dir);
-        let modified_at = Some(item.when);
-        let modified = modified_at
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| format_time(d.as_secs()))
-            .unwrap_or_default();
+        let modified_at = metadata::system_time_to_secs(item.when);
+        let modified = modified_at.map(format_time).unwrap_or_default();
         entries.push(Entry {
             name,
             path: item.content.to_string_lossy().into_owned(),
@@ -2595,6 +2659,8 @@ fn apply_bin_items(s: &mut App, items: Vec<fileops::BinItem>) {
     s.bin_items = items;
     s.visible = (0..s.entries.len()).collect();
     s.groups.clear();
+    s.marquee_rects.borrow_mut().clear();
+    remap_selection_by_path(s, &sel_paths, foc_path.as_deref(), anc_path.as_deref());
 }
 
 /// Step back, reporting whether the window has something new to draw: `poll`
@@ -2692,6 +2758,8 @@ fn load(s: &mut App, f: Fixture) {
     s.drag = None;
     s.drag_press = None;
     s.os_hover = None;
+    s.marquee = None;
+    s.marquee_rects.borrow_mut().clear();
     s.contextual = false;
     clear_selection(s);
     s.notice.clear();
@@ -3110,6 +3178,7 @@ fn init() -> App {
     refresh_visible(&mut app);
     app.tabs = vec![capture_tab(&app)];
     app.active_tab = 0;
+    app.prefs_sig = prefs_signature(&app);
     timing("init total", started);
     app
 }
@@ -4325,15 +4394,28 @@ fn tab_pressed(s: &mut App, index: usize, alt: bool) {
     }
 }
 
+fn tab_index_from_path(s: &App, path: &str) -> Option<usize> {
+    for seg in path.rsplit('/') {
+        let idx = seg
+            .strip_prefix("tab-close-")
+            .or_else(|| seg.strip_prefix("tab-"))
+            .and_then(|n| n.parse::<usize>().ok());
+        if let Some(i) = idx.filter(|&i| i < s.tabs.len()) {
+            return Some(i);
+        }
+    }
+    None
+}
+
 /// Close the tab a press landed on, from the key path of the element under it.
 /// True when a tab was there to close.
 fn close_tab_at_path(s: &mut App, path: &str) -> bool {
-    match parse_drop_target(s, path).1 {
-        Some(DropTarget::Tab(index)) => {
+    match tab_index_from_path(s, path) {
+        Some(index) => {
             close_tab_at(s, index);
             true
         }
-        _ => false,
+        None => false,
     }
 }
 
@@ -5133,6 +5215,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                             menu_item(p, label, leading, None, false).on_press(move |s: &mut App| {
                                 s.sort = k;
                                 s.keep_order = false;
+                                s.marquee_rects.borrow_mut().clear();
                                 refresh_visible(s);
                                 s.menu = None;
                             }),
@@ -5147,6 +5230,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                             menu_item(p, label, leading, None, false).on_press(move |s: &mut App| {
                                 s.sort_desc = desc;
                                 s.keep_order = false;
+                                s.marquee_rects.borrow_mut().clear();
                                 refresh_visible(s);
                                 s.menu = None;
                             }),
@@ -5160,6 +5244,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                         menu_item(p, "Group by date", g.then_some(Ico::Check), None, false).on_press(
                             move |s: &mut App| {
                                 s.group_by_date = !g;
+                                s.marquee_rects.borrow_mut().clear();
                                 refresh_visible(s);
                                 s.menu = None;
                             },
@@ -5179,6 +5264,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                             menu_item(p, label, leading, None, false)
                                 .on_press(move |s: &mut App| {
                                     s.mode = m;
+                                    s.marquee_rects.borrow_mut().clear();
                                     s.menu = None;
                                 }),
                         );
@@ -5191,6 +5277,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                         menu_item(p, "Compact view", c.then_some(Ico::Check), None, false).on_press(
                             move |s: &mut App| {
                                 s.compact = !c;
+                                s.marquee_rects.borrow_mut().clear();
                                 s.menu = None;
                             },
                         ),
@@ -5203,6 +5290,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                         menu_item(p, "Show hidden items", sh.then_some(Ico::Check), None, false)
                             .on_press(move |s: &mut App| {
                                 s.show_hidden = !sh;
+                                s.marquee_rects.borrow_mut().clear();
                                 refresh_visible(s);
                                 s.menu = None;
                             }),
@@ -5223,6 +5311,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                             menu_item(p, "Show protected OS files", sp.then_some(Ico::Check), None, false)
                                 .on_press(move |s: &mut App| {
                                     s.show_protected = !sp;
+                                    s.marquee_rects.borrow_mut().clear();
                                     refresh_visible(s);
                                     s.menu = None;
                                 }),
@@ -5264,6 +5353,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                         rows.push(
                             menu_item(p, f.label(), leading, None, false).on_press(move |s: &mut App| {
                                 s.filter = f;
+                                s.marquee_rects.borrow_mut().clear();
                                 refresh_visible(s);
                                 s.menu = None;
                             }),
@@ -5304,7 +5394,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                     rows.push(
                         menu_item(p, "Select all", None, Some("Ctrl+A"), false).on_press(
                             |s: &mut App| {
-                                s.notice = "Select all arrives with multi-selection".into();
+                                select_all(s);
                                 s.menu = None;
                             },
                         ),
@@ -5313,9 +5403,15 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                     let path = s
                         .selected
                         .first()
-                        .map(|&i| entry_by_index(s, i).path.clone())
+                        .and_then(|&i| {
+                            if s.searching {
+                                s.search_hits.get(i).map(|h| h.entry.path.clone())
+                            } else {
+                                s.entries.get(i).map(|e| e.path.clone())
+                            }
+                        })
                         .unwrap_or_default();
-                    let has_sel = !s.selected.is_empty();
+                    let has_sel = !path.is_empty();
                     let copy = path.clone();
                     rows.push(
                         menu_item(p, "Copy path", None, None, !has_sel).on_press_tx(
@@ -5449,13 +5545,8 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                             rows.push(
                                 menu_item(p, "Delete permanently", Some(Ico::Delete), None, false)
                                     .on_press(move |s: &mut App| {
-                                        match fileops::bin_delete_forever(&victim) {
-                                            Ok(()) => s.notice = "Deleted permanently".into(),
-                                            Err(e) => s.notice = e,
-                                        }
-                                        s.bin_cache = None;
-                                        spawn_bin_scan(s);
                                         s.menu = None;
+                                        open_dialog(s, Dialog::BinDelete { item: victim.clone() });
                                     }),
                             );
                         h += MENU_ROW_H;
@@ -5535,6 +5626,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                         );
                         h += MENU_ROW_H;
                     }
+                    let actionable = entries_actionable(s);
                     for (id, label, icon) in [
                         ("rename", "Rename", Ico::Rename),
                         ("cut", "Cut", Ico::Cut),
@@ -5543,7 +5635,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                     ] {
                         if menu_visible(s, id) {
                             rows.push(
-                                menu_item(p, label, Some(icon), None, false).on_press(move |s: &mut App| {
+                                menu_item(p, label, Some(icon), None, !actionable).on_press(move |s: &mut App| {
                                     match id {
                                         "rename" => begin_rename(s),
                                         "cut" => {
@@ -5605,13 +5697,8 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                         rows.push(
                             menu_item(p, "Empty Recycle Bin", Some(Ico::Delete), None, s.bin_items.is_empty())
                                 .on_press(|s: &mut App| {
-                                    match fileops::bin_empty() {
-                                        Ok(()) => s.notice = "Recycle Bin emptied".into(),
-                                        Err(e) => s.notice = e,
-                                    }
-                                    s.bin_cache = None;
-                                    spawn_bin_scan(s);
                                     s.menu = None;
+                                    open_dialog(s, Dialog::BinEmpty);
                                 }),
                         );
                         h += MENU_ROW_H;
@@ -5640,6 +5727,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                             menu_item(p, label, leading, None, false).on_press(move |s: &mut App| {
                                 s.sort = k;
                                 s.keep_order = false;
+                                s.marquee_rects.borrow_mut().clear();
                                 refresh_visible(s);
                                 s.menu = None;
                             }),
@@ -5655,6 +5743,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                         rows.push(
                             menu_item(p, label, leading, None, false).on_press(move |s: &mut App| {
                                 s.mode = m;
+                                s.marquee_rects.borrow_mut().clear();
                                 s.menu = None;
                             }),
                         );
@@ -5674,7 +5763,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                     if menu_visible(s, "select-all") {
                         rows.push(
                             menu_item(p, "Select all", None, Some("Ctrl+A"), false).on_press(|s: &mut App| {
-                                s.notice = "Select all arrives with multi-selection".into();
+                                select_all(s);
                                 s.menu = None;
                             }),
                         );
@@ -6439,11 +6528,20 @@ enum DialogButton {
     Close,
 }
 
+fn close_dialog(s: &mut App) {
+    if matches!(s.dialog.take(), Some(Dialog::PasteConflict { .. })) && s.op_rx.is_none() {
+        let staged = std::mem::take(&mut s.drop_staged);
+        osdrag::release(&staged);
+    }
+}
+
 /// The buttons of `dialog`, in the order they are drawn and walked. A dialog's
 /// buttons depend only on the dialog itself, so the row and the keyboard agree.
 fn dialog_buttons(dialog: Option<&Dialog>) -> Vec<DialogButton> {
     match dialog {
         Some(Dialog::Delete { .. })
+        | Some(Dialog::BinDelete { .. })
+        | Some(Dialog::BinEmpty)
         | Some(Dialog::Rename { .. })
         | Some(Dialog::NewFolder { .. }) => vec![DialogButton::Cancel, DialogButton::Confirm],
         Some(Dialog::PasteConflict { .. }) => {
@@ -6473,7 +6571,9 @@ fn dialog_button_label(s: &App, button: DialogButton) -> String {
     match button {
         DialogButton::Cancel => "Cancel".into(),
         DialogButton::Confirm => match s.dialog.as_ref() {
-            Some(Dialog::Delete { permanent: true, .. }) => "Delete permanently".into(),
+            Some(Dialog::Delete { permanent: true, .. })
+            | Some(Dialog::BinDelete { .. }) => "Delete permanently".into(),
+            Some(Dialog::BinEmpty) => "Empty Recycle Bin".into(),
             Some(Dialog::Delete { .. }) => "Delete".into(),
             Some(Dialog::NewFolder { .. }) => "Create".into(),
             _ => "OK".into(),
@@ -6529,12 +6629,30 @@ fn press_dialog_button(s: &mut App, button: DialogButton) {
             if matches!(s.dialog, Some(Dialog::Update)) && s.update_busy {
                 return;
             }
-            s.dialog = None;
+            close_dialog(s);
         }
         DialogButton::Confirm => match s.dialog.as_ref() {
             Some(Dialog::Delete { .. }) => {
                 let Some(Dialog::Delete { permanent, paths }) = s.dialog.take() else { return };
                 start_delete(s, if permanent { fileops::DeleteMode::Permanent } else { fileops::DeleteMode::Trash }, paths);
+            }
+            Some(Dialog::BinDelete { .. }) => {
+                let Some(Dialog::BinDelete { item }) = s.dialog.take() else { return };
+                match fileops::bin_delete_forever(&item) {
+                    Ok(()) => s.notice = "Deleted permanently".into(),
+                    Err(e) => s.notice = e,
+                }
+                s.bin_cache = None;
+                spawn_bin_scan(s);
+            }
+            Some(Dialog::BinEmpty) => {
+                s.dialog = None;
+                match fileops::bin_empty() {
+                    Ok(()) => s.notice = "Recycle Bin emptied".into(),
+                    Err(e) => s.notice = e,
+                }
+                s.bin_cache = None;
+                spawn_bin_scan(s);
             }
             Some(Dialog::Rename { .. }) => commit_rename(s),
             Some(Dialog::NewFolder { .. }) => commit_new_folder(s),
@@ -6700,6 +6818,35 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
             base()
                 .child(text(title).font(TILE_TEXT).color(p.text))
                 .child(text(msg.as_str()).font(UI_TEXT).color(p.secondary))
+                .child(
+                    row().w_full().gap(8.0).child(el().grow(1.0))
+                        .child(dialog_buttons_el(s, p)),
+                )
+        }
+        Dialog::BinDelete { item } => {
+            let name = Path::new(&item.original)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| item.original.to_string_lossy().into_owned());
+            let msg = format!("Permanently delete \"{name}\" from the Recycle Bin? This cannot be undone.");
+            base()
+                .child(text("Permanently delete?").font(TILE_TEXT).color(p.text))
+                .child(text(msg.as_str()).font(UI_TEXT).color(p.secondary).w_full().wrap())
+                .child(
+                    row().w_full().gap(8.0).child(el().grow(1.0))
+                        .child(dialog_buttons_el(s, p)),
+                )
+        }
+        Dialog::BinEmpty => {
+            base()
+                .child(text("Empty Recycle Bin?").font(TILE_TEXT).color(p.text))
+                .child(
+                    text("Permanently delete everything in the Recycle Bin? This cannot be undone.")
+                        .font(UI_TEXT)
+                        .color(p.secondary)
+                        .w_full()
+                        .wrap(),
+                )
                 .child(
                     row().w_full().gap(8.0).child(el().grow(1.0))
                         .child(dialog_buttons_el(s, p)),
@@ -6991,12 +7138,12 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
                 rows = rows.child(property_row(p, "Location", &details.location));
             }
             for (label, at) in [
-                ("Modified", details.modified),
-                ("Created", details.created),
-                ("Accessed", details.accessed),
+                ("Modified", details.modified_secs),
+                ("Created", details.created_secs),
+                ("Accessed", details.accessed_secs),
             ] {
                 if let Some(at) = at {
-                    rows = rows.child(property_row(p, label, &format_time(at)));
+                    rows = rows.child(property_row(p, label, &metadata::format_local_datetime(at)));
                 }
             }
             // Whatever the type itself could tell us: dimensions, a text file's
@@ -7031,7 +7178,12 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
     el().key("dialog-overlay")
         .pin(Some(0.0), Some(0.0), Some(0.0), Some(0.0))
         .fill(Color::BLACK.alpha(0.45))
-        .on_press(|s: &mut App| s.dialog = None)
+        .on_press(|s: &mut App| {
+            if matches!(s.dialog, Some(Dialog::Update)) && s.update_busy {
+                return;
+            }
+            close_dialog(s);
+        })
         .center()
         .child(panel)
 }
@@ -7528,8 +7680,9 @@ fn focus_row(s: &App) -> usize {
 /// The element key a row is drawn under, per view, for scroll-into-view.
 fn row_key(s: &App, row: usize) -> String {
     match s.mode {
-        Mode::List => format!("list-{row}"),
-        Mode::Grid | Mode::Tiles => format!("tile-{row}"),
+        Mode::List => format!("litem-{row}"),
+        Mode::Grid => format!("tile-{row}"),
+        Mode::Tiles => format!("tileitem-{row}"),
         Mode::Details => format!("row-{row}"),
     }
 }
@@ -7576,9 +7729,11 @@ fn context_target_at(s: &App, x: f32, y: f32) -> (CtxScope, usize) {
     let len = if s.view == View::ThisPc { s.volumes.len() } else { display_len(s) };
     let rects = s.marquee_rects.borrow();
     for (i, r) in rects.iter().take(len).enumerate() {
-        if x >= r[0] && x <= r[2] && y >= r[1] && y <= r[3] {
-            let scope = if s.view == View::ThisPc { CtxScope::Volume } else { CtxScope::Item };
-            return (scope, i);
+        if r[2] > r[0] && r[3] > r[1] && x >= r[0] && x <= r[2] && y >= r[1] && y <= r[3] {
+            if s.view == View::ThisPc {
+                return (CtxScope::Volume, i);
+            }
+            return (CtxScope::Item, ei_at_row(s, i));
         }
     }
     (CtxScope::Background, 0)
@@ -7665,9 +7820,17 @@ fn marquee_drag(s: &mut App, d: &mut rune::Drag, tx: &mut Tx) {
 /// two folders on one disk moves and a drag to another disk copies.
 fn volume_of(s: &App, path: &Path) -> String {
     let mut best = String::new();
+    #[cfg(windows)]
+    let path_cmp = PathBuf::from(path.to_string_lossy().to_ascii_lowercase());
+    #[cfg(not(windows))]
+    let path_cmp = path;
     for v in &s.volumes {
         let vp = v.path.to_string_lossy();
-        if path.starts_with(&v.path) && vp.len() > best.len() {
+        #[cfg(windows)]
+        let matches = path_cmp.starts_with(Path::new(&vp.to_ascii_lowercase()));
+        #[cfg(not(windows))]
+        let matches = path_cmp.starts_with(&v.path);
+        if matches && vp.len() > best.len() {
             best = vp.into_owned();
         }
     }
@@ -7687,11 +7850,24 @@ fn same_volume(s: &App, paths: &[String], target: &Path) -> bool {
         .all(|p| volume_of(s, Path::new(p)) == volume_of(s, target))
 }
 
+fn tab_drop_path(s: &App, index: usize) -> Option<PathBuf> {
+    let (view, root) = if index == s.active_tab {
+        (s.view, s.root.as_path())
+    } else {
+        let tab = s.tabs.get(index)?;
+        (tab.view, tab.root.as_path())
+    };
+    (view == View::Files && !root.as_os_str().is_empty()).then(|| root.to_path_buf())
+}
+
 fn drop_target_path(s: &App, target: Option<&DropTarget>) -> Option<PathBuf> {
     match target {
         Some(DropTarget::Folder(p)) => Some(p.clone()),
-        Some(DropTarget::Tab(i)) => s.tabs.get(*i).map(|t| t.root.clone()),
-        Some(DropTarget::Background) => Some(s.root.clone()),
+        Some(DropTarget::Tab(i)) => tab_drop_path(s, *i),
+        Some(DropTarget::Background) => {
+            (matches!(s.view, View::Files | View::Gallery) && !s.root.as_os_str().is_empty())
+                .then(|| s.root.clone())
+        }
         None => None,
     }
 }
@@ -7713,6 +7889,17 @@ fn drop_mode(s: &App, paths: &[String], target: Option<&DropTarget>, shift: bool
     }
 }
 
+fn entry_drop_target(s: &App, i: usize) -> Option<(String, Option<DropTarget>)> {
+    if i >= display_len(s) || !matches!(s.view, View::Files | View::Gallery) {
+        return None;
+    }
+    let (_, e) = display_entry(s, i);
+    if !e.is_dir {
+        return Some((String::new(), None));
+    }
+    Some((format!("row:{}", e.path), Some(DropTarget::Folder(PathBuf::from(&e.path)))))
+}
+
 /// Read a drop target out of an element key path: the deepest keyed segment
 /// that names a place a drag can land.
 fn parse_drop_target(s: &App, path: &str) -> (String, Option<DropTarget>) {
@@ -7720,19 +7907,28 @@ fn parse_drop_target(s: &App, path: &str) -> (String, Option<DropTarget>) {
     // so the row segment is the path itself, up to the first indexed child.
     if let Some((_, rest)) = path.split_once("/rows/") {
         let entry_path = rest.split("/#").next().unwrap_or(rest);
-        if let Some(e) = s.entries.iter().find(|e| e.path == entry_path) {
-            let key = format!("row:{}", e.path);
-            let target = e.is_dir.then(|| DropTarget::Folder(PathBuf::from(&e.path)));
-            return (key, target);
+        let found = if s.searching {
+            s.search_hits.iter().find(|h| h.entry.path == entry_path).map(|h| &h.entry)
+        } else {
+            s.entries.iter().find(|e| e.path == entry_path)
+        };
+        if let Some(e) = found {
+            if matches!(s.view, View::Files | View::Gallery) && e.is_dir {
+                return (format!("row:{}", e.path), Some(DropTarget::Folder(PathBuf::from(&e.path))));
+            }
+            return (String::new(), None);
         }
     }
     for seg in path.rsplit('/') {
-        if let Some(n) = seg.strip_prefix("row-") {
-            if let Some(e) = n.parse::<usize>().ok().map(|i| display_entry(s, i).1) {
-                let key = format!("row:{}", e.path);
-                let target = e.is_dir.then(|| DropTarget::Folder(PathBuf::from(&e.path)));
-                return (key, target);
+        if let Some(n) = seg.strip_prefix("row-")
+            .or_else(|| seg.strip_prefix("litem-"))
+            .or_else(|| seg.strip_prefix("tile-"))
+            .or_else(|| seg.strip_prefix("tileitem-"))
+        {
+            if let Some(res) = n.parse::<usize>().ok().and_then(|i| entry_drop_target(s, i)) {
+                return res;
             }
+            continue;
         }
         let target = if let Some(n) = seg.strip_prefix("crumb-") {
             n.parse::<usize>()
@@ -7743,12 +7939,12 @@ fn parse_drop_target(s: &App, path: &str) -> (String, Option<DropTarget>) {
         } else if let Some(n) = seg.strip_prefix("tab-close-") {
             n.parse::<usize>()
                 .ok()
-                .filter(|i| *i < s.tabs.len())
+                .filter(|&i| tab_drop_path(s, i).is_some())
                 .map(DropTarget::Tab)
         } else if let Some(n) = seg.strip_prefix("tab-") {
             n.parse::<usize>()
                 .ok()
-                .filter(|i| *i < s.tabs.len())
+                .filter(|&i| tab_drop_path(s, i).is_some())
                 .map(DropTarget::Tab)
         } else if let Some(n) = seg.strip_prefix("rail-") {
             n.parse::<usize>().ok().and_then(place_path).map(DropTarget::Folder)
@@ -7777,6 +7973,9 @@ fn parse_drop_target(s: &App, path: &str) -> (String, Option<DropTarget>) {
         } else {
             continue;
         };
+        if target.is_none() {
+            return (String::new(), None);
+        }
         return (seg.to_string(), target);
     }
     (String::new(), None)
@@ -7814,7 +8013,15 @@ fn row_drag(s: &mut App, rect_i: usize, ei: usize, d: &mut rune::Drag, tx: &mut 
                         .map(|p| p.to_string_lossy().into_owned())
                         .collect()
                 } else {
-                    vec![s.entries[ei].path.clone()]
+                    let valid = if s.searching {
+                        ei < s.search_hits.len()
+                    } else {
+                        ei < s.entries.len()
+                    };
+                    if !valid {
+                        return;
+                    }
+                    vec![entry_by_index(s, ei).path.clone()]
                 };
                 if paths.is_empty() {
                     return;
@@ -7913,25 +8120,24 @@ fn row_drag(s: &mut App, rect_i: usize, ei: usize, d: &mut rune::Drag, tx: &mut 
 fn finish_drag(s: &mut App) {
     let Some(dr) = s.drag.take() else { return };
     let Some(target) = dr.target else { return };
-    let (target_path, tab) = match &target {
-        DropTarget::Folder(p) => (p.clone(), None),
-        DropTarget::Tab(i) => match s.tabs.get(*i) {
-            Some(t) => (t.root.clone(), Some(*i)),
-            None => return,
-        },
-        DropTarget::Background => (s.root.clone(), None),
+    let tab = match &target {
+        DropTarget::Tab(i) => Some(*i),
+        _ => None,
     };
+    let Some(target_path) = drop_target_path(s, Some(&target)) else { return };
     let sources: Vec<PathBuf> = dr.paths.iter().map(PathBuf::from).collect();
     if dr.mode == fileops::Mode::Cut
-        && sources.iter().all(|p| p.parent() == Some(target_path.as_path()))
+        && sources
+            .iter()
+            .all(|p| p.parent().is_some_and(|par| same_folder(par, &target_path)))
     {
         return;
     }
     paste_into(s, sources, dr.mode, target_path);
-    if let Some(i) = tab {
-        if i != s.active_tab {
-            switch_tab(s, i);
-        }
+    if let Some(i) = tab
+        && i != s.active_tab
+    {
+        switch_tab(s, i);
     }
 }
 
@@ -8135,6 +8341,8 @@ fn start_search(s: &mut App, query: String) {
     s.search_scanned = 0;
     s.search_elapsed = 0;
     s.search_truncated = false;
+    clear_selection(s);
+    s.marquee_rects.borrow_mut().clear();
     std::thread::spawn(move || {
         search::search(&req, &worker_cancel, |ev| tx.send(ev).is_ok());
     });
@@ -8144,6 +8352,7 @@ fn start_search(s: &mut App, query: String) {
 fn drain_search(s: &mut App) -> bool {
     let mut changed = false;
     let mut done = false;
+    let mut reset_sel = false;
     if let Some(rx) = &s.search_rx {
         while let Ok(ev) = rx.try_recv() {
             match ev {
@@ -8152,6 +8361,7 @@ fn drain_search(s: &mut App) -> bool {
                     s.search_matched = matched;
                     s.search_elapsed = elapsed_ms;
                     s.searching = true;
+                    reset_sel = true;
                     changed = true;
                 }
                 search::Event::Batch { items, scanned } => {
@@ -8176,7 +8386,15 @@ fn drain_search(s: &mut App) -> bool {
             }
         }
     }
+    if reset_sel && !done {
+        clear_selection(s);
+        s.marquee_rects.borrow_mut().clear();
+    }
     if done {
+        let path_of = |i: usize| s.search_hits.get(i).map(|h| h.entry.path.clone());
+        let sel_paths: Vec<String> = s.selected.iter().filter_map(|&i| path_of(i)).collect();
+        let foc_path = s.focused.and_then(path_of);
+        let anc_path = s.anchor.and_then(path_of);
         // Settle the streamed results into one ranked list: folders first, then
         // score, then the shorter name, then alphabetical.
         s.search_hits.sort_by(|a, b| {
@@ -8185,6 +8403,12 @@ fn drain_search(s: &mut App) -> bool {
                 .then_with(|| a.entry.name.len().cmp(&b.entry.name.len()))
                 .then_with(|| a.entry.name.to_lowercase().cmp(&b.entry.name.to_lowercase()))
         });
+        let index_of = |p: &str| s.search_hits.iter().position(|h| h.entry.path == p);
+        s.selected = sel_paths.iter().filter_map(|p| index_of(p)).collect();
+        s.focused = foc_path.as_deref().and_then(index_of);
+        s.anchor = anc_path.as_deref().and_then(index_of);
+        update_selection_detail(s);
+        s.marquee_rects.borrow_mut().clear();
         s.search_rx = None;
         s.search_cancel = None;
     }
@@ -8206,6 +8430,7 @@ fn clear_search(s: &mut App) {
     // The names describe the folder that was being searched; they do not outlive
     // the search box, so nothing can be answered from a stale index.
     s.search_cache = None;
+    s.marquee_rects.borrow_mut().clear();
     clear_selection(s);
 }
 
@@ -8472,8 +8697,14 @@ fn attach_replaced(action: Option<Undo>, items: &[fileops::Replaced], moved: boo
         return action;
     }
     match action {
-        Some(Undo::Copied { pairs, .. }) => Some(Undo::Copied { pairs, replaced: items.to_vec() }),
-        Some(Undo::Moved { pairs, .. }) => Some(Undo::Moved { pairs, replaced: items.to_vec() }),
+        Some(Undo::Copied { pairs, mut replaced }) => {
+            replaced.extend_from_slice(items);
+            Some(Undo::Copied { pairs, replaced })
+        }
+        Some(Undo::Moved { pairs, mut replaced }) => {
+            replaced.extend_from_slice(items);
+            Some(Undo::Moved { pairs, replaced })
+        }
         None if moved => Some(Undo::Moved { pairs: Vec::new(), replaced: items.to_vec() }),
         None => Some(Undo::Copied { pairs: Vec::new(), replaced: items.to_vec() }),
         other => other,
@@ -8601,16 +8832,22 @@ fn put_back(action: &Undo) -> Stepped {
                 .cloned()
                 .collect();
             let mut step = match fileops::copy_again_each(&plain) {
-                Ok(_) => Stepped::whole(action),
-                Err((left, e)) => Stepped {
-                    went: if left.len() == plain.len() {
-                        None
-                    } else {
-                        Some(Undo::Copied { pairs: plain.clone(), replaced: Vec::new() })
-                    },
-                    left: (!left.is_empty()).then(|| Undo::Copied { pairs: left, replaced: Vec::new() }),
-                    error: Some(format!("Could not copy it again: {e}")),
+                Ok(_) => Stepped {
+                    went: (!plain.is_empty()).then(|| Undo::Copied { pairs: plain, replaced: Vec::new() }),
+                    left: None,
+                    error: None,
                 },
+                Err((left, e)) => {
+                    let went_plain: Vec<(PathBuf, PathBuf)> = plain
+                        .into_iter()
+                        .filter(|p| !left.contains(p))
+                        .collect();
+                    Stepped {
+                        went: (!went_plain.is_empty()).then(|| Undo::Copied { pairs: went_plain, replaced: Vec::new() }),
+                        left: (!left.is_empty()).then(|| Undo::Copied { pairs: left, replaced: Vec::new() }),
+                        error: Some(format!("Could not copy it again: {e}")),
+                    }
+                }
             };
             let (done, failed, swap_error) = apply_replaced(replaced, false, fileops::swap_forward);
             step.went = attach_replaced(step.went.take(), &done, false);
@@ -8649,9 +8886,12 @@ fn put_back(action: &Undo) -> Stepped {
             if !deleted.trashed.is_empty() {
                 // Keep the records the new deletion made: the old ones name a
                 // stay in the trash that has already been taken back.
+                let done_count = deleted.trashed.len();
+                let left = (deleted.error.is_some() && done_count < items.len())
+                    .then(|| Undo::Trashed { items: items[done_count..].to_vec() });
                 Stepped {
                     went: Some(Undo::Trashed { items: deleted.trashed }),
-                    left: None,
+                    left,
                     error: deleted.error.map(|e| format!("Could not delete it again: {e}")),
                 }
             } else {
@@ -8681,7 +8921,18 @@ fn step_moved(pairs: Vec<(PathBuf, PathBuf)>, back: bool) -> Stepped {
     )
 }
 
+fn entries_actionable(s: &App) -> bool {
+    match s.view {
+        View::Files | View::Gallery => true,
+        View::QuickAccess => s.quick_access_tab == 0,
+        View::ThisPc | View::RecycleBin => false,
+    }
+}
+
 fn copy_selection(s: &mut App) {
+    if !entries_actionable(s) {
+        return;
+    }
     let paths = selected_paths(s);
     if !paths.is_empty() {
         s.clipboard = Some((paths, fileops::Mode::Copy));
@@ -8690,6 +8941,9 @@ fn copy_selection(s: &mut App) {
 }
 
 fn cut_selection(s: &mut App) {
+    if !entries_actionable(s) {
+        return;
+    }
     let paths = selected_paths(s);
     if !paths.is_empty() {
         s.clipboard = Some((paths, fileops::Mode::Cut));
@@ -8809,24 +9063,40 @@ fn begin_paste(s: &mut App) {
     paste_into(s, sources, mode, target);
 }
 
+fn same_folder(a: &Path, b: &Path) -> bool {
+    if same_path(a, b) {
+        return true;
+    }
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => same_path(&ca, &cb),
+        _ => false,
+    }
+}
+
 /// Copy or move sources into a target, asking about conflicts. Cutting into
 /// the folder an item already lives in is a no-op, not a conflict.
 fn paste_into(s: &mut App, sources: Vec<PathBuf>, mode: fileops::Mode, target: PathBuf) {
     let sources: Vec<PathBuf> = if mode == fileops::Mode::Cut {
         sources
             .into_iter()
-            .filter(|src| src.parent() != Some(target.as_path()))
+            .filter(|src| !src.parent().is_some_and(|p| same_folder(p, &target)))
             .collect()
     } else {
         sources
     };
     if sources.is_empty() {
+        if s.op_rx.is_none() {
+            let staged = std::mem::take(&mut s.drop_staged);
+            osdrag::release(&staged);
+        }
         s.menu = None;
         s.notice = "Those items are already in this folder".into();
         return;
     }
     let conflict_exists = sources.iter().any(|src| {
-        src.file_name().map(|n| target.join(n).exists()).unwrap_or(false)
+        src.file_name()
+            .map(|n| fs::symlink_metadata(target.join(n)).is_ok())
+            .unwrap_or(false)
     });
     s.menu = None;
     if conflict_exists {
@@ -8838,6 +9108,9 @@ fn paste_into(s: &mut App, sources: Vec<PathBuf>, mode: fileops::Mode, target: P
 
 /// Ask before deleting; Shift chooses permanent, otherwise the trash.
 fn begin_delete(s: &mut App, permanent: bool) {
+    if !entries_actionable(s) {
+        return;
+    }
     let paths = selected_paths(s);
     if paths.is_empty() {
         return;
@@ -8847,16 +9120,29 @@ fn begin_delete(s: &mut App, permanent: bool) {
 }
 
 fn begin_rename(s: &mut App) {
+    if !entries_actionable(s) {
+        return;
+    }
+    let len = if s.searching { s.search_hits.len() } else { s.entries.len() };
     let Some(e) = s
         .selected
         .first()
-        .filter(|&&i| i < display_len(s))
+        .filter(|&&i| i < len)
         .map(|&i| entry_by_index(s, i))
     else {
         return;
     };
-    let mut edit = TextEdit::default();
-    edit.text = e.name.clone();
+    let mut edit = TextEdit::new(e.name.clone());
+    edit.focused = true;
+    edit.anchor = 0;
+    edit.focus = if !e.is_dir {
+        match e.name.rfind('.') {
+            Some(pos) if pos > 0 => e.name[..pos].chars().count(),
+            _ => e.name.chars().count(),
+        }
+    } else {
+        e.name.chars().count()
+    };
     let path = PathBuf::from(&e.path);
     s.menu = None;
     open_dialog(s, Dialog::Rename { path, edit });
@@ -8867,8 +9153,10 @@ fn begin_new_folder(s: &mut App) {
         s.notice = "Open a folder to create one in".into();
         return;
     }
-    let mut edit = TextEdit::default();
-    edit.text = "New folder".into();
+    let mut edit = TextEdit::new("New folder");
+    edit.focused = true;
+    edit.anchor = 0;
+    edit.focus = edit.text.chars().count();
     s.menu = None;
     open_dialog(s, Dialog::NewFolder { parent: s.root.clone(), edit });
 }
@@ -8881,10 +9169,21 @@ fn commit_rename(s: &mut App) {
     }
     match fileops::rename(&path, &name) {
         Ok(target) if target != path => {
-            record_undo(s, Undo::Rename { from: path, to: target });
+            record_undo(s, Undo::Rename { from: path.clone(), to: target.clone() });
             if s.view == View::Files {
                 let root = s.root.clone();
                 set_location(s, root);
+            } else if s.view == View::Gallery {
+                refresh_gallery(s);
+            } else if s.view == View::QuickAccess {
+                let old_str = path.to_string_lossy();
+                let new_str = target.to_string_lossy().into_owned();
+                for r in &mut s.recent {
+                    if *r == old_str {
+                        *r = new_str.clone();
+                    }
+                }
+                refresh_recent(s);
             }
         }
         // A rename to the same name changed nothing; recording it would jam
@@ -8965,17 +9264,21 @@ fn drain_op(s: &mut App) -> bool {
         s.op_rx = None;
         s.op_cancel = None;
         s.transfer = None;
-        // A completed cut-move consumes the clipboard; a second paste would
-        // otherwise use paths that no longer exist. Only the cut paste that
-        // actually ran does this — deleting an unrelated item must not drop a
-        // different cut waiting to be pasted.
+        // A completed or partial cut-move consumes only the paths that actually
+        // landed; failed or cancelled items remain on the clipboard. Only the
+        // cut paste that actually ran does this — deleting an unrelated item
+        // must not drop a different cut waiting to be pasted.
         let cut = s.op_cut_paths.take();
         if cut.is_some()
-            && s.clipboard.as_ref().is_some_and(|(paths, mode)| {
-                *mode == fileops::Mode::Cut && Some(paths) == cut.as_ref()
-            })
+            && let Some((paths, mode)) = &mut s.clipboard
+            && *mode == fileops::Mode::Cut
+            && Some(&*paths) == cut.as_ref()
+            && let Some(Undo::Moved { pairs, .. }) = &undo
         {
-            s.clipboard = None;
+            paths.retain(|p| !pairs.iter().any(|(from, _)| p == from || p.starts_with(from)));
+            if paths.is_empty() {
+                s.clipboard = None;
+            }
         }
         let staged = std::mem::take(&mut s.drop_staged);
         osdrag::release(&staged);
@@ -9155,6 +9458,38 @@ fn handle_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
             _ => return false,
         }
     }
+    if s.customize_open {
+        if ev.key == Key::Escape {
+            s.customize_open = false;
+        }
+        return true;
+    }
+    if s.custom_open {
+        if ev.key == Key::Escape {
+            s.custom_open = false;
+            return true;
+        }
+        if s.custom_hex.focused {
+            return false;
+        }
+        return true;
+    }
+    if s.dialog.is_some() {
+        if ev.key == Key::Escape {
+            close_dialog(s);
+            return true;
+        }
+        return dialog_key(s, &ev.key);
+    }
+    if s.menu.is_some() {
+        if ev.key == Key::Escape {
+            s.menu = None;
+        }
+        return true;
+    }
+    if s.search_edit.focused {
+        return false;
+    }
     if ev.is_command('l')
         || (ev.mods.alt && matches!(&ev.key, Key::Text(t) if t.eq_ignore_ascii_case("d")))
     {
@@ -9162,18 +9497,6 @@ fn handle_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
         return true;
     }
     if ev.key == Key::Escape {
-        if s.custom_open {
-            s.custom_open = false;
-            return true;
-        }
-        if s.dialog.is_some() {
-            s.dialog = None;
-            return true;
-        }
-        if s.menu.is_some() {
-            s.menu = None;
-            return true;
-        }
         // A folder still being read is the next thing Escape should stop.
         if s.scan_rx.is_some() {
             cancel_scan(s);
@@ -9184,14 +9507,6 @@ fn handle_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
             clear_selection(s);
             return true;
         }
-        return false;
-    }
-    if s.custom_open || s.dialog.is_some() {
-        // The custom panel owns the keyboard while it is open, so shortcuts
-        // cannot fire a file operation from inside a color field.
-        return s.custom_open || dialog_key(s, &ev.key);
-    }
-    if s.search_edit.focused {
         return false;
     }
     if ev.is_command('c') {
@@ -9665,7 +9980,7 @@ fn grid_tile(s: &App, i: usize, p: Paint) -> El {
         .key(format!("tile-{i}"))
         .w(106.0)
         .radius(4.0)
-        .fill(if selected || drop_hot(s, &format!("tile-{i}")) { p.rail_sel } else { Color::TRANSPARENT })
+        .fill(if selected || drop_hot(s, &format!("tile-{i}")) || drop_hot(s, &format!("row:{}", e.path)) { p.rail_sel } else { Color::TRANSPARENT })
         .hover(p.hover)
         .pt(8.0)
         .pb(8.0)
@@ -9720,15 +10035,11 @@ fn list_item(s: &App, i: usize, p: Paint) -> El {
     let (ei, e) = display_entry(s, i);
     let selected = is_selected(s, ei);
     let mut item = row()
-        .key(format!("list-{i}"))
-        .on_drop_files(move |s: &mut App, files, tx: &mut Tx| {
-            let t = s.favorites.get(i).cloned().map(|p| DropTarget::Folder(PathBuf::from(p)));
-            take_drop(s, t, files, tx);
-        })
+        .key(format!("litem-{i}"))
         .w(230.0)
         .h(if s.compact { 22.0 } else { 26.0 })
         .radius(4.0)
-        .fill(if selected { p.rail_sel } else { Color::TRANSPARENT })
+        .fill(if selected || drop_hot(s, &format!("litem-{i}")) || drop_hot(s, &format!("row:{}", e.path)) { p.rail_sel } else { Color::TRANSPARENT })
         .hover(p.hover)
         .px(6.0)
         .gap(8.0)
@@ -9788,7 +10099,7 @@ fn tile_item(s: &App, i: usize, p: Paint) -> El {
         .w(268.0)
         .h(64.0)
         .radius(4.0)
-        .fill(if selected { p.rail_sel } else { Color::TRANSPARENT })
+        .fill(if selected || drop_hot(s, &format!("tileitem-{i}")) || drop_hot(s, &format!("row:{}", e.path)) { p.rail_sel } else { Color::TRANSPARENT })
         .hover(p.hover)
         .px(8.0)
         .gap(10.0)
@@ -9962,7 +10273,13 @@ fn quick_access_content(s: &App, p: Paint) -> El {
                 .items_center()
                 .child(ico(p, Ico::Clock, 14.0, if recent_on { p.accent_ink } else { p.secondary }))
                 .child(text("Recent").font(UI_TEXT).color(if recent_on { p.accent_ink } else { p.text }))
-                .on_press(|s: &mut App| s.quick_access_tab = 0),
+                .on_press(|s: &mut App| {
+                    if s.quick_access_tab != 0 {
+                        s.quick_access_tab = 0;
+                        clear_selection(s);
+                        s.marquee_rects.borrow_mut().clear();
+                    }
+                }),
         )
         .child(
             row()
@@ -9975,7 +10292,13 @@ fn quick_access_content(s: &App, p: Paint) -> El {
                 .items_center()
                 .child(ico(p, Ico::Star, 14.0, if recent_on { p.secondary } else { p.accent_ink }))
                 .child(text("Favorites").font(UI_TEXT).color(if recent_on { p.text } else { p.accent_ink }))
-                .on_press(|s: &mut App| s.quick_access_tab = 1),
+                .on_press(|s: &mut App| {
+                    if s.quick_access_tab != 1 {
+                        s.quick_access_tab = 1;
+                        clear_selection(s);
+                        s.marquee_rects.borrow_mut().clear();
+                    }
+                }),
         );
     let mut table = col().w_full().pt(14.0);
     if recent_on {
@@ -10054,7 +10377,7 @@ fn quick_access_content(s: &App, p: Paint) -> El {
                 .child(col().w(activity_w));
             row = row
                 .on_press_tx(move |st: &mut App, tx: &mut Tx| click_select(st, ei, tx.mods()))
-                .on_drag(move |st: &mut App, d: &mut rune::Drag, tx: &mut Tx| row_drag(st, ei, ei, d, tx))
+                .on_drag(move |st: &mut App, d: &mut rune::Drag, tx: &mut Tx| row_drag(st, row_idx, ei, d, tx))
                 .on_double_press(move |st: &mut App| {
                     select_entry(st, ei);
                     open_recent(st, ei);
@@ -10252,15 +10575,14 @@ fn this_pc_content(s: &App, p: Paint) -> El {
 }
 
 /// The month a photo belongs to, for the Gallery's group headers.
-fn month_label(at: Option<std::time::SystemTime>) -> String {
+fn month_label(at: Option<i64>) -> String {
     const MONTHS: [&str; 12] = [
         "January", "February", "March", "April", "May", "June", "July", "August", "September",
         "October", "November", "December",
     ];
-    let Some(at) = at else { return "Unknown date".to_string() };
-    let Ok(secs) = at.duration_since(UNIX_EPOCH) else { return "Unknown date".to_string() };
-    let (y, m, _) = civil_from_days((secs.as_secs() / 86_400) as i64);
-    format!("{} {}", MONTHS[(m - 1).clamp(0, 11) as usize], y)
+    let Some(secs) = at else { return "Unknown date".to_string() };
+    let (y, m, _, _, _, _) = metadata::local_civil(secs);
+    format!("{} {}", MONTHS[m.saturating_sub(1).min(11) as usize], y)
 }
 
 /// Walk a folder for images, newest first, bounded so a large library cannot
@@ -10288,11 +10610,8 @@ fn sweep_images(root: &Path, limit: usize, max_depth: usize) -> Vec<Entry> {
                 if kind != Kind::Image {
                     continue;
                 }
-                let modified_at = meta.modified().ok();
-                let modified = modified_at
-                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                    .map(|d| format_time(d.as_secs()))
-                    .unwrap_or_default();
+                let modified_at = meta.modified().ok().and_then(metadata::system_time_to_secs);
+                let modified = modified_at.map(format_time).unwrap_or_default();
                 out.push(Entry {
                     name,
                     path: item.path().to_string_lossy().into_owned(),
@@ -10324,11 +10643,17 @@ fn gallery_folder() -> Option<PathBuf> {
 /// Re-read the Pictures library into the Gallery's entries.
 fn refresh_gallery(s: &mut App) {
     let Some(pictures) = gallery_folder() else { return };
+    let path_of = |i: usize| s.entries.get(i).map(|e| e.path.clone());
+    let sel_paths: Vec<String> = s.selected.iter().filter_map(|&i| path_of(i)).collect();
+    let foc_path = s.focused.and_then(path_of);
+    let anc_path = s.anchor.and_then(path_of);
     s.entries = sweep_images(&pictures, 4000, 8);
     s.visible = (0..s.entries.len()).collect();
     s.count = s.entries.len();
     s.count_override = Some(s.count);
     s.groups.clear();
+    s.marquee_rects.borrow_mut().clear();
+    remap_selection_by_path(s, &sel_paths, foc_path.as_deref(), anc_path.as_deref());
 }
 
 /// Open the Gallery: the Pictures library as a photo grid. A re-click is a
@@ -10713,6 +11038,11 @@ fn content(s: &App, p: Paint) -> El {
                     // A right-click on another item moves the open menu to it,
                     // as a fresh right-click would.
                     let (scope, target) = context_target_at(s, at.x, at.y);
+                    match scope {
+                        CtxScope::Item if !is_selected(s, target) => select_entry(s, target),
+                        CtxScope::Volume => s.volumes_selected = Some(target),
+                        _ => {}
+                    }
                     s.menu = Some(Menu::Context { scope, target, x: at.x, y: at.y });
                 }),
         );
@@ -11655,17 +11985,17 @@ mod rail_tests {
 #[cfg(test)]
 mod sort_tests {
     use super::*;
-    use std::time::{Duration, UNIX_EPOCH};
 
     /// A folder or file with a chosen size, timestamp and type name.
     fn item(name: &str, is_dir: bool, size: u64, day: u64, type_label: &str) -> Entry {
+        let secs = (day * 86_400) as i64;
         Entry {
             name: name.to_string(),
             path: format!("C:/probe/{name}"),
             is_dir,
             size: if is_dir { 0 } else { size },
-            modified: format_time(day * 86_400),
-            modified_at: Some(UNIX_EPOCH + Duration::from_secs(day * 86_400)),
+            modified: format_time(secs),
+            modified_at: Some(secs),
             type_label: type_label.to_string(),
             kind: if is_dir { Kind::Folder } else { Kind::Text },
             hidden: false,
@@ -14075,5 +14405,502 @@ mod move_tests {
         assert!(root.join("presenter-pwa").join("index.html").exists(), "and the other too");
         assert!(root.join("ChurchApp").is_dir(), "the folder itself is left alone");
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod bugfix_tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lyre-bugfix-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn make_test_entry(name: &str, path: &str, is_dir: bool, modified_at: Option<i64>) -> Entry {
+        let kind = classify(name, is_dir);
+        Entry {
+            name: name.to_string(),
+            path: path.to_string(),
+            is_dir,
+            size: if is_dir { 0 } else { 10 },
+            modified: modified_at.map(format_time).unwrap_or_default(),
+            modified_at,
+            type_label: kind_label(kind).to_string(),
+            kind,
+            hidden: false,
+            system: false,
+            fixture: false,
+            fixture_size: String::new(),
+        }
+    }
+
+    #[test]
+    fn list_view_tile_and_search_drop_targets_resolve_to_entries() {
+        let base = scratch("drop-list");
+        let zdir = base.join("zdir");
+        let fav = scratch("drop-list-fav");
+        std::fs::create_dir_all(&zdir).unwrap();
+        let mut s = init();
+        s.view = View::Files;
+        s.root = base.clone();
+        s.entries = scan(&base).0;
+        refresh_visible(&mut s);
+        s.favorites = vec![fav.to_string_lossy().into_owned()];
+
+        // List, Grid, and Tiles item keys must resolve to the displayed entry,
+        // never to s.favorites[0].
+        for key_path in ["main/list-items/litem-0", "main/tiles/tile-0", "main/tiles-view/tileitem-0"] {
+            let (key, target) = parse_drop_target(&s, key_path);
+            assert!(key.starts_with("row:"), "{key_path} -> {key}");
+            assert_eq!(target, Some(DropTarget::Folder(zdir.clone())));
+        }
+        // Quick Access favorites still resolve on list-0.
+        assert_eq!(
+            parse_drop_target(&s, "main/home/list-0").1,
+            Some(DropTarget::Folder(fav.clone()))
+        );
+
+        // Search mode must scan s.search_hits rather than s.entries.
+        let hit_dir = base.join("only_in_search");
+        s.searching = true;
+        s.search_hits = vec![search::Hit {
+            entry: make_test_entry("only_in_search", &hit_dir.to_string_lossy(), true, None),
+            score: 100,
+            indices: vec![],
+        }];
+        let (_, target) = parse_drop_target(&s, "main/list-items/litem-0");
+        assert_eq!(target, Some(DropTarget::Folder(hit_dir.clone())));
+        let row_path = format!("window/list-area/viewport/rows/{}/#0", hit_dir.to_string_lossy());
+        assert_eq!(parse_drop_target(&s, &row_path).1, Some(DropTarget::Folder(hit_dir)));
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&fav);
+    }
+
+    #[test]
+    fn tab_drop_target_uses_live_state_and_rejects_non_files_tabs() {
+        let base = scratch("tab-drop");
+        let mut s = init();
+        load(&mut s, Fixture::QuickAccess);
+        s.tabs = vec![capture_tab(&s)];
+        s.active_tab = 0;
+        // Quick Access tab must reject drops even if a stale root was behind it,
+        // while middle-click tab_index_from_path can still close it.
+        assert_eq!(parse_drop_target(&s, "main/tabs/tab-0").1, None);
+        assert_eq!(drop_target_path(&s, Some(&DropTarget::Tab(0))), None);
+        assert_eq!(tab_index_from_path(&s, "main/tabs/tab-0"), Some(0));
+
+        // Navigating active tab 0 to a real folder updates live drop resolution
+        // even before tabs[0] is recaptured.
+        s.view = View::Files;
+        s.root = base.clone();
+        assert_eq!(parse_drop_target(&s, "main/tabs/tab-0").1, Some(DropTarget::Tab(0)));
+        assert_eq!(drop_target_path(&s, Some(&DropTarget::Tab(0))), Some(base.clone()));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn volume_of_is_case_insensitive_on_windows() {
+        let mut s = init();
+        s.volumes = vec![volumes::Volume {
+            path: PathBuf::from("C:\\"),
+            label: String::new(),
+            kind: volumes::VolumeKind::Fixed,
+            free: 0,
+            total: 0,
+        }];
+        assert_eq!(
+            volume_of(&s, Path::new("c:\\Users\\test.txt")),
+            volume_of(&s, Path::new("C:\\Other\\dest.txt"))
+        );
+    }
+
+    #[test]
+    fn redo_copied_partial_failure_does_not_put_failed_items_on_undo() {
+        let base = scratch("redo-copied");
+        let src = base.join("src");
+        let dst = base.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        let a_src = src.join("a.txt");
+        let b_src = src.join("b.txt");
+        let a_dst = dst.join("a.txt");
+        let b_dst = dst.join("b.txt");
+        std::fs::write(&a_src, b"aaa").unwrap();
+        std::fs::write(&b_src, b"bbb").unwrap();
+
+        let mut s = init();
+        s.view = View::Files;
+        s.root = dst.clone();
+        record_undo(
+            &mut s,
+            Undo::Copied {
+                pairs: vec![(a_src.clone(), a_dst.clone()), (b_src.clone(), b_dst.clone())],
+                replaced: Vec::new(),
+            },
+        );
+        std::fs::copy(&a_src, &a_dst).unwrap();
+        std::fs::copy(&b_src, &b_dst).unwrap();
+
+        undo_last(&mut s);
+        assert!(!a_dst.exists() && !b_dst.exists());
+
+        // An unrelated file takes b_dst before Redo.
+        std::fs::write(&b_dst, b"preexisting").unwrap();
+        redo_last(&mut s);
+        assert!(a_dst.exists(), "a.txt was copied again");
+        assert_eq!(std::fs::read_to_string(&b_dst).unwrap(), "preexisting");
+        assert!(!s.redo.is_empty(), "failed b.txt remains on redo");
+
+        // Pressing Undo must remove only a_dst and NEVER delete preexisting b_dst!
+        undo_last(&mut s);
+        assert!(!a_dst.exists(), "a_dst was undone");
+        assert_eq!(
+            std::fs::read_to_string(&b_dst).unwrap(),
+            "preexisting",
+            "preexisting file at failed redo destination must not be deleted"
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn redo_copied_with_failed_replace_keeps_failed_replace_out_of_went() {
+        let base = scratch("redo-replace-fail");
+        let r = fileops::Replaced {
+            source: base.join("src.txt"),
+            target: base.join("target.txt"),
+            old: base.join("old.bak"),
+            new: PathBuf::new(), // missing backup causes swap_forward to fail
+        };
+        std::fs::write(&r.target, b"restored").unwrap();
+        let action = Undo::Copied { pairs: vec![(r.source.clone(), r.target.clone())], replaced: vec![r] };
+        let stepped = put_back(&action);
+        assert!(stepped.went.is_none(), "failed replace must not enter undo");
+        assert!(stepped.left.is_some(), "failed replace stays in redo");
+        assert!(stepped.error.is_some());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn redo_trashed_partial_failure_keeps_remaining_items() {
+        let base = scratch("redo-trash-partial");
+        let a = base.join("a.txt");
+        let missing = base.join("missing.txt");
+        std::fs::write(&a, b"hi").unwrap();
+        let now = std::time::SystemTime::now();
+        let trashed_rec = |p: PathBuf| fileops::Trashed {
+            original: p,
+            when: now,
+            #[cfg(unix)]
+            trashed: None,
+            #[cfg(unix)]
+            info: None,
+        };
+        let action = Undo::Trashed {
+            items: vec![trashed_rec(a.clone()), trashed_rec(missing.clone())],
+        };
+        let stepped = put_back(&action);
+        assert!(stepped.error.is_some());
+        if let Some(Undo::Trashed { items }) = stepped.went {
+            assert_eq!(items.len(), 1);
+            assert!(stepped.left.is_some(), "remaining failed item must be kept in left");
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn same_folder_cut_paste_is_noop_and_paste_conflict_cancel_cleans_staged() {
+        let base = scratch("same-folder");
+        let sub = base.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let file = base.join("a.txt");
+        std::fs::write(&file, b"x").unwrap();
+        let stage_src = base.join("staged.txt");
+        std::fs::write(&stage_src, b"s").unwrap();
+        let staged = osdrag::stage(std::slice::from_ref(&stage_src))[0].clone();
+        assert!(staged.exists());
+
+        let mut s = init();
+        s.view = View::Files;
+        s.root = base.clone();
+        // Relative .. path refers to the same folder as base.
+        paste_into(&mut s, vec![file.clone()], fileops::Mode::Cut, sub.join(".."));
+        assert!(s.transfer.is_none());
+        assert_eq!(s.notice, "Those items are already in this folder");
+
+        // Cancelling PasteConflict cleans s.drop_staged.
+        s.drop_staged = vec![staged.clone()];
+        open_dialog(
+            &mut s,
+            Dialog::PasteConflict {
+                mode: fileops::Mode::Copy,
+                sources: vec![staged.clone()],
+                target: base.clone(),
+            },
+        );
+        press_dialog_button(&mut s, DialogButton::Cancel);
+        assert!(s.dialog.is_none());
+        assert!(s.drop_staged.is_empty());
+        assert!(!staged.exists());
+
+        // Broken symlink at destination must be detected as a conflict.
+        let src_dir = base.join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let src_file = src_dir.join("broken.txt");
+        std::fs::write(&src_file, b"real").unwrap();
+        let dst_link = base.join("broken.txt");
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(base.join("nonexistent"), &dst_link).is_ok();
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(base.join("nonexistent"), &dst_link).is_ok();
+        if linked {
+            paste_into(&mut s, vec![src_file], fileops::Mode::Copy, base.clone());
+            assert!(matches!(s.dialog, Some(Dialog::PasteConflict { .. })));
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn drain_op_cut_partial_failure_keeps_unmoved_clipboard_items() {
+        let mut s = init();
+        let a = PathBuf::from("/fake/a.txt");
+        let b = PathBuf::from("/fake/b.txt");
+        s.clipboard = Some((vec![a.clone(), b.clone()], fileops::Mode::Cut));
+        s.op_cut_paths = Some(vec![a.clone(), b.clone()]);
+        s.transfer = Some(Transfer {
+            label: "Moving",
+            name: String::new(),
+            done: 1,
+            total: 2,
+            done_bytes: 0,
+            total_bytes: 0,
+            stopping: false,
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        s.op_rx = Some(rx);
+        tx.send(OpMsg::Done {
+            outcome: Err("Moved 1 item, then stopped: fail".into()),
+            undo: Some(Undo::Moved {
+                pairs: vec![(a.clone(), PathBuf::from("/dest/a.txt"))],
+                replaced: Vec::new(),
+            }),
+        })
+        .unwrap();
+        assert!(drain_op(&mut s));
+        assert_eq!(s.clipboard, Some((vec![b], fileops::Mode::Cut)));
+    }
+
+    #[test]
+    fn virtual_views_gate_file_ops() {
+        let mut s = init();
+        s.entries = vec![make_test_entry("secret.txt", "/fake/secret.txt", false, None)];
+        s.visible = vec![0];
+        s.selected = vec![0];
+
+        s.view = View::RecycleBin;
+        begin_rename(&mut s);
+        assert!(s.dialog.is_none());
+        begin_delete(&mut s, false);
+        assert!(s.dialog.is_none());
+        cut_selection(&mut s);
+        copy_selection(&mut s);
+        assert!(s.clipboard.is_none());
+
+        s.view = View::QuickAccess;
+        s.quick_access_tab = 1; // Favorites tab hides Recent entries
+        begin_rename(&mut s);
+        assert!(s.dialog.is_none());
+        begin_delete(&mut s, true);
+        assert!(s.dialog.is_none());
+        cut_selection(&mut s);
+        copy_selection(&mut s);
+        assert!(s.clipboard.is_none());
+    }
+
+    #[test]
+    fn search_selection_clear_and_remap_and_context_target_and_rename_focus() {
+        let base = scratch("sel-ctx");
+        std::fs::write(base.join("alpha.txt"), b"a").unwrap();
+        std::fs::write(base.join("beta.txt"), b"b").unwrap();
+
+        let mut s = init();
+        s.view = View::Files;
+        s.root = base.clone();
+        s.entries = scan(&base).0;
+        refresh_visible(&mut s);
+        select_entry(&mut s, 0);
+        start_search(&mut s, "a".into());
+        assert!(s.selected.is_empty(), "start_search must clear prior folder selection");
+
+        // Simulate streamed hits, select "alpha.txt" at index 1 before Event::Done sorts it to 0.
+        let (tx, rx) = std::sync::mpsc::channel();
+        s.search_rx = Some(rx);
+        s.search_hits = vec![
+            search::Hit { entry: s.entries[1].clone(), score: 10, indices: vec![] },
+            search::Hit { entry: s.entries[0].clone(), score: 100, indices: vec![] },
+        ];
+        select_entry(&mut s, 1);
+        assert_eq!(s.search_hits[1].entry.name, "alpha.txt");
+        tx.send(search::Event::Done { matched: 2, scanned: 2, elapsed_ms: 1, truncated: false })
+            .unwrap();
+        drain_search(&mut s);
+        assert_eq!(s.selected, vec![0]);
+        assert_eq!(s.search_hits[s.selected[0]].entry.name, "alpha.txt");
+
+        // context_target_at must map display row 0 -> ei via ei_at_row.
+        clear_search(&mut s);
+        s.keep_order = false;
+        s.sort = 0;
+        s.sort_desc = true;
+        refresh_visible(&mut s);
+        assert_eq!(s.visible, vec![1, 0]);
+        s.marquee_rects.replace(vec![[0.0, 100.0, 200.0, 130.0]]);
+        assert_eq!(context_target_at(&s, 50.0, 110.0), (CtxScope::Item, 1));
+
+        // Filter hides entry 0, leaving only entry 1 visible; begin_rename still works and selects stem.
+        s.search_edit.text = "beta".into();
+        refresh_visible(&mut s);
+        assert_eq!(s.visible, vec![1]);
+        select_entry(&mut s, 1);
+        begin_rename(&mut s);
+        match &s.dialog {
+            Some(Dialog::Rename { edit, .. }) => {
+                assert!(edit.focused);
+                assert_eq!(edit.anchor, 0);
+                assert_eq!(edit.focus, 4); // "beta"
+            }
+            _ => panic!("expected Rename dialog"),
+        }
+        s.dialog = None;
+        begin_new_folder(&mut s);
+        match &s.dialog {
+            Some(Dialog::NewFolder { edit, .. }) => {
+                assert!(edit.focused);
+                assert_eq!(edit.anchor, 0);
+                assert_eq!(edit.focus, "New folder".len());
+            }
+            _ => panic!("expected NewFolder dialog"),
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn handle_key_guards_modals_menus_and_custom_hex_and_tab_close_clears_state() {
+        let mut s = init();
+        s.view = View::Files;
+        s.entries = vec![make_test_entry("a.txt", "/fake/a.txt", false, None)];
+        s.visible = vec![0];
+        s.selected = vec![0];
+        let rt = rune::Runtime::new(init(), view, (800.0, 600.0), rune::Env::new(true, 1.0));
+        let mut dummy_tx_rt = rt;
+        dummy_tx_rt.update(|_, tx| {
+            let cmd_l = KeyEvent {
+                key: Key::Text("l".into()),
+                mods: rune::Mods { ctrl: !cfg!(target_os = "macos"), cmd: cfg!(target_os = "macos"), ..Default::default() },
+            };
+            let esc = KeyEvent { key: Key::Escape, mods: Default::default() };
+            let del = KeyEvent { key: Key::Delete, mods: Default::default() };
+
+            // Customize dialog consumes Ctrl+L and Delete, Escape closes it.
+            s.customize_open = true;
+            assert!(handle_key(&mut s, &cmd_l, tx));
+            assert!(s.address_edit.is_none());
+            assert!(handle_key(&mut s, &del, tx));
+            assert!(s.dialog.is_none());
+            assert!(handle_key(&mut s, &esc, tx));
+            assert!(!s.customize_open);
+
+            // Custom panel with focused hex input yields typing to text_input.
+            s.custom_open = true;
+            s.custom_hex.focused = true;
+            let char_a = KeyEvent { key: Key::Text("a".into()), mods: Default::default() };
+            assert!(!handle_key(&mut s, &char_a, tx));
+            assert!(handle_key(&mut s, &esc, tx));
+            assert!(!s.custom_open);
+
+            // Open menu consumes Delete/Ctrl+L, Escape closes menu.
+            s.menu = Some(Menu::Drop { kind: DropMenu::More, x: 10.0, y: 10.0 });
+            assert!(handle_key(&mut s, &del, tx));
+            assert!(s.dialog.is_none());
+            assert!(handle_key(&mut s, &cmd_l, tx));
+            assert!(s.address_edit.is_none());
+            assert!(handle_key(&mut s, &esc, tx));
+            assert!(s.menu.is_none());
+        });
+
+        // close_tab_at clears search, search_edit, dialog, and pending_refresh.
+        let mut s = init();
+        new_tab(&mut s);
+        s.searching = true;
+        s.search_edit.text = "query".into();
+        s.dialog = Some(Dialog::BinEmpty);
+        s.pending_refresh = Some(watch::Refreshed {
+            path: PathBuf::new(),
+            entries: Vec::new(),
+            scan_ms: 0.0,
+        });
+        close_tab_at(&mut s, 1);
+        assert!(!s.searching);
+        assert!(s.search_edit.text.is_empty());
+        assert!(s.dialog.is_none());
+        assert!(s.pending_refresh.is_none());
+    }
+
+    #[test]
+    fn timestamps_pre_1970_and_group_by_date_unifies_folders_and_files() {
+        let pre = format_time(-86_400);
+        assert!(!pre.is_empty());
+        assert_ne!(month_label(Some(-86_400)), "Unknown date");
+
+        let mut s = init();
+        s.view = View::Files;
+        s.keep_order = false;
+        s.group_by_date = true;
+        let same_day = 1_700_050_000i64;
+        s.entries = vec![
+            make_test_entry("doc.txt", "/x/doc.txt", false, Some(same_day + 10)),
+            make_test_entry("sub", "/x/sub", true, Some(same_day)),
+            make_test_entry("undated.bin", "/x/undated.bin", false, None),
+        ];
+        refresh_visible(&mut s);
+        let headers: Vec<&str> = s.groups.iter().map(|(_, h)| h.as_str()).collect();
+        let expected_day = metadata::format_local_date(same_day);
+        assert_eq!(headers, vec![expected_day.as_str(), "Unknown date"]);
+    }
+
+    #[test]
+    fn init_sets_prefs_sig_matching_current_state() {
+        let s = init();
+        assert_eq!(s.prefs_sig, prefs_signature(&s));
+    }
+
+    #[test]
+    fn os_drag_end_clears_os_drag_state_and_bin_dialogs_confirm() {
+        let mut s = init();
+        s.os_drag = Some(vec!["C:\\x\\a.txt".into()]);
+        let (tx_drop, rx_drop) = std::sync::mpsc::channel();
+        s.osdrop_rx = Some(rx_drop);
+        tx_drop.send(osdrag::OsDragMsg::End).unwrap();
+        let mut rt = rune::Runtime::new(init(), view, (800.0, 600.0), rune::Env::new(true, 1.0));
+        rt.update(|_, tx| {
+            assert!(drain_osdrop(&mut s, tx));
+        });
+        assert!(s.os_drag.is_none());
+
+        let item = fileops::BinItem {
+            original: PathBuf::from("/x/deleted.txt"),
+            content: PathBuf::from("/trash/deleted.txt"),
+            info: PathBuf::from("/trash/deleted.info"),
+            when: std::time::SystemTime::now(),
+            size: 1,
+            is_dir: false,
+        };
+        open_dialog(&mut s, Dialog::BinDelete { item });
+        assert_eq!(dialog_buttons(s.dialog.as_ref()), vec![DialogButton::Cancel, DialogButton::Confirm]);
+        press_dialog_button(&mut s, DialogButton::Cancel);
+        assert!(s.dialog.is_none());
     }
 }

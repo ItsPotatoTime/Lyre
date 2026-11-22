@@ -472,11 +472,48 @@ fn copy_at(
         if let Some(parent) = dst.parent() {
             let _ = fs::create_dir_all(parent);
         }
-        let copied = fs::copy(src, dst).map_err(|e| format!("{}: {e}", src.display()))?;
+        copy_file_chunked(src, dst, &meta, cancel, report)?;
         apply_times(&meta, dst, false);
-        report(copied);
         Ok(())
     }
+}
+
+/// Copy one regular file in chunks so large transfers report progress in real
+/// time and stop promptly when cancelled.
+fn copy_file_chunked(
+    src: &Path,
+    dst: &Path,
+    meta: &fs::Metadata,
+    cancel: &AtomicBool,
+    report: &mut dyn FnMut(u64),
+) -> Result<(), String> {
+    use std::io::{Read, Write};
+    const CHUNK: usize = 256 * 1024;
+    let mut reader = fs::File::open(src).map_err(|e| format!("{}: {e}", src.display()))?;
+    let mut writer = fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(dst)
+        .map_err(|e| format!("{}: {e}", dst.display()))?;
+    let mut buf = vec![0u8; CHUNK];
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            drop(writer);
+            let _ = fs::remove_file(dst);
+            return Err("Cancelled".into());
+        }
+        let n = reader.read(&mut buf).map_err(|e| format!("{}: {e}", src.display()))?;
+        if n == 0 {
+            break;
+        }
+        writer
+            .write_all(&buf[..n])
+            .map_err(|e| format!("{}: {e}", dst.display()))?;
+        report(n as u64);
+    }
+    let _ = fs::set_permissions(dst, meta.permissions());
+    Ok(())
 }
 
 /// Make a link at `dst` that points where `src` points.
@@ -638,10 +675,22 @@ fn restore_one(_item: &Trashed) -> Result<(), String> {
 }
 
 fn remove_item(path: &Path) -> Result<(), String> {
+    let cancel = AtomicBool::new(false);
+    remove_item_progress(path, &cancel, &mut |_| {})
+}
+
+fn remove_item_progress(
+    path: &Path,
+    cancel: &AtomicBool,
+    report: &mut dyn FnMut(u64),
+) -> Result<(), String> {
+    if cancel.load(Ordering::Relaxed) {
+        return Err("Cancelled".into());
+    }
     let meta = fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     // On Windows a junction or directory symlink is a reparse point with
     // FILE_ATTRIBUTE_DIRECTORY (0x10) set even when broken; DeleteFile cannot
-    // remove a directory reparse point, so remove_dir_all must be used.
+    // remove a directory reparse point, so remove_dir must be used.
     #[cfg(windows)]
     let folder_link = {
         use std::os::windows::fs::MetadataExt;
@@ -649,10 +698,21 @@ fn remove_item(path: &Path) -> Result<(), String> {
     };
     #[cfg(not(windows))]
     let folder_link = false;
-    if meta.is_dir() || folder_link {
-        fs::remove_dir_all(path).map_err(|e| format!("{}: {e}", path.display()))
+    if folder_link {
+        return fs::remove_dir(path).map_err(|e| format!("{}: {e}", path.display()));
+    }
+    if meta.is_dir() {
+        let entries = fs::read_dir(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        for item in entries {
+            let entry = item.map_err(|e| format!("{}: {e}", path.display()))?;
+            remove_item_progress(&entry.path(), cancel, report)?;
+        }
+        fs::remove_dir(path).map_err(|e| format!("{}: {e}", path.display()))
     } else {
-        fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()))
+        let size = if meta.file_type().is_symlink() { 0 } else { meta.len() };
+        fs::remove_file(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        report(size);
+        Ok(())
     }
 }
 
@@ -1008,7 +1068,6 @@ pub fn paste<F: FnMut(Progress) -> bool>(
         if !emit(Progress { done: shown, total, name: name.clone(), done_bytes, total_bytes }) {
             break;
         }
-        shown += 1;
         // Measured before the item goes: after a cut the source is gone and
         // reads as zero, so a move's progress never reached the total.
         let size_before = item_size(src);
@@ -1016,7 +1075,7 @@ pub fn paste<F: FnMut(Progress) -> bool>(
             let mut report = |add: u64| {
                 done_bytes += add;
                 if last_emit.elapsed() >= std::time::Duration::from_millis(60)
-                    || done_bytes - last_bytes >= step
+                    || done_bytes.saturating_sub(last_bytes) >= step
                 {
                     last_emit = std::time::Instant::now();
                     last_bytes = done_bytes;
@@ -1027,6 +1086,7 @@ pub fn paste<F: FnMut(Progress) -> bool>(
         };
         match outcome {
             Ok(dst) => {
+                shown += 1;
                 // A rename moves bytes without copying them; credit them at the end.
                 completed += size_before;
                 done_bytes = done_bytes.max(completed);
@@ -1145,6 +1205,9 @@ pub fn delete<F: FnMut(Progress) -> bool>(
     let mut deleted = 0usize;
     let mut trashed: Vec<Trashed> = Vec::new();
     let mut error = None;
+    let mut last_emit = std::time::Instant::now();
+    let mut last_bytes = 0u64;
+    let step = (total_bytes / 16).max(1);
     for (i, path) in paths.iter().enumerate() {
         if cancel.load(Ordering::Relaxed) {
             break;
@@ -1154,11 +1217,28 @@ pub fn delete<F: FnMut(Progress) -> bool>(
             break;
         }
         let size = item_size(path);
+        let done_before = done_bytes;
         let failed = match mode {
-            DeleteMode::Permanent => remove_item(path).err(),
+            DeleteMode::Permanent => {
+                let mut completed = done_bytes;
+                let mut report = |add: u64| {
+                    completed += add;
+                    if last_emit.elapsed() >= std::time::Duration::from_millis(60)
+                        || completed.saturating_sub(last_bytes) >= step
+                    {
+                        last_emit = std::time::Instant::now();
+                        last_bytes = completed;
+                        emit(Progress { done: i, total, name: name.clone(), done_bytes: completed, total_bytes });
+                    }
+                };
+                let res = remove_item_progress(path, cancel, &mut report).err();
+                done_bytes = completed.max(done_bytes);
+                res
+            }
             DeleteMode::Trash => match trash_one(path) {
                 Ok(item) => {
                     trashed.push(item);
+                    done_bytes += size;
                     None
                 }
                 Err(e) => Some(e),
@@ -1168,7 +1248,9 @@ pub fn delete<F: FnMut(Progress) -> bool>(
             error = Some(e);
             break;
         }
-        done_bytes += size;
+        if mode == DeleteMode::Permanent {
+            done_bytes = done_bytes.max(done_before + size);
+        }
         deleted += 1;
         emit(Progress { done: i + 1, total, name, done_bytes, total_bytes });
     }
@@ -1941,6 +2023,36 @@ mod tests {
             "progress must climb inside the folder: {seen:?}"
         );
         assert_eq!(seen.last().unwrap().0, total);
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn single_large_file_copy_reports_bytes_while_it_runs() {
+        let base = scratch("single-file-progress");
+        let src = base.join("big.bin");
+        let total: u64 = 6 * 1024 * 1024;
+        fs::write(&src, vec![9u8; total as usize]).unwrap();
+        let dest = base.join("dest");
+        fs::create_dir_all(&dest).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut seen = Vec::new();
+        let pasted = paste(
+            Mode::Copy,
+            Conflict::Rename,
+            &[src],
+            &dest,
+            &cancel,
+            |p| {
+                seen.push((p.done, p.total, p.done_bytes, p.total_bytes));
+                true
+            },
+        );
+        assert!(pasted.error.is_none(), "the copy must finish: {:?}", pasted.error);
+        assert!(
+            seen.iter().any(|&(done, tot, d, t)| done == 0 && tot == 1 && t == total && d > 0 && d < total),
+            "single-file copy must report intermediate bytes while done == 0: {seen:?}"
+        );
+        assert_eq!(seen.last().copied(), Some((1, 1, total, total)));
         let _ = fs::remove_dir_all(&base);
     }
 

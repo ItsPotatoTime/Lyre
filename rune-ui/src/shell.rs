@@ -114,6 +114,18 @@ mod win {
     #[link(name = "shell32")]
     unsafe extern "system" {
         fn ShellExecuteExW(info: *mut ExecuteInfo) -> i32;
+        fn SHOpenWithDialog(hwnd: isize, info: *const OpenAsInfo) -> i32;
+    }
+    #[link(name = "ole32")]
+    unsafe extern "system" {
+        fn CoInitializeEx(reserved: *mut c_void, coinit: u32) -> i32;
+    }
+
+    #[repr(C)]
+    struct OpenAsInfo {
+        pcsz_file: *const u16,
+        pcsz_class: *const u16,
+        oaif_in_flags: u32,
     }
 
     #[repr(C)]
@@ -704,7 +716,39 @@ mod win {
     }
 
     pub fn open_with_picker(path: &str) -> Result<(), String> {
-        execute("openas", path, None)
+        const SEE_MASK_INVOKEIDLIST: u32 = 0x0000_000C;
+        const COINIT_APARTMENTTHREADED: u32 = 0x2;
+        const OAIF_ALLOW_REGISTRATION: u32 = 0x0000_0001;
+        const OAIF_REGISTER_EXT: u32 = 0x0000_0002;
+        const OAIF_EXEC: u32 = 0x0000_0004;
+        const E_CANCELLED: i32 = -2147023673; // HRESULT_FROM_WIN32(ERROR_CANCELLED)
+        let hwnd = crate::frame::hwnd().unwrap_or(0);
+        let verb_w = wide("openas");
+        let file_w = wide(path);
+        let mut exec: ExecuteInfo = unsafe { std::mem::zeroed() };
+        exec.size = std::mem::size_of::<ExecuteInfo>() as u32;
+        exec.mask = SEE_MASK_INVOKEIDLIST;
+        exec.window = hwnd as usize;
+        exec.verb = verb_w.as_ptr();
+        exec.file = file_w.as_ptr();
+        exec.show = SW_SHOWNORMAL;
+        if unsafe { ShellExecuteExW(&mut exec) } != 0 {
+            return Ok(());
+        }
+        let info = OpenAsInfo {
+            pcsz_file: file_w.as_ptr(),
+            pcsz_class: std::ptr::null(),
+            oaif_in_flags: OAIF_ALLOW_REGISTRATION | OAIF_REGISTER_EXT | OAIF_EXEC,
+        };
+        let hr = unsafe {
+            let _ = CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED);
+            SHOpenWithDialog(hwnd, &info)
+        };
+        if hr == 0 || hr == E_CANCELLED {
+            Ok(())
+        } else {
+            Err("Windows could not open the application picker.".into())
+        }
     }
 }
 

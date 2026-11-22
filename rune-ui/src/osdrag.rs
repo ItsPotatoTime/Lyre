@@ -458,7 +458,30 @@ pub mod win {
         drop: unsafe extern "system" fn(*mut Target, *mut c_void, u32, Point, *mut u32) -> i32,
     }
 
-    unsafe extern "system" fn query(this: *mut Target, _iid: *const c_void, out: *mut *mut c_void) -> i32 {
+    unsafe extern "system" fn query(this: *mut Target, iid: *const c_void, out: *mut *mut c_void) -> i32 {
+        // IUnknown: {00000000-0000-0000-C000-000000000046}
+        const IID_IUNKNOWN: [u8; 16] = [
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+        ];
+        // IDropTarget: {00000122-0000-0000-C000-000000000046}
+        const IID_IDROPTARGET: [u8; 16] = [
+            0x22, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+        ];
+        const E_NOINTERFACE: i32 = -2147467262;
+        if out.is_null() {
+            return -2147467261; // E_POINTER
+        }
+        if iid.is_null() {
+            unsafe { *out = std::ptr::null_mut() };
+            return E_NOINTERFACE;
+        }
+        let requested = unsafe { std::slice::from_raw_parts(iid as *const u8, 16) };
+        if requested != IID_IUNKNOWN && requested != IID_IDROPTARGET {
+            unsafe { *out = std::ptr::null_mut() };
+            return E_NOINTERFACE;
+        }
         unsafe {
             if std::env::var_os("LYRE_TRACE").is_some() {
                 eprintln!("[drop] QueryInterface");

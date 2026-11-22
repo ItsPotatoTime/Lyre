@@ -127,13 +127,15 @@ fn fold_char(ch: char) -> char {
 struct Needle {
     /// The folded query, ASCII-lowercased.
     bytes: Vec<u8>,
+    /// True when the query looks like a file extension (e.g. `.png`).
+    ext_query: bool,
 }
 
 impl Needle {
     fn new(folded: &str) -> Self {
-        Self {
-            bytes: folded.bytes().map(|byte| byte.to_ascii_lowercase()).collect(),
-        }
+        let bytes: Vec<u8> = folded.bytes().map(|byte| byte.to_ascii_lowercase()).collect();
+        let ext_query = bytes.len() >= 2 && bytes[0] == b'.' && !bytes[1..].contains(&b'.');
+        Self { bytes, ext_query }
     }
 
     /// Whether every byte of the query appears in order.
@@ -171,6 +173,7 @@ fn score_name(
     pattern: &Pattern,
     needle: &Needle,
     name: &str,
+    is_dir: bool,
     folded: &mut String,
     buf: &mut Vec<char>,
     matcher: &mut Matcher,
@@ -184,7 +187,23 @@ fn score_name(
     if !needle.is_subsequence(hay) {
         return None;
     }
-    pattern.score(Utf32Str::new(hay, buf), matcher)
+    let base = pattern.score(Utf32Str::new(hay, buf), matcher)?;
+    if needle.ext_query && !is_dir {
+        let hay_bytes = hay.as_bytes();
+        let n_len = needle.bytes.len();
+        if hay_bytes.len() >= n_len
+            && hay_bytes[hay_bytes.len() - n_len..].eq_ignore_ascii_case(&needle.bytes)
+        {
+            return Some(base.saturating_add(10_000));
+        }
+        if hay_bytes
+            .windows(n_len)
+            .any(|w| w.eq_ignore_ascii_case(&needle.bytes))
+        {
+            return Some(base.saturating_add(1_000));
+        }
+    }
+    Some(base)
 }
 
 /// Run a search, emitting results as they are known. `emit` returns false to stop.
@@ -277,7 +296,7 @@ fn score_local(
         if !visible {
             continue;
         }
-        if let Some(score) = score_name(pattern, needle, &entry.name, &mut folded, &mut buf, &mut matcher) {
+        if let Some(score) = score_name(pattern, needle, &entry.name, entry.is_dir, &mut folded, &mut buf, &mut matcher) {
             scored.push((score, i as u32));
         }
     }
@@ -287,13 +306,12 @@ fn score_local(
     (hits, matched)
 }
 
-/// Folders first, then best score, then shorter name, then alphabetical.
+/// Best score first (regardless of file vs folder), then shorter name, then alphabetical.
 fn rank(scored: &mut Vec<(u32, u32)>, entries: &[crate::Entry]) {
     let compare = |a: &(u32, u32), b: &(u32, u32)| {
         let left = &entries[a.1 as usize];
         let right = &entries[b.1 as usize];
-        right.is_dir.cmp(&left.is_dir)
-            .then_with(|| b.0.cmp(&a.0))
+        b.0.cmp(&a.0)
             .then_with(|| left.name.len().cmp(&right.name.len()))
             .then_with(|| left.name.to_lowercase().cmp(&right.name.to_lowercase()))
     };
@@ -567,6 +585,7 @@ fn work(
                 &scratch.pattern,
                 &scratch.needle,
                 &name,
+                is_dir,
                 &mut scratch.folded,
                 &mut scratch.buf,
                 &mut scratch.matcher,
@@ -676,7 +695,7 @@ fn filter_cache(
         if !show_hidden && name.starts_with('.') {
             continue;
         }
-        let Some(score) = score_name(pattern, needle, name, &mut folded, &mut buf, &mut matcher)
+        let Some(score) = score_name(pattern, needle, name, *is_dir, &mut folded, &mut buf, &mut matcher)
         else {
             continue;
         };
@@ -1042,12 +1061,27 @@ mod tests {
     }
 
     #[test]
-    fn folders_rank_before_files() {
-        let entries = vec![entry("report.txt", false), entry("reports", true)];
+    fn best_match_ranks_first_regardless_of_type() {
+        let entries = vec![entry("report", false), entry("reports_archive", true)];
         let req = Request { path: "/folder".into(), local: entries, query: "report".into(), recursive: false, show_hidden: false, show_protected: false, cache: None };
         let events = collect_events(&req);
         let items = match &events[0] { Event::Local { items, .. } => items, _ => panic!() };
-        assert!(items[0].entry.is_dir, "folders lead even when a file scores similarly");
+        assert_eq!(items[0].entry.name, "report", "exact match ranks above longer folder");
+    }
+
+    #[test]
+    fn extension_query_predominates_matching_files() {
+        let entries = vec![
+            entry("some.planning.txt", false),
+            entry(".png_backup", true),
+            entry("photo.png", false),
+            entry("photo.png.bak", false),
+        ];
+        let req = Request { path: "/folder".into(), local: entries, query: ".png".into(), recursive: false, show_hidden: false, show_protected: false, cache: None };
+        let events = collect_events(&req);
+        let items = match &events[0] { Event::Local { items, .. } => items, _ => panic!() };
+        assert_eq!(items[0].entry.name, "photo.png", "file ending in .png ranks first");
+        assert_eq!(items[1].entry.name, "photo.png.bak", "file containing .png ranks second");
     }
 
     #[test]

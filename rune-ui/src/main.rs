@@ -504,7 +504,30 @@ struct Transfer {
     total: usize,
     done_bytes: u64,
     total_bytes: u64,
+    started_at: Instant,
+    last_speed_at: Instant,
+    last_speed_bytes: u64,
+    speed_bps: f64,
     stopping: bool,
+}
+
+impl Transfer {
+    fn new(label: &'static str, total: usize) -> Self {
+        let now = Instant::now();
+        Self {
+            label,
+            name: String::new(),
+            done: 0,
+            total,
+            done_bytes: 0,
+            total_bytes: 0,
+            started_at: now,
+            last_speed_at: now,
+            last_speed_bytes: 0,
+            speed_bps: 0.0,
+            stopping: false,
+        }
+    }
 }
 
 /// What a folder scan reports back from its worker thread.
@@ -1018,6 +1041,7 @@ struct App {
     /// The "Open with" worker's answer: listing applications touches the disk
     /// and, on Linux, runs `xdg-mime`, so it never runs on the UI thread.
     openwith_rx: Option<std::sync::mpsc::Receiver<openwith::OpenWith>>,
+    openwith_defaults: std::collections::BTreeMap<String, String>,
     /// Live search: results stream from a worker into these, replacing the list.
     searching: bool,
     search_hits: Vec<search::Hit>,
@@ -1050,6 +1074,8 @@ struct App {
     rect_filter: Live<[f32; 4]>,
     rect_more: Live<[f32; 4]>,
     rect_window: Live<[f32; 4]>,
+    laid_out_window: std::cell::Cell<[f32; 4]>,
+    pending_reveal_path: Option<String>,
     /// Fixture views arrive in the authored order of the reference captures;
     /// only a real directory scan is sorted by the active column.
     keep_order: bool,
@@ -1773,6 +1799,9 @@ fn load_prefs_from(s: &mut App, id: &str) {
     if let Some(size) = prefs.get::<(u32, u32)>("window_size") {
         s.window_settled = size;
     }
+    if let Some(defaults) = prefs.get::<std::collections::BTreeMap<String, String>>("openwith_defaults") {
+        s.openwith_defaults = defaults;
+    }
 }
 
 /// Write the whole view state and collections; poll calls this once per change.
@@ -1823,13 +1852,14 @@ fn persist_to(s: &App, id: &str) {
     let _ = prefs.set("show_extensions", &s.show_extensions);
     let _ = prefs.set("col_w", &s.col_w);
     let _ = prefs.set("rail_w", &s.rail_w);
+    let _ = prefs.set("openwith_defaults", &s.openwith_defaults);
 }
 
 /// A cheap fingerprint of everything persisted, so poll saves only on change.
 fn prefs_signature(s: &App) -> String {
     let custom = s.custom.clamped();
     format!(
-        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{:?}|{}|{}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{}|{}|{}|{}|{:?}|{}|{}|{:?}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{}|{:?}",
         s.sort,
         s.sort_desc,
         s.preview,
@@ -1866,6 +1896,7 @@ fn prefs_signature(s: &App) -> String {
         custom.fx_frosted,
         custom.fx_shadows,
         custom.fx_borders,
+        s.openwith_defaults,
     )
 }
 
@@ -2232,19 +2263,33 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
     // resize event, so it is sampled here; writing the settings on every frame of
     // a drag would be wasteful, and nothing else would wake the window after the
     // last frame of it, hence the delayed wake.
-    if let Some(size) = frame::content_size()
-        && size != s.window_settled
-    {
-        if s.window_pending != Some(size) {
-            s.window_pending = Some(size);
-            s.window_changed_at = Instant::now();
-            tx.wake_after(std::time::Duration::from_millis(500));
-        } else if s.window_changed_at.elapsed() >= std::time::Duration::from_millis(400) {
-            s.window_settled = size;
+    let mut window_resized = false;
+    if let Some(size) = frame::content_size() {
+        let scale = s.scale.get().max(1.0);
+        let lw = size.0 as f32 / scale;
+        let lh = size.1 as f32 / scale;
+        let cur = s.rect_window.get();
+        if (cur[2] - lw).abs() > 0.5 || (cur[3] - lh).abs() > 0.5 {
+            s.rect_window.set([cur[0], cur[1], lw, lh]);
+            window_resized = true;
+        }
+        if size != s.window_settled {
+            if s.window_pending != Some(size) {
+                s.window_pending = Some(size);
+                s.window_changed_at = Instant::now();
+                tx.wake_after(std::time::Duration::from_millis(500));
+            } else if s.window_changed_at.elapsed() >= std::time::Duration::from_millis(400) {
+                s.window_settled = size;
+                s.window_pending = None;
+            }
+        } else {
             s.window_pending = None;
         }
     } else {
         s.window_pending = None;
+    }
+    if s.rect_window.get() != s.laid_out_window.get() {
+        window_resized = true;
     }
     let headless = is_headless();
     if !headless {
@@ -2274,10 +2319,10 @@ fn poll(s: &mut App, _t: f64, tx: &mut Tx) -> bool {
     }
     // A step taken from the side buttons is a change the view reads, and a step
     // back to a page starts no scan whose answer would mark the frame otherwise.
-    let mut changed = drain_op(s) || stepped || tab_closed;
+    let mut changed = drain_op(s) || stepped || tab_closed || window_resized;
     // Keep frames coming while a transfer runs so its progress drains promptly.
     if s.transfer.is_some() {
-        tx.wake_after(std::time::Duration::from_millis(60));
+        tx.wake_after(std::time::Duration::from_millis(33));
     }
     changed |= drain_icons(s);
     if s.icons_pending.get() > 0 {
@@ -2512,6 +2557,13 @@ fn drain_scan(s: &mut App) -> bool {
     s.entries = result.entries;
     s.scan_ms = result.scan_ms;
     refresh_visible(s);
+    if let Some(target) = s.pending_reveal_path.take()
+        && let Some(ei) = s.entries.iter().position(|e| e.path == target)
+    {
+        select_entry(s, ei);
+        s.reveal = Some(ei);
+        s.reveal_at = Some(std::time::Instant::now());
+    }
     true
 }
 
@@ -3223,6 +3275,7 @@ fn init() -> App {
         undo: Vec::new(),
         redo: Vec::new(),
         openwith_rx: None,
+        openwith_defaults: std::collections::BTreeMap::new(),
         searching: false,
         search_hits: Vec::new(),
         search_matched: 0,
@@ -3248,6 +3301,8 @@ fn init() -> App {
         rect_filter: Live::new([0.0; 4]),
         rect_more: Live::new([0.0; 4]),
         rect_window: Live::new([0.0; 4]),
+        laid_out_window: std::cell::Cell::new([0.0; 4]),
+        pending_reveal_path: None,
         keep_order: false,
         count_override: None,
         zoom: false,
@@ -4400,6 +4455,7 @@ fn view(s: &App, cx: &mut Cx<App>) -> El {
     }
     let p = paint(s, cx.env().scale);
     s.scale.set(cx.env().scale);
+    s.laid_out_window.set(s.rect_window.get());
     // The thumb is a window-level overlay driven by the Files viewport; when
     // that viewport is not mounted nothing refreshes it, so hide it here.
     if s.view != View::Files {
@@ -5715,11 +5771,7 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                         let open_label = if is_dir { "Open" } else { "Open with default app" };
                         rows.push(
                             menu_item(p, open_label, Some(Ico::Open), Some("Enter"), false).on_press(move |s: &mut App| {
-                                if is_dir {
-                                    go(s, PathBuf::from(&open));
-                                } else if let Err(e) = shell::open_default(&open) {
-                                    s.notice = e;
-                                }
+                                open_path(s, &open, is_dir);
                                 s.menu = None;
                             }),
                         );
@@ -5738,6 +5790,19 @@ fn menu_overlay(s: &App, p: Paint) -> El {
                                 start_open_with(s, open.clone(), label.clone());
                                 s.menu = None;
                             }),
+                        );
+                        h += MENU_ROW_H;
+                    }
+                    if s.searching && let Some(parent) = Path::new(&path).parent() {
+                        let folder = parent.to_path_buf();
+                        let target_path = path.clone();
+                        rows.push(
+                            menu_item(p, "Open file location", None, None, false).on_press(
+                                move |s: &mut App| {
+                                    s.menu = None;
+                                    open_file_location(s, &folder, &target_path);
+                                },
+                            ),
                         );
                         h += MENU_ROW_H;
                     }
@@ -7260,12 +7325,15 @@ fn press_dialog_button(s: &mut App, button: DialogButton) {
                 return;
             };
             let (path, selected) = (path.clone(), selected.clone());
-            // Windows cannot be told a new default, so the one-off open is all
-            // that is left to honour there.
-            let commit = *remember && !data.as_ref().is_some_and(|d| d.default_via_picker);
+            let via_picker = data.as_ref().is_some_and(|d| d.default_via_picker);
+            let kind = data.as_ref().map(|d| d.kind.clone()).unwrap_or_default();
+            let remember = *remember;
             if let Some(id) = selected {
+                if via_picker && remember && !kind.is_empty() {
+                    s.openwith_defaults.insert(kind, id.clone());
+                }
                 s.dialog = None;
-                apply_open_with(s, &path, &id, commit);
+                apply_open_with(s, &path, &id, remember && !via_picker);
             }
         }
     }
@@ -7566,16 +7634,42 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
                     .child(dialog_buttons_el(s, p)),
             )
         }
-        Dialog::OpenWith { name, data, selected, remember, .. } => {
+        Dialog::OpenWith { path: file_path, name, data, selected, remember, .. } => {
             let picked = selected.clone();
-            let mut panel = base().child(
-                text(format!("Open “{name}” with")).font(TILE_TEXT).color(p.text).truncate(),
+            let kind_badge = data
+                .as_ref()
+                .filter(|d| !d.kind.is_empty())
+                .map(|d| d.kind.clone());
+            let mut header = row().w_full().items_center().gap(8.0).child(
+                text(format!("Open “{name}”"))
+                    .font(TILE_TEXT)
+                    .color(p.text)
+                    .grow(1.0)
+                    .min_w(0.0)
+                    .truncate(),
             );
+            if let Some(kind) = kind_badge {
+                header = header.child(
+                    row()
+                        .px(7.0)
+                        .py(2.0)
+                        .radius(4.0)
+                        .fill(p.field)
+                        .border(p.hair, p.line)
+                        .child(text(kind).font(CAPTION).color(p.secondary)),
+                );
+            }
+            let mut panel = base()
+                .child(header)
+                .child(el().w_full().h(p.hair).fill(p.line));
             let mut loaded: Option<&openwith::OpenWith> = None;
             match data {
                 None => {
                     panel = panel.child(
-                        text("Looking for applications…").font(UI_TEXT).color(p.secondary),
+                        row()
+                            .w_full()
+                            .py(12.0)
+                            .child(text("Looking for applications…").font(UI_TEXT).color(p.secondary)),
                     );
                 }
                 Some(d) => {
@@ -7592,7 +7686,7 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
                         };
                         panel = panel.child(
                             text(format!(
-                                "No application on this system says it can open {kind}files."
+                                "No registered application says it can open {kind}files. Use Choose another app to pick one."
                             ))
                             .font(UI_TEXT)
                             .color(p.secondary)
@@ -7600,26 +7694,32 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
                             .wrap(),
                         );
                     } else {
-                        let default_id = d.default_app.clone();
-                        // Application lists run long: the whole set scrolls
-                        // inside a fixed height rather than growing the dialog.
+                        let default_id = if d.kind.is_empty() {
+                            None
+                        } else {
+                            s.openwith_defaults.get(&d.kind).cloned()
+                        }
+                        .or_else(|| d.default_app.clone());
                         let mut list = col()
                             .key("openwith-list")
                             .w_full()
-                            .gap(2.0)
-                            .max_h(252.0)
+                            .gap(4.0)
+                            .max_h(280.0)
                             .scroll(ScrollSpec { stick_bottom: false });
                         for app in &d.apps {
                             let id = app.id.clone();
+                            let dbl_id = app.id.clone();
+                            let dbl_path = file_path.clone();
                             let is_default = default_id.as_deref() == Some(app.id.as_str());
                             let is_selected = picked.as_deref() == Some(app.id.as_str());
                             let mut item = row()
                                 .w_full()
-                                .h(30.0)
-                                .px(8.0)
+                                .h(36.0)
+                                .px(10.0)
                                 .gap(10.0)
-                                .radius(4.0)
-                                .fill(Color::TRANSPARENT)
+                                .radius(6.0)
+                                .fill(if is_selected { p.row_sel } else { Color::TRANSPARENT })
+                                .border(p.hair, if is_selected { p.focus_line } else { Color::TRANSPARENT })
                                 .items_center()
                                 .hover(p.hover)
                                 .press(p.press)
@@ -7636,12 +7736,20 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
                                     if let Some(Dialog::OpenWith { selected, .. }) = &mut s.dialog {
                                         *selected = Some(id.clone());
                                     }
+                                })
+                                .on_double_press(move |s: &mut App| {
+                                    s.dialog = None;
+                                    apply_open_with(s, &dbl_path, &dbl_id, false);
                                 });
-                            if is_selected {
-                                item = item.fill(p.row_sel);
-                            }
                             if is_default {
-                                item = item.child(text("Default").font(CAPTION).color(p.accent));
+                                item = item.child(
+                                    row()
+                                        .px(6.0)
+                                        .py(2.0)
+                                        .radius(4.0)
+                                        .fill(p.accent.alpha(0.14))
+                                        .child(text("Default").font(CAPTION).color(p.accent)),
+                                );
                             }
                             list = list.child(item);
                         }
@@ -7651,13 +7759,18 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
             }
 
             let via_picker = loaded.is_some_and(|d| d.default_via_picker);
+            let has_apps = loaded.is_some_and(|d| !d.apps.is_empty());
 
-            // Ours to honour on Linux and macOS. On Windows the association is
-            // hash-protected, so this row gives way to the system's own picker.
-            if loaded.is_some() && !via_picker {
-                let label = match loaded.and_then(|d| (!d.kind.is_empty()).then(|| d.kind.clone())) {
-                    Some(kind) => format!("Always use this application to open {kind} files"),
-                    None => "Always use this application for these files".to_string(),
+            // On Linux/macOS this writes the OS default; on Windows it saves
+            // an in-Lyre per-extension default since UserChoice is locked.
+            if has_apps {
+                let kind_label = loaded
+                    .and_then(|d| (!d.kind.is_empty()).then(|| d.kind.clone()));
+                let label = match (via_picker, kind_label) {
+                    (true, Some(kind)) => format!("Always use this app in Lyre for {kind} files"),
+                    (true, None) => "Always use this app in Lyre for these files".to_string(),
+                    (false, Some(kind)) => format!("Always use this application to open {kind} files"),
+                    (false, None) => "Always use this application for these files".to_string(),
                 };
                 panel = panel.child(
                     row()
@@ -7683,12 +7796,28 @@ fn dialog_overlay(s: &App, p: Paint) -> El {
                 );
             }
 
-            let footer = row()
-                .w_full()
-                .gap(8.0)
-                .items_center()
-                .child(el().grow(1.0))
-                .child(dialog_buttons_el(s, p));
+            let buttons = dialog_buttons(s.dialog.as_ref());
+            let focus = dialog_focus_index(s, buttons.len());
+            let mut footer = row().w_full().gap(8.0).items_center();
+            if let Some(ci) = buttons.iter().position(|b| *b == DialogButton::ChooseApp) {
+                let label = dialog_button_label(s, DialogButton::ChooseApp);
+                footer = footer.child(
+                    dialog_button(p, &label, false, ci == focus)
+                        .on_press(|s: &mut App| press_dialog_button(s, DialogButton::ChooseApp)),
+                );
+            }
+            footer = footer.child(el().grow(1.0));
+            for (i, &button) in buttons.iter().enumerate() {
+                if button == DialogButton::ChooseApp {
+                    continue;
+                }
+                let label = dialog_button_label(s, button);
+                let primary = dialog_button_primary(button);
+                footer = footer.child(
+                    dialog_button(p, &label, primary, i == focus)
+                        .on_press(move |s: &mut App| press_dialog_button(s, button)),
+                );
+            }
             panel.child(footer)
         }
         Dialog::Properties(details) => {
@@ -8078,7 +8207,18 @@ fn details_header(s: &App, p: Paint) -> El {
         }));
     }
     h = h.child(column_divider(p, 3));
-    h.child(el().grow(1.0))
+    if s.searching {
+        h.child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .pl(12.0)
+                .pr(8.0)
+                .child(text("Location").font(CAPTION).color(p.secondary)),
+        )
+    } else {
+        h.child(el().grow(1.0))
+    }
 }
 
 /// A column divider: a hairline centred in a wider grab zone that resizes the
@@ -8244,6 +8384,26 @@ fn clear_selection(s: &mut App) {
 /// The display row the focus sits on, defaulting to the first.
 fn focus_row(s: &App) -> usize {
     s.focused.and_then(|ei| row_of(s, ei)).unwrap_or(0)
+}
+
+/// Number of items per row in the active file view for Up/Down arrow navigation.
+fn grid_columns(s: &App) -> usize {
+    let (item_w, pad_x, gap) = if s.view == View::Gallery {
+        (148.0_f32, 32.0_f32, 4.0_f32)
+    } else if s.view == View::Files {
+        match s.mode {
+            Mode::Grid => (106.0, 32.0, 8.0),
+            Mode::List => (230.0, 24.0, 2.0),
+            Mode::Tiles => (268.0, 32.0, 8.0),
+            Mode::Details => return 1,
+        }
+    } else {
+        return 1;
+    };
+    let vp_w = s.viewport_rect.get()[2];
+    let room = if vp_w > 1.0 { vp_w } else { content_width(s) };
+    let inner = (room - pad_x).max(item_w);
+    ((inner + gap) / (item_w + gap)).floor().max(1.0) as usize
 }
 
 /// The element key a row is drawn under, per view, for scroll-into-view.
@@ -8921,6 +9081,7 @@ fn start_search(s: &mut App, query: String) {
 fn drain_search(s: &mut App) -> bool {
     let mut changed = false;
     let mut done = false;
+    let mut sort_needed = false;
     let mut reset_sel = false;
     if let Some(rx) = &s.search_rx {
         while let Ok(ev) = rx.try_recv() {
@@ -8936,6 +9097,7 @@ fn drain_search(s: &mut App) -> bool {
                 search::Event::Batch { items, scanned } => {
                     s.search_hits.extend(items);
                     s.search_scanned = scanned;
+                    sort_needed = true;
                     changed = true;
                 }
                 search::Event::Index(cache) => {
@@ -8959,16 +9121,15 @@ fn drain_search(s: &mut App) -> bool {
         clear_selection(s);
         s.marquee_rects.borrow_mut().clear();
     }
-    if done {
+    if sort_needed || done {
         let path_of = |i: usize| s.search_hits.get(i).map(|h| h.entry.path.clone());
         let sel_paths: Vec<String> = s.selected.iter().filter_map(|&i| path_of(i)).collect();
         let foc_path = s.focused.and_then(path_of);
         let anc_path = s.anchor.and_then(path_of);
-        // Settle the streamed results into one ranked list: folders first, then
-        // score, then the shorter name, then alphabetical.
+        // Settle the streamed results into one ranked list: best score first
+        // regardless of item type, then shorter name, then alphabetical.
         s.search_hits.sort_by(|a, b| {
-            b.entry.is_dir.cmp(&a.entry.is_dir)
-                .then_with(|| b.score.cmp(&a.score))
+            b.score.cmp(&a.score)
                 .then_with(|| a.entry.name.len().cmp(&b.entry.name.len()))
                 .then_with(|| a.entry.name.to_lowercase().cmp(&b.entry.name.to_lowercase()))
         });
@@ -8976,12 +9137,30 @@ fn drain_search(s: &mut App) -> bool {
         s.selected = sel_paths.iter().filter_map(|p| index_of(p)).collect();
         s.focused = foc_path.as_deref().and_then(index_of);
         s.anchor = anc_path.as_deref().and_then(index_of);
-        update_selection_detail(s);
-        s.marquee_rects.borrow_mut().clear();
-        s.search_rx = None;
-        s.search_cancel = None;
+        if done {
+            update_selection_detail(s);
+            s.marquee_rects.borrow_mut().clear();
+            s.search_rx = None;
+            s.search_cancel = None;
+        }
     }
     changed
+}
+
+/// Navigate to `folder` from search results and highlight `target_path`.
+fn open_file_location(s: &mut App, folder: &Path, target_path: &str) {
+    s.search_edit.clear();
+    clear_search(s);
+    if s.view == View::Files && folder == s.root {
+        if let Some(ei) = s.entries.iter().position(|e| e.path == target_path) {
+            select_entry(s, ei);
+            s.reveal = Some(ei);
+            s.reveal_at = Some(std::time::Instant::now());
+        }
+        return;
+    }
+    s.pending_reveal_path = Some(target_path.to_string());
+    go(s, folder.to_path_buf());
 }
 
 /// Stop searching and return to the folder listing.
@@ -9546,7 +9725,7 @@ fn start_paste(s: &mut App, mode: fileops::Mode, conflict: fileops::Conflict, so
     } else {
         None
     };
-    s.transfer = Some(Transfer { label, name: String::new(), done: 0, total, done_bytes: 0, total_bytes: 0, stopping: false });
+    s.transfer = Some(Transfer::new(label, total));
     std::thread::spawn(move || {
         let progress_tx = tx.clone();
         let emit = |p: fileops::Progress| {
@@ -9592,7 +9771,7 @@ fn start_delete(s: &mut App, mode: fileops::DeleteMode, paths: Vec<PathBuf>) {
     s.op_rx = Some(rx);
     s.op_cancel = Some(cancel);
     s.op_cut_paths = None;
-    s.transfer = Some(Transfer { label: "Deleting", name: String::new(), done: 0, total, done_bytes: 0, total_bytes: 0, stopping: false });
+    s.transfer = Some(Transfer::new("Deleting", total));
     std::thread::spawn(move || {
         let progress_tx = tx.clone();
         let emit = |p: fileops::Progress| {
@@ -9808,6 +9987,23 @@ fn drain_op(s: &mut App) -> bool {
                         t.total = p.total;
                         t.done_bytes = p.done_bytes;
                         t.total_bytes = p.total_bytes;
+                        let dt = t.last_speed_at.elapsed().as_secs_f64();
+                        if dt >= 0.25 {
+                            let dbytes = t.done_bytes.saturating_sub(t.last_speed_bytes) as f64;
+                            let inst = dbytes / dt;
+                            t.speed_bps = if t.speed_bps <= 0.0 {
+                                inst
+                            } else {
+                                t.speed_bps * 0.6 + inst * 0.4
+                            };
+                            t.last_speed_at = Instant::now();
+                            t.last_speed_bytes = t.done_bytes;
+                        } else if t.speed_bps <= 0.0 && t.done_bytes > 0 {
+                            let total_dt = t.started_at.elapsed().as_secs_f64();
+                            if total_dt >= 0.05 {
+                                t.speed_bps = t.done_bytes as f64 / total_dt;
+                            }
+                        }
                     }
                     changed = true;
                 }
@@ -9894,6 +10090,15 @@ fn open_path(s: &mut App, path: &str, is_dir: bool) {
         return go(s, folder);
     }
     record_recent(s, path);
+    let ext = openwith::extension_of(path);
+    if !ext.is_empty()
+        && let Some(app_id) = s.openwith_defaults.get(&ext)
+    {
+        if let Err(err) = openwith::open_with_app(path, app_id) {
+            s.notice = err;
+        }
+        return;
+    }
     if let Err(err) = shell::open_default(path) {
         s.notice = err;
     }
@@ -9919,7 +10124,7 @@ fn start_open_with(s: &mut App, path: String, name: String) {
         name,
         data: None,
         selected: None,
-        remember: true,
+        remember: false,
     });
     std::thread::spawn(move || {
         let _ = tx.send(openwith::open_with(&path));
@@ -9940,7 +10145,8 @@ fn drain_openwith(s: &mut App) -> bool {
         s.openwith_rx = Some(rx);
         return false;
     };
-    let default = data.default_app.clone();
+    let saved_default = s.openwith_defaults.get(&data.kind).cloned();
+    let default = saved_default.or_else(|| data.default_app.clone());
     let first = data.apps.first().map(|app| app.id.clone());
     if let Some(Dialog::OpenWith { data: slot, selected, .. }) = &mut s.dialog {
         *slot = Some(data);
@@ -10229,12 +10435,31 @@ fn handle_key(s: &mut App, ev: &KeyEvent, tx: &mut Tx) -> bool {
             go_up(s);
             true
         }
-        Key::Up | Key::Left => {
+        Key::Left => {
             move_focus(s, focus_row(s).saturating_sub(1), ev.mods, tx);
             true
         }
-        Key::Down | Key::Right => {
+        Key::Right => {
             move_focus(s, focus_row(s) + 1, ev.mods, tx);
+            true
+        }
+        Key::Up => {
+            let step = grid_columns(s);
+            let cur = focus_row(s);
+            if cur >= step {
+                move_focus(s, cur - step, ev.mods, tx);
+            }
+            true
+        }
+        Key::Down => {
+            let step = grid_columns(s);
+            let cur = focus_row(s);
+            let len = display_len(s);
+            if cur + step < len {
+                move_focus(s, cur + step, ev.mods, tx);
+            } else if len > 0 && step > 1 && cur / step < (len - 1) / step {
+                move_focus(s, len - 1, ev.mods, tx);
+            }
             true
         }
         Key::Home => {
@@ -10363,7 +10588,7 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
     let widths = column_widths(s);
     let mut line = row()
         .key(format!("row-{i}"))
-        .w(row_width(s))
+        .w(if s.searching { row_width(s).max(content_width(s)) } else { row_width(s) })
         .h(row_h(s))
         .items_center()
         .fill(if selected || drop_hot(s, &format!("row:{}", e.path)) { p.row_sel } else { Color::TRANSPARENT })
@@ -10374,7 +10599,7 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
     } else if focused && selected {
         line = line.border(p.hair, p.focus_line);
     }
-    let line = line
+    let mut line = line
         .child(
             row()
                 .w(widths[0])
@@ -10426,6 +10651,26 @@ fn file_row(s: &App, i: usize, p: Paint) -> El {
             ),
         )
         .child(el().w(COL_SEP_W).h(16.0).center().child(el().w(p.hair).h(16.0).fill(p.soft_line)));
+    if s.searching {
+        let parent = Path::new(&e.path)
+            .parent()
+            .map(|dir| dir.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        line = line.child(
+            col()
+                .grow(1.0)
+                .min_w(0.0)
+                .pl(12.0)
+                .pr(12.0)
+                .child(
+                    text(parent)
+                        .font(ROW_TEXT)
+                        .color(p.tertiary)
+                        .w_full()
+                        .truncate(),
+                ),
+        );
+    }
     os_drag_source(marquee_track(
         line.on_press_tx(move |s: &mut App, tx: &mut Tx| {
             click_select(s, ei, tx.mods());
@@ -11665,7 +11910,7 @@ fn status_bar(s: &App, p: Paint) -> El {
         .gap(8.0)
         .items_center();
 
-    // A running transfer takes the bar: label, progress, percent and cancel.
+    // A running transfer takes the bar: label, progress, percent, speed and cancel.
     if let Some(t) = &s.transfer {
         let frac = if t.total_bytes > 0 {
             (t.done_bytes as f64 / t.total_bytes as f64).min(1.0) as f32
@@ -11674,10 +11919,16 @@ fn status_bar(s: &App, p: Paint) -> El {
         } else {
             0.0
         };
-        let readout = if t.total_bytes > 0 {
-            format!("{}% ({} of {})", (frac * 100.0) as u32, t.done.min(t.total), t.total)
+        let pct = (frac * 100.0).floor().min(100.0) as u32;
+        let speed = if t.speed_bps >= 1.0 {
+            format!(" · {}/s", format_size(t.speed_bps.round() as u64))
         } else {
-            format!("{} of {}", t.done.min(t.total), t.total)
+            String::new()
+        };
+        let readout = if t.total > 0 {
+            format!("{pct}% ({} of {}){speed}", t.done.min(t.total), t.total)
+        } else {
+            format!("{pct}%{speed}")
         };
         let label = if t.stopping { "Stopping".to_string() } else { format!("{} {}", t.label, t.name) };
         let cancel_label = if t.stopping { "Stopping…" } else { "Cancel" };
@@ -11812,6 +12063,14 @@ fn fit_to_screen(saved: (u32, u32), screen: (u32, u32), scale: f32) -> Option<(u
     let min_w = ((MIN_W * scale).round() as u32).min(screen.0);
     let min_h = ((MIN_H * scale).round() as u32).min(screen.1);
     Some((saved.0.clamp(min_w, screen.0), saved.1.clamp(min_h, screen.1)))
+}
+
+/// Center a window of `size` inside `screen` at `origin` so a large saved
+/// window never opens partway offscreen.
+fn center_on_screen(size: (u32, u32), origin: (i32, i32), screen: (u32, u32)) -> (i32, i32) {
+    let x = origin.0 + (screen.0.saturating_sub(size.0) / 2) as i32;
+    let y = origin.1 + (screen.1.saturating_sub(size.1) / 2) as i32;
+    (x, y)
 }
 
 /// Where a panic is written: `lyre-crash.log` beside the settings, or the
@@ -12025,15 +12284,13 @@ fn main() {
             ("transfer", |s| {
                 s.view = View::Files;
                 s.mode = Mode::Details;
-                s.transfer = Some(Transfer {
-                    label: "Copying",
-                    name: "ubuntu-24.04.iso".into(),
-                    done: 3,
-                    total: 10,
-                    done_bytes: 450,
-                    total_bytes: 1000,
-                    stopping: false,
-                });
+                let mut t = Transfer::new("Copying", 10);
+                t.name = "ubuntu-24.04.iso".into();
+                t.done = 3;
+                t.done_bytes = 450;
+                t.total_bytes = 1000;
+                t.speed_bps = 128.0 * 1024.0 * 1024.0;
+                s.transfer = Some(t);
             }),
             ("cut", |s| {
                 s.view = View::Files;
@@ -12152,9 +12409,20 @@ fn main() {
         // will actually open on so a size remembered from a larger display still
         // fits, and never below the window's own minimum.
         let saved = rune::prefs::Prefs::open(PREFS_ID).get::<(u32, u32)>("window_size");
+        let primary = displays.iter().find(|d| d.primary).or(displays.first());
         let physical = saved.and_then(|(width, height)| {
-            let display = displays.iter().find(|d| d.primary).or(displays.first())?;
+            let display = primary?;
             fit_to_screen((width, height), display.size, display.scale as f32)
+        });
+        let position = primary.map(|display| {
+            let size = physical.unwrap_or_else(|| {
+                let scale = display.scale.max(0.5) as f32;
+                (
+                    ((1076.0 * scale).round() as u32).min(display.size.0),
+                    ((600.0 * scale).round() as u32).min(display.size.1),
+                )
+            });
+            center_on_screen(size, display.position, display.size)
         });
         let (wants_transparent, startup_backdrop, startup_dark) = startup_backdrop_prefs();
         let startup_transparent = wants_transparent || cfg!(target_os = "macos");
@@ -12165,6 +12433,7 @@ fn main() {
             WindowOptions {
                 borderless: true,
                 resizable: true,
+                position,
                 min_size: Some((MIN_W, MIN_H)),
                 physical_size: physical,
                 transparent: startup_transparent,
@@ -12522,6 +12791,69 @@ mod view_pref_tests {
                 assert!(s.view == View::Gallery, "the rail press opened the Gallery");
                 assert_eq!(s.preview, preview, "the Gallery must leave the pane alone");
             }
+        }
+    }
+
+    #[test]
+    fn center_on_screen_keeps_large_window_inside_display() {
+        assert_eq!(center_on_screen((1920, 1080), (0, 0), (1920, 1080)), (0, 0));
+        assert_eq!(center_on_screen((1600, 900), (100, 50), (1920, 1080)), (260, 140));
+        assert_eq!(center_on_screen((2560, 1440), (0, 0), (1920, 1080)), (0, 0));
+    }
+
+    #[test]
+    fn arrow_down_and_up_step_by_grid_columns() {
+        let mut s = init();
+        s.view = View::Files;
+        s.mode = Mode::Grid;
+        s.viewport_rect.set([0.0, 0.0, 400.0, 400.0]);
+        s.entries = (0..8)
+            .map(|i| Entry {
+                name: format!("item-{i}"),
+                path: format!("/tmp/item-{i}"),
+                is_dir: false,
+                hidden: false,
+                system: false,
+                kind: Kind::Text,
+                size: 1,
+                modified: String::new(),
+                modified_at: Some(0),
+                type_label: "File".into(),
+                fixture: false,
+                fixture_size: String::new(),
+            })
+            .collect();
+        s.visible = (0..8).collect();
+        s.focused = Some(0);
+        let cols = grid_columns(&s);
+        assert_eq!(cols, 3);
+        let mut rt = rune::Runtime::new(s, view, (1000.0, 800.0), rune::Env::new(true, 1.0));
+        let down = rune::KeyEvent { key: rune::Key::Down, mods: rune::Mods::default() };
+        let up = rune::KeyEvent { key: rune::Key::Up, mods: rune::Mods::default() };
+        rt.update(|s, tx| {
+            assert!(handle_key(s, &down, tx));
+            assert_eq!(s.focused, Some(3));
+            assert!(handle_key(s, &up, tx));
+            assert_eq!(s.focused, Some(0));
+        });
+    }
+
+    #[test]
+    fn openwith_default_persists_and_updates_signature() {
+        let mut s = init();
+        let before = prefs_signature(&s);
+        s.openwith_defaults.insert(".md".into(), r"Applications\Notepad.exe".into());
+        assert_ne!(prefs_signature(&s), before);
+        let id = format!("lyre-openwith-test-{}", std::process::id());
+        persist_to(&s, &id);
+        let mut reloaded = init();
+        load_prefs_from(&mut reloaded, &id);
+        assert_eq!(
+            reloaded.openwith_defaults.get(".md").map(String::as_str),
+            Some(r"Applications\Notepad.exe")
+        );
+        if let Some(p) = rune::prefs::Prefs::open(&id).path() {
+            let _ = std::fs::remove_dir_all(p.parent().unwrap_or(p));
         }
     }
 }
@@ -15297,15 +15629,9 @@ mod bugfix_tests {
         let b = PathBuf::from("/fake/b.txt");
         s.clipboard = Some((vec![a.clone(), b.clone()], fileops::Mode::Cut));
         s.op_cut_paths = Some(vec![a.clone(), b.clone()]);
-        s.transfer = Some(Transfer {
-            label: "Moving",
-            name: String::new(),
-            done: 1,
-            total: 2,
-            done_bytes: 0,
-            total_bytes: 0,
-            stopping: false,
-        });
+        let mut t = Transfer::new("Moving", 2);
+        t.done = 1;
+        s.transfer = Some(t);
         let (tx, rx) = std::sync::mpsc::channel();
         s.op_rx = Some(rx);
         tx.send(OpMsg::Done {

@@ -4,6 +4,26 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
+## [0.3.8]
+
+An incremental release improving the Open with dialog and native picker, search ranking and location navigation, file-operation progress tracking, window restore/placement, and sleep stability.
+
+### Added
+
+- **Open with dialog & per-extension defaults.** Redesigned the Open with dialog to match Lyre's frosted panel styling, expanded Windows candidate app discovery, and added per-extension default app persistence.
+- **Search location column & action.** Added a `Location` column to Details search results and an `Open file location` context-menu action to jump directly to a result's folder.
+
+### Improved
+
+- **Search ranking.** Prioritized files matching queried extensions (such as `.png`) and ranked results purely by match relevance instead of forcing folders to the top.
+
+### Fixed
+
+- **Native Open with picker.** Fixed `Choose another app…` by passing `SEE_MASK_INVOKEIDLIST` and the owner window handle to `ShellExecuteExW` (`openas`), opening Windows' native picker with both `Always` and `Just once`.
+- **Sleep & background stability.** Fixed COM `IDropTarget::QueryInterface` IID checks to prevent crashes when the app wakes from sleep or runs in the background.
+- **File operation progress & speed.** Fixed stuck 0% progress bars with chunked copy updates, accurate item counts, permanent-delete progress reporting, and live transfer speed readouts.
+- **Window restore, placement & grid navigation.** Fixed crunched columns on restore, centered/clamped initial window placement within the work area, and fixed `Up`/`Down` arrow navigation in Grid and Gallery views.
+
 ## [0.3.7]
 
 An incremental release adding Recycle Bin sidebar access and parallel loading,

@@ -199,6 +199,14 @@ mod imp {
         ) -> i32;
         fn DwmExtendFrameIntoClientArea(hwnd: isize, margins: *const Margins) -> i32;
     }
+    #[repr(C)]
+    struct MonitorInfo {
+        cb_size: u32,
+        rc_monitor: Rect,
+        rc_work: Rect,
+        flags: u32,
+    }
+
     #[link(name = "user32")]
     unsafe extern "system" {
         fn ShowWindow(hwnd: isize, cmd: i32) -> i32;
@@ -207,6 +215,9 @@ mod imp {
         fn GetWindowPlacement(hwnd: isize, placement: *mut Placement) -> i32;
         fn GetWindowRect(hwnd: isize, rect: *mut Rect) -> i32;
         fn GetClientRect(hwnd: isize, rect: *mut Rect) -> i32;
+        fn MonitorFromWindow(hwnd: isize, flags: u32) -> isize;
+        fn GetMonitorInfoW(monitor: isize, info: *mut MonitorInfo) -> i32;
+        fn SetWindowPos(hwnd: isize, insert_after: isize, x: i32, y: i32, cx: i32, cy: i32, flags: u32) -> i32;
         fn DefSubclassProc(hwnd: isize, msg: u32, wparam: usize, lparam: isize) -> isize;
         fn RedrawWindow(hwnd: isize, rect: *const core::ffi::c_void, region: *mut core::ffi::c_void, flags: u32) -> i32;
         fn LoadImageW(
@@ -230,7 +241,11 @@ mod imp {
 
     const WM_NCHITTEST: u32 = 0x0084;
     const WM_SIZE: u32 = 0x0005;
+    const WM_ACTIVATE: u32 = 0x0006;
     const WM_SYSCOMMAND: u32 = 0x0112;
+    const WM_POWERBROADCAST: u32 = 0x0218;
+    const PBT_APMRESUMESUSPEND: usize = 0x0007;
+    const PBT_APMRESUMEAUTOMATIC: usize = 0x0012;
     const SC_RESTORE: usize = 0xF120;
     /// `WM_SIZE`'s wParam when the window is being minimised.
     const SIZE_MINIMIZED: usize = 1;
@@ -271,6 +286,9 @@ mod imp {
             // for the paint that draws it at its real size instead.
             if (msg == WM_SIZE && wparam != SIZE_MINIMIZED)
                 || (msg == WM_SYSCOMMAND && wparam & 0xFFF0 == SC_RESTORE)
+                || (msg == WM_ACTIVATE && (wparam & 0xFFFF) != 0)
+                || (msg == WM_POWERBROADCAST
+                    && (wparam == PBT_APMRESUMESUSPEND || wparam == PBT_APMRESUMEAUTOMATIC))
             {
                 RedrawWindow(hwnd, std::ptr::null(), std::ptr::null_mut(), RDW_INTERNALPAINT);
             }
@@ -429,9 +447,47 @@ mod imp {
                     );
                     SetWindowSubclass(hwnd, subclass, 1, 0);
                     apply_icon(hwnd);
+                    clamp_to_work_area(hwnd);
                 }
             }
         });
+    }
+
+    /// Keep a newly created window completely inside its monitor's work area so
+    /// a large saved size never starts partly offscreen or behind the taskbar.
+    unsafe fn clamp_to_work_area(hwnd: isize) {
+        const MONITOR_DEFAULTTONEAREST: u32 = 2;
+        const SWP_NOZORDER: u32 = 0x0004;
+        const SWP_NOACTIVATE: u32 = 0x0010;
+        let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+        if monitor == 0 {
+            return;
+        }
+        let mut info = MonitorInfo {
+            cb_size: core::mem::size_of::<MonitorInfo>() as u32,
+            rc_monitor: Rect { left: 0, top: 0, right: 0, bottom: 0 },
+            rc_work: Rect { left: 0, top: 0, right: 0, bottom: 0 },
+            flags: 0,
+        };
+        if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
+            return;
+        }
+        let mut r = Rect { left: 0, top: 0, right: 0, bottom: 0 };
+        if unsafe { GetWindowRect(hwnd, &mut r) } == 0 {
+            return;
+        }
+        let work = info.rc_work;
+        let work_w = (work.right - work.left).max(1);
+        let work_h = (work.bottom - work.top).max(1);
+        let w = (r.right - r.left).min(work_w);
+        let h = (r.bottom - r.top).min(work_h);
+        let x = r.left.clamp(work.left, work.right - w);
+        let y = r.top.clamp(work.top, work.bottom - h);
+        if x != r.left || y != r.top || w != (r.right - r.left) || h != (r.bottom - r.top) {
+            unsafe {
+                SetWindowPos(hwnd, 0, x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
     }
 
     /// Put the embedded icon in the titlebar, taskbar and alt-tab list.

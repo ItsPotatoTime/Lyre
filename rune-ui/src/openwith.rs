@@ -66,7 +66,7 @@ impl OpenWith {
 
 /// The dotted, lower-case extension of a path, or empty when it has none.
 /// Dotfiles such as `.bashrc` count as having no extension, as the platforms do.
-fn extension_of(path: &str) -> String {
+pub fn extension_of(path: &str) -> String {
     Path::new(path)
         .extension()
         .map(|ext| format!(".{}", ext.to_string_lossy().to_lowercase()))
@@ -807,13 +807,41 @@ mod win {
         let default_prog_id = user_choice(&extension);
 
         let mut candidates: Vec<String> = Vec::new();
+        let push_open_with_list = |key: &str, out: &mut Vec<String>| {
+            for entry in shell::reg_subkeys(key) {
+                if entry.eq_ignore_ascii_case("MRUList") || entry.eq_ignore_ascii_case("OpenWithList") {
+                    continue;
+                }
+                if entry.contains('\\') {
+                    out.push(entry);
+                } else {
+                    out.push(format!(r"Applications\{entry}"));
+                }
+            }
+        };
         // What the machine associates with the type, then everything that
         // declared itself for it.
         candidates.extend(shell::reg_string(&extension, None));
         candidates.extend(shell::reg_subkeys(&format!(r"{extension}\OpenWithProgids")));
+        push_open_with_list(&format!(r"{extension}\OpenWithList"), &mut candidates);
         candidates.extend(shell::reg_subkeys(&format!(
-            r"SystemFileAssociations\{extension}\OpenWithList"
+            r"SystemFileAssociations\{extension}\OpenWithProgids"
         )));
+        push_open_with_list(&format!(r"SystemFileAssociations\{extension}\OpenWithList"), &mut candidates);
+        // PerceivedType (e.g. "text" for .md/.rs/.json -> Notepad, editors, etc.)
+        if let Some(perceived) = shell::reg_string(&extension, Some("PerceivedType"))
+            && !perceived.is_empty()
+        {
+            candidates.extend(shell::reg_subkeys(&format!(
+                r"SystemFileAssociations\{perceived}\OpenWithProgids"
+            )));
+            push_open_with_list(
+                &format!(r"SystemFileAssociations\{perceived}\OpenWithList"),
+                &mut candidates,
+            );
+        }
+        candidates.extend(shell::reg_subkeys(r"*\OpenWithProgids"));
+        push_open_with_list(r"*\OpenWithList", &mut candidates);
         // Applications that accept the type list it under SupportedTypes.
         for exe in shell::reg_subkeys("Applications") {
             let key = format!(r"Applications\{exe}\SupportedTypes");

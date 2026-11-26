@@ -4,6 +4,17 @@ What changed, in the order it shipped. The release workflow reads the section
 for the tag being built and copies it into the draft release, so this file is the
 release notes rather than a second copy of them.
 
+## [Unreleased]
+
+### Fixed
+
+- **A copy that stops inside a folder can be taken back.** A paste recorded
+  an item only when it finished, so a folder copy that failed part way (a
+  full disk, a tree nested past the depth limit) left a partial copy behind
+  with no record, and undo could not remove it. A destination the paste
+  created is recorded even when the copy stops; a destination that already
+  stood there is not, so a merge into it is still left alone.
+
 ## [0.3.8]
 
 An incremental release improving the Open with dialog and native picker, search ranking and location navigation, file-operation progress tracking, window restore/placement, and sleep stability.

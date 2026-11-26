@@ -921,7 +921,11 @@ impl Pasted {
     }
 }
 
-/// One item of a paste: where it landed, or why it did not go.
+/// One item of a paste: where it landed, or why it did not go. A failure
+/// also names the destination when this paste created it and the copy
+/// stopped part way, so the caller can record the partial item for undo;
+/// a destination that already stood there is never part of that record,
+/// because a merge into it must be left alone.
 fn paste_one(
     mode: Mode,
     conflict: Conflict,
@@ -930,7 +934,7 @@ fn paste_one(
     cancel: &AtomicBool,
     report: &mut dyn FnMut(u64),
     replaced: &mut Vec<Replaced>,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, (String, Option<PathBuf>)> {
     let name = name_of(src);
     let mut dst = target.join(&name);
     let src_is_link = is_symlink_path(src);
@@ -940,7 +944,7 @@ fn paste_one(
     let initial_dst_norm = target_norm.join(&name);
     // Never paste a folder into itself.
     if src_is_dir && !norm_eq(&initial_dst_norm, &src_norm) && norm_starts_with(&initial_dst_norm, &src_norm) {
-        return Err("Cannot paste a folder into itself.".into());
+        return Err(("Cannot paste a folder into itself.".into(), None));
     }
     if let Ok(dst_meta) = fs::symlink_metadata(&dst) {
         match conflict {
@@ -950,7 +954,7 @@ fn paste_one(
                 // is separate from the destination, so a folder merge can still
                 // happen below and undo has the complete earlier state to put
                 // back. On failure the caller restores it.
-                let old = replace_backup(&dst)?;
+                let old = replace_backup(&dst).map_err(|e| (e, None))?;
                 replaced.push(Replaced { source: src.to_path_buf(), old, new: PathBuf::new(), target: dst.clone() });
                 // A file and a folder cannot stand in for one another in place,
                 // and a symlink cannot be merged into. Everything else merges,
@@ -959,7 +963,7 @@ fn paste_one(
                 let dst_is_link = dst_meta.file_type().is_symlink();
                 let dst_is_dir = !dst_is_link && dst_meta.is_dir();
                 if src_is_link || dst_is_link || dst_is_dir != src_is_dir {
-                    remove_item(&dst)?;
+                    remove_item(&dst).map_err(|e| (e, None))?;
                 }
             }
         }
@@ -970,13 +974,17 @@ fn paste_one(
     // would be truncated by fs::copy.
     let dst_norm = target_norm.join(name_of(&dst));
     if norm_eq(&src_norm, &dst_norm) || same_file(src, &dst) {
-        return Err("That item is already here.".into());
+        return Err(("That item is already here.".into(), None));
     }
-    match mode {
-        Mode::Copy => copy_item(src, &dst, cancel, report)?,
-        Mode::Cut => move_item(src, &dst, cancel, report)?,
+    let stood_there = dst.exists();
+    let outcome = match mode {
+        Mode::Copy => copy_item(src, &dst, cancel, report),
+        Mode::Cut => move_item(src, &dst, cancel, report),
+    };
+    match outcome {
+        Ok(()) => Ok(dst),
+        Err(e) => Err((e, (!stood_there && dst.exists()).then(|| dst.clone()))),
     }
-    Ok(dst)
 }
 
 pub fn paste<F: FnMut(Progress) -> bool>(
@@ -1107,7 +1115,7 @@ pub fn paste<F: FnMut(Progress) -> bool>(
                 }
                 emit(Progress { done: shown, total, name, done_bytes, total_bytes });
             }
-            Err(e) => {
+            Err((e, partial)) => {
                 // Anything set aside for this item goes back rather than
                 // stranding the old contents in a backup folder. A custom
                 // destination from Conflict::Rename is not in `name`, so match
@@ -1116,6 +1124,11 @@ pub fn paste<F: FnMut(Progress) -> bool>(
                     .rev()
                     .filter(|&k| replaced[k].source == *src)
                     .collect();
+                // A replaced entry restored here means the destination holds
+                // the earlier contents again, not what the paste wrote: the
+                // partial copy is already gone with the swap, so recording
+                // it would let undo delete the restored original.
+                let mut restored = false;
                 for k in failing {
                     let r = replaced.remove(k);
                     // Put the earlier contents back where they were. Only drop
@@ -1125,6 +1138,7 @@ pub fn paste<F: FnMut(Progress) -> bool>(
                     match restore {
                         Ok(()) => {
                             let _ = remove_item(&r.old);
+                            restored = true;
                         }
                         Err(back) => {
                             // Keep the backup referenced for a later retry.
@@ -1132,6 +1146,14 @@ pub fn paste<F: FnMut(Progress) -> bool>(
                             error = Some(format!("{e}; the replaced item could not be restored: {back}"));
                             break;
                         }
+                    }
+                }
+                // A destination this paste created and then stopped inside is
+                // part of what the paste did: recording it lets undo take the
+                // partial copy back instead of leaving it behind.
+                if let Some(dst) = partial {
+                    if !restored {
+                        landed.push((src.clone(), dst));
                     }
                 }
                 if error.is_none() {
@@ -2849,6 +2871,98 @@ mod tests {
         assert!(folder_item.is_dir);
         assert!(items.iter().any(|i| i.original == Path::new("/tmp/broken-link")));
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A copy that stops inside a folder records the partial destination it
+    /// created, so undo can take it back instead of leaving it behind.
+    #[test]
+    fn a_stopped_copy_records_the_partial_folder() {
+        let dir = scratch("partial");
+        let src = dir.join("deep");
+        let mut deep = src.clone();
+        fs::create_dir_all(&deep).unwrap();
+        // Nest past the copy depth limit so the copy stops part way in.
+        for _ in 0..520 {
+            deep = deep.join("d");
+            fs::create_dir_all(&deep).unwrap();
+        }
+        let out = dir.join("out");
+        fs::create_dir_all(&out).unwrap();
+        let cancel = AtomicBool::new(false);
+        let pasted = paste(Mode::Copy, Conflict::Rename, std::slice::from_ref(&src), &out, &cancel, noop);
+        assert!(pasted.error.is_some(), "the copy stops at the depth limit");
+        assert_eq!(pasted.landed.len(), 1, "the partial folder is recorded for undo");
+        assert_eq!(pasted.landed[0].1, out.join("deep"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A stopped copy over a file does not record the partial destination:
+    /// the file was set aside, the copy stopped, and the original was
+    /// restored from its backup, so recording the path would let undo
+    /// delete the restored original.
+    #[test]
+    fn a_stopped_copy_over_a_file_does_not_record_the_partial() {
+        let dir = scratch("partial-over-file");
+        let src = dir.join("x");
+        let mut deep = src.clone();
+        fs::create_dir_all(&deep).unwrap();
+        // Nest past the copy depth limit so the copy stops part way in.
+        for _ in 0..520 {
+            deep = deep.join("d");
+            fs::create_dir_all(&deep).unwrap();
+        }
+        let out = dir.join("out");
+        fs::create_dir_all(&out).unwrap();
+        fs::write(out.join("x"), "ORIGINAL").unwrap();
+        let cancel = AtomicBool::new(false);
+        let pasted = paste(Mode::Copy, Conflict::Overwrite, std::slice::from_ref(&src), &out, &cancel, noop);
+        assert!(pasted.error.is_some(), "the copy stops at the depth limit");
+        assert!(pasted.landed.is_empty(), "the restored original is not recorded as a partial");
+        assert!(pasted.replaced.is_empty(), "the replaced entry was restored and dropped");
+        assert_eq!(fs::read(out.join("x")).unwrap(), b"ORIGINAL", "the original file is back");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A link pasted on its own is copied as a link, like the ones inside a
+    /// copied folder, not as the contents of what it points at.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_pasted_alone_is_copied_as_a_link() {
+        let dir = scratch("toplink");
+        let real = dir.join("real.txt");
+        fs::write(&real, "contents").unwrap();
+        let link = dir.join("link.txt");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let out = dir.join("out");
+        fs::create_dir_all(&out).unwrap();
+        let cancel = AtomicBool::new(false);
+        let pasted = paste(Mode::Copy, Conflict::Rename, std::slice::from_ref(&link), &out, &cancel, noop);
+        assert!(pasted.error.is_none(), "the paste must finish: {:?}", pasted.error);
+        let landed = out.join("link.txt");
+        let meta = fs::symlink_metadata(&landed).unwrap();
+        assert!(meta.file_type().is_symlink(), "the copy is a link, not the target's contents");
+        assert_eq!(fs::read_link(&landed).unwrap(), real);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A move's progress counts the item that went: its size is read before
+    /// it moves, because afterwards the source is gone and reads as zero.
+    #[test]
+    fn a_moves_progress_reaches_the_total() {
+        let dir = scratch("movecount");
+        let file = dir.join("a.txt");
+        fs::write(&file, "12345").unwrap();
+        let out = dir.join("out");
+        fs::create_dir_all(&out).unwrap();
+        let cancel = AtomicBool::new(false);
+        let mut last_done_bytes = 0u64;
+        let pasted = paste(Mode::Cut, Conflict::Rename, std::slice::from_ref(&file), &out, &cancel, |p| {
+            last_done_bytes = p.done_bytes;
+            true
+        });
+        assert!(pasted.error.is_none(), "the move must finish: {:?}", pasted.error);
+        assert_eq!(last_done_bytes, 5, "the moved bytes are credited");
         let _ = fs::remove_dir_all(&dir);
     }
 }
